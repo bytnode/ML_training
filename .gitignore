@@ -1,0 +1,16 @@
+# Modèle XGBoost entraîné (artefact regénérable via train.py)
+btc_reversal_model.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Éditeurs / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
