@@ -58,12 +58,12 @@ CSV_PATH = "training_data.csv"
 MODEL_OUTPUT = "btc_reversal_model.json"
 
 TRAIN_DAYS   = 3600     # 1825 jours = 5 ans  (None = utilise tout ce qui reste)
-TEST_DAYS    = 1400      # 365 jours = 1 an
+TEST_DAYS    = 365      # 365 jours = 1 an
 VAL_FRACTION = 0.15     # 15% du bloc train+val devient le set de validation (la partie la plus recente du bloc)
 
 # --- Évaluation ---
 THRESHOLDS = [0.50, 0.52, 0.55,0.56,0.57, 0.58, 0.60,0.61, 0.62]
-BREAKDOWN_THRESHOLD = 0.57
+BREAKDOWN_THRESHOLD = 0.58
 
 # --- Hyperparamètres XGBoost ---
 XGB_N_ESTIMATORS = 1000
