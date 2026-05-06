@@ -58,12 +58,31 @@ CSV_PATH = "training_data.csv"
 MODEL_OUTPUT = "btc_reversal_model.json"
 
 TRAIN_DAYS   = 3600     # 1825 jours = 5 ans  (None = utilise tout ce qui reste)
-TEST_DAYS    = 365      # 365 jours = 1 an
-VAL_FRACTION = 0.15     # 15% du bloc train+val devient le set de validation (la partie la plus recente du bloc)
+TEST_DAYS    = 30      # 365 jours = 1 an
+VAL_FRACTION = 0.1   # 15% du bloc train+val devient le set de validation (la partie la plus recente du bloc)
+
+# Filtre du test set : liste des seq_len a evaluer.
+#   None ou liste vide = toutes les seq_len presentes dans le CSV (comportement par defaut).
+#   [2, 3]             = n'evalue que sur les rows seq_len in {2, 3}.
+# N'affecte PAS train/val : le modele est toujours entraine sur tout.
+SEQ_TEST = [2, 3, 4]
 
 # --- Évaluation ---
-THRESHOLDS = [0.50, 0.52, 0.55,0.56,0.57, 0.58, 0.60,0.61, 0.62]
-BREAKDOWN_THRESHOLD = 0.58
+THRESHOLDS = [0.50, 0.52, 0.55,0.56,0.57, 0.58,0.59, 0.60,0.61, 0.62]
+BREAKDOWN_THRESHOLD = 0.6
+
+# --- Seuil adaptatif ---
+# Le seuil utilise pour decider take/skip est BREAKDOWN_THRESHOLD + delta(bucket),
+# ou bucket = (volatility_state, is_weekend). Les deltas sont calcules sur les
+# derniers ADAPTIVE_CALIB_FRACTION * TEST_DAYS jours de la slice de validation et
+# sauves dans un sidecar JSON a cote du modele.
+ADAPTIVE_THRESHOLD = True               # False = utilise BREAKDOWN_THRESHOLD partout (comportement legacy)
+ADAPTIVE_TARGET_WR = 0.58               # WR cible par bucket (egal a la base = "lisse les regimes")
+ADAPTIVE_CALIB_FRACTION = 0.75          # fenetre de calib = ADAPTIVE_CALIB_FRACTION * TEST_DAYS (0.15 * 365 = ~54j)
+ADAPTIVE_MIN_N_VAL = 200                # seuil minimum de rows par bucket pour calibration "high confidence"
+ADAPTIVE_MIN_N_VAL_SOFT = 30            # plancher "low confidence" : si calib + full val sont sous MIN_N_VAL mais                               # qu'on a au moins ce nombre dans full val, on calibre quand meme (flag low_conf)
+ADAPTIVE_MIN_N_AT_THRESHOLD = 30        # seuil minimum de bets a un threshold candidat (anti-overfit du delta)
+ADAPTIVE_DELTA_CLAMP = (-0.05, 0.08)    # rail de securite : le delta par bucket reste dans ces bornes
 
 # --- Hyperparamètres XGBoost ---
 XGB_N_ESTIMATORS = 1000

@@ -2,6 +2,39 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Commands
+
+```bash
+# install (no requirements.txt — Python 3.10+, tested on 3.14)
+pip install requests pandas numpy xgboost scikit-learn scipy
+
+# end-to-end pipeline
+python data.py        # fetch + features  -> training_data.csv
+python train.py       # train + eval      -> btc_reversal_model.json + appends logs/runs.csv
+python predict.py     # smoke-test predict on last CSV row
+
+# train.py CLI flags
+python train.py --label myrun     # custom run_label in logs/runs.csv (default "manual")
+python train.py --no-save         # don't overwrite btc_reversal_model.json
+python train.py --no-log          # don't append to logs/runs.csv
+
+# hyperparameter sweep (does NOT overwrite the prod model)
+python sweep.py                                # all sweeps, 5 values per HP
+python sweep.py --quick                        # 3 values per HP
+python sweep.py --only max_depth,learning_rate # restrict to listed HPs
+
+# analyze sweep results
+python analyze_runs.py
+python analyze_runs.py --metric breakdown_total_wr --top 20
+python analyze_runs.py --only max_depth,learning_rate
+
+# optional cleaning pipeline
+python clean_data/analyze.py     # audits training_data.csv -> analysis_report.{md,json}
+python clean_data/clean.py       # writes training_data_clean.csv + cleaning_log.md
+```
+
+There is **no test suite, no linter, no build system** — verification happens by inspecting `logs/runs.csv` across runs and watching the `breakdown_total_wr` / `wr_at_0.58` metrics. Don't add `pytest`, `ruff`, or a `Makefile` without asking.
+
 ## Pipeline
 
 Three core Python files at the root + an optional `clean_data/` module + sweep tooling.
@@ -68,9 +101,59 @@ Every call to `train_and_evaluate(log_run=True)` (which is the default for `pyth
 Every tunable knob lives in `config.py`, split into two clearly-labelled sections:
 
 - **SECTION 1 — DATA** (consumed by `data.py`): `SYMBOL`, `INTERVAL`, `DAYS_BACK`, fetch parameters, `INTERVAL_MS`, `MTF_INTERVALS`, indicator periods, feature-window sizes, `BODY_RATIO_MIN`, `WARMUP`, `MAX_SEQ_LEN`, volatility thresholds.
-- **SECTION 2 — TRAINING** (consumed by `train.py` and `predict.py`): file paths, `TRAIN_DAYS`, `TEST_DAYS`, `VAL_FRACTION`, `THRESHOLDS`, `BREAKDOWN_THRESHOLD`, all `XGB_*` hyperparameters.
+- **SECTION 2 — TRAINING** (consumed by `train.py` and `predict.py`): file paths, `TRAIN_DAYS`, `TEST_DAYS`, `VAL_FRACTION`, `SEQ_TEST`, `THRESHOLDS`, `BREAKDOWN_THRESHOLD`, all `XGB_*` hyperparameters.
 
 Don't reintroduce hardcoded values in `data.py` / `train.py` — import from `config.py` instead.
+
+### Adaptive per-regime threshold (`ADAPTIVE_THRESHOLD`)
+
+`BREAKDOWN_THRESHOLD = 0.58` stays as a hardcoded **base**, but the actual decision threshold floats per market regime: `effective_th = BREAKDOWN_THRESHOLD + delta(volatility_state, is_weekend)`. The deltas are calibrated on val and persisted next to the model in a JSON sidecar — same architecture as the model file.
+
+**Buckets**: `(volatility_state ∈ {0,1,2}, is_weekend ∈ {0,1})` = 6 fixed buckets. No new features required — both already exist in the CSV.
+
+**Calibration recipe** (run inside `train.py` after `model.fit`):
+1. Slice val to the last `ADAPTIVE_CALIB_FRACTION × TEST_DAYS` days by timestamp (default `0.15 × 365 ≈ 54` days). The window is expressed as a fraction of `TEST_DAYS` so the calibration scale follows the evaluation horizon — if you shrink the test window, the calib window shrinks proportionally. The resolved day count is computed once at module load (`train.ADAPTIVE_CALIB_DAYS`) and logged to `runs.csv` as `adaptive_calib_days` (alongside the source `adaptive_calib_fraction` for traceability).
+2. For each bucket, sweep candidate thresholds in `[0.45, 0.75]` step 0.005, keeping only candidates with ≥ `ADAPTIVE_MIN_N_AT_THRESHOLD` bets (default 30).
+3. Pick the smallest threshold whose realized WR ≥ `ADAPTIVE_TARGET_WR`. If unreachable, fall back to the threshold with the highest WR in that bucket.
+4. `delta = chosen_th - BREAKDOWN_THRESHOLD`, clamped to `ADAPTIVE_DELTA_CLAMP` (default `(-0.05, +0.08)`).
+5. Per-bucket fallback cascade (sparse buckets like high-vol-weekend are common in BTC data):
+   - `n_calib ≥ ADAPTIVE_MIN_N_VAL` → use calib window (`source = "calib_window"`, **high confidence**).
+   - else `n_full ≥ ADAPTIVE_MIN_N_VAL` → use full val (`fallback_full_val`, high confidence, recency sacrificed).
+   - else `n_full ≥ ADAPTIVE_MIN_N_VAL_SOFT` (default 30) → use full val (`low_conf_full_val`, **low confidence**). The clamp + `MIN_N_AT_THRESHOLD` floor + max-WR fallback inside `_compute_bucket_threshold` are what keep a noisy delta from being dangerous in this tier — don't loosen them without thought.
+   - else → `delta = 0`, `source = "insufficient_data"`.
+
+**Sidecar JSON** (`<MODEL_OUTPUT>.thresholds.json`, e.g. `btc_reversal_model.thresholds.json`):
+```json
+{
+  "base_threshold": 0.58,
+  "deltas": {"0_0": -0.025, "0_1": 0.0, "1_0": 0.0, "1_1": 0.015, "2_0": 0.04, "2_1": 0.06},
+  "metadata": {"trained_at": "...", "calib_days": 90, "target_wr": 0.58, ...}
+}
+```
+Keys are `"<vol>_<wknd>"`. Saved only when `train.py` runs with `save_model=True` (so sweeps don't clobber the deployed sidecar — same convention as `MODEL_OUTPUT` itself).
+
+**`predict.py` contract**:
+- `should_take_bet(features)` (no `threshold` arg) → loads the sidecar lazily and applies the per-bucket threshold automatically. If the sidecar is missing (legacy model, or sidecar deleted), falls back to `BREAKDOWN_THRESHOLD`.
+- `should_take_bet(features, threshold=0.58)` → ignores the sidecar entirely, useful for A/B vs the fixed threshold or when the caller doesn't have `volatility_state`/`is_weekend` available.
+- The sidecar is cached in a module-level singleton (`_thresholds`) just like `_model`.
+
+**`runs.csv` schema additions**:
+- `adaptive_threshold_enabled`, `adaptive_calib_days`, `adaptive_target_wr` — config snapshot.
+- `adaptive_total_taken`, `adaptive_total_wr` — head-to-head vs the fixed `breakdown_total_*` on the same test slice.
+- `delta_v{0,1,2}_w{0,1}` — the 6 calibrated deltas (`None` when bucket fell back to insufficient_data).
+
+**Disabling**: set `ADAPTIVE_THRESHOLD = False` in `config.py`. `train.py` skips calibration, doesn't write the sidecar, and the metrics dict has `adaptive_total_*` set to `None`/`0`. `predict.py` continues to work — if the sidecar exists from a prior run, it's still used unless deleted; if missing, falls back to `BREAKDOWN_THRESHOLD`.
+
+**Important**: with very small `VAL_FRACTION` (e.g. 0.01), the calib window may have fewer rows than `ADAPTIVE_MIN_N_VAL` per bucket and many buckets will silently fall back to `delta = 0`. Watch the `source_flag` column in the printed calibration table — if most buckets read `insufficient_data`, lower `ADAPTIVE_MIN_N_VAL` or raise `VAL_FRACTION`.
+
+### Restricting the test slice to specific streak lengths (`SEQ_TEST`)
+
+`SEQ_TEST` filters which `seq_len` values are kept in the **test slice only** — train and val are never filtered, so the model still sees every streak length during fitting. The filter is applied right after the temporal split, before the threshold sweep / breakdown / `runs.csv` logging, which means baseline WR, `wr_at_<th>`, and `breakdown_total_*` are all computed against the filtered test set.
+
+- `SEQ_TEST = None` (or `[]`) — keep all rows (default, current behaviour).
+- `SEQ_TEST = [2, 3]` — evaluate only on `seq_len ∈ {2, 3}` rows.
+
+The chosen filter is logged as a `seq_test` column in `logs/runs.csv` (value `"all"` or e.g. `"2,3"`), so `analyze_runs.py` results across runs with different `SEQ_TEST` are distinguishable. The per-`seq_len` breakdown print already suppresses empty buckets, so excluded streaks just disappear from the output rather than printing as 0.
 
 ### Disabling regularization hyperparameters
 
