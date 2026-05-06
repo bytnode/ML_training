@@ -1,12 +1,14 @@
-import requests
-import time
+import bisect
 import csv
+import time
 from concurrent.futures import ThreadPoolExecutor
+
+import requests
 
 from config import (
     SYMBOL, INTERVAL, DAYS_BACK, OUTPUT_CSV,
     API_URL, KLINES_LIMIT, REQUEST_TIMEOUT, MAX_RETRIES, FETCH_WORKERS,
-    INTERVAL_MS,
+    INTERVAL_MS, MTF_INTERVALS,
     WARMUP, MAX_SEQ_LEN, BODY_RATIO_MIN,
     EMA_OBV_PERIOD, EMA_CLOSE_PERIODS, RSI_PERIOD,
     ATR_PERIOD, ATR_LONG_PERIOD, VOL_AVG_PERIOD,
@@ -16,14 +18,18 @@ from config import (
 
 session = requests.Session()
 
-def fetch_chunk(start_sec, end_sec):
+
+# ============================================================
+#  FETCH BITSTAMP (parametre par interval)
+# ============================================================
+def fetch_chunk(start_sec, end_sec, interval):
     """
-    Appelle Bitstamp OHLC et normalise la réponse au format kline Binance
-    [open_time_ms, open, high, low, close, volume] pour garder le reste du
-    pipeline inchangé.
+    Appelle Bitstamp OHLC pour un interval donne et normalise au format kline
+    Binance [open_time_ms, open, high, low, close, volume] pour garder le reste
+    du pipeline inchange.
     """
     url = API_URL.format(pair=SYMBOL)
-    step_seconds = INTERVAL_MS[INTERVAL] // 1000
+    step_seconds = INTERVAL_MS[interval] // 1000
     params = {
         "step": step_seconds,
         "limit": KLINES_LIMIT,
@@ -48,8 +54,9 @@ def fetch_chunk(start_sec, end_sec):
             time.sleep(2 ** attempt)
     return []
 
-def fetch_all_klines(start_time, end_time):
-    step = INTERVAL_MS[INTERVAL] * KLINES_LIMIT
+
+def fetch_all_klines(start_time, end_time, interval):
+    step = INTERVAL_MS[interval] * KLINES_LIMIT
     windows = []
     current = start_time
     while current < end_time:
@@ -59,13 +66,39 @@ def fetch_all_klines(start_time, end_time):
 
     all_klines = []
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
-        results = executor.map(lambda w: fetch_chunk(w[0], w[1]), windows)
+        results = executor.map(lambda w: fetch_chunk(w[0], w[1], interval), windows)
         for chunk in results:
             all_klines.extend(chunk)
 
-    # Dédup par timestamp (les fenêtres Bitstamp peuvent se chevaucher aux bords)
+    # Dedup par timestamp (les fenetres Bitstamp peuvent se chevaucher aux bords)
     by_ts = {k[0]: k for k in all_klines}
     return sorted(by_ts.values(), key=lambda k: k[0])
+
+
+def fetch_all_timeframes(start_time, end_time, intervals):
+    """Sequentiel au niveau TF (chaque fetch_all_klines parallelise deja en interne)."""
+    out = {}
+    for iv in intervals:
+        print(f"  Fetching {iv}...", flush=True)
+        klines = fetch_all_klines(start_time, end_time, interval=iv)
+        out[iv] = klines
+        print(f"    {len(klines):,} bars.")
+    return out
+
+
+# ============================================================
+#  HELPER NO-LOOKAHEAD
+# ============================================================
+def last_closed_index(open_times_sorted, t_decision_ms, interval_ms):
+    """
+    Retourne l'index de la derniere bougie *closed* avant t_decision_ms.
+    Une bougie est closed ssi open_time + interval_ms <= t_decision_ms.
+    Equivaut a : on cherche le plus grand i tel que open_times[i] <= t_decision_ms - interval_ms.
+    Retourne -1 si aucune bougie n'est encore closed.
+    """
+    target = t_decision_ms - interval_ms
+    return bisect.bisect_right(open_times_sorted, target) - 1
+
 
 # ============================================================
 #  INDICATEURS
@@ -81,12 +114,14 @@ def compute_obv(closes, volumes):
             obv.append(obv[-1])
     return obv
 
+
 def compute_ema(values, period):
     ema = [values[0]]
     alpha = 2 / (period + 1)
     for i in range(1, len(values)):
         ema.append(alpha * values[i] + (1 - alpha) * ema[-1])
     return ema
+
 
 def compute_rsi(closes, period=14):
     rsi = [50.0] * len(closes)
@@ -110,6 +145,7 @@ def compute_rsi(closes, period=14):
             rsi[i] = 100 - (100 / (1 + rs))
     return rsi
 
+
 def compute_atr(highs, lows, closes, period=14):
     tr = [highs[0] - lows[0]]
     for i in range(1, len(closes)):
@@ -126,11 +162,13 @@ def compute_atr(highs, lows, closes, period=14):
             atr[i] = (atr[i-1] * (period-1) + tr[i]) / period
     return atr
 
+
 def compute_volume_avg(volumes, period=20):
     avg = [volumes[0]] * len(volumes)
     for i in range(period, len(volumes)):
         avg[i] = sum(volumes[i-period:i]) / period
     return avg
+
 
 # ============================================================
 #  EXTRACTION DES FEATURES
@@ -139,25 +177,41 @@ def body_ratio(o, h, l, c):
     rng = h - l
     return abs(c - o) / rng if rng > 0 else 0
 
+
 def upper_wick_ratio(o, h, l, c):
     rng = h - l
     body_top = max(o, c)
     return (h - body_top) / rng if rng > 0 else 0
+
 
 def lower_wick_ratio(o, h, l, c):
     rng = h - l
     body_bot = min(o, c)
     return (body_bot - l) / rng if rng > 0 else 0
 
+
 def get_direction(o, c):
     if c > o: return "up"
     if c < o: return "down"
     return "flat"
 
-def extract_features(klines, max_seq_len=MAX_SEQ_LEN):
+
+def _index_mtf(klines):
+    """Decompose une serie de klines en arrays paralleles pour acces rapide."""
+    return {
+        "times":   [int(k[0]) for k in klines],
+        "opens":   [float(k[1]) for k in klines],
+        "highs":   [float(k[2]) for k in klines],
+        "lows":    [float(k[3]) for k in klines],
+        "closes":  [float(k[4]) for k in klines],
+        "volumes": [float(k[5]) for k in klines],
+    }
+
+
+def extract_features(klines, klines_mtf, max_seq_len=MAX_SEQ_LEN):
     """
-    Pour chaque séquence de N bougies de même sens (N = 1 à max_seq_len),
-    extrait les features et le label (a-t-elle été suivie d'un retournement ?)
+    Pour chaque sequence de N bougies de meme sens (N = 1 a max_seq_len),
+    extrait les features 15m + OHLCV des MTF (no-lookahead) + le label.
     """
     n = len(klines)
     opens   = [float(k[1]) for k in klines]
@@ -169,7 +223,7 @@ def extract_features(klines, max_seq_len=MAX_SEQ_LEN):
 
     directions = [get_direction(opens[i], closes[i]) for i in range(n)]
 
-    # Indicateurs précalculés sur toute la série
+    # Indicateurs precalcules sur toute la serie 15m
     ema_p_short, ema_p_mid, ema_p_long = EMA_CLOSE_PERIODS
     obv = compute_obv(closes, volumes)
     ema_obv_20 = compute_ema(obv, EMA_OBV_PERIOD)
@@ -181,91 +235,103 @@ def extract_features(klines, max_seq_len=MAX_SEQ_LEN):
     atr_100_avg = compute_atr(highs, lows, closes, ATR_LONG_PERIOD)
     vol_avg_20 = compute_volume_avg(volumes, VOL_AVG_PERIOD)
 
-    # Warmup : on commence après que tous les indicateurs soient stabilisés
-    warmup = WARMUP
+    # Index des MTF pour acces rapide
+    mtf = {iv: _index_mtf(kl) for iv, kl in klines_mtf.items()}
 
+    warmup = WARMUP
     rows = []
+    skipped_mtf = 0
+    interval_15m_ms = INTERVAL_MS["15m"]
 
     for seq_len in range(1, max_seq_len + 1):
         for i in range(warmup, n - seq_len - 1):
             window = directions[i : i + seq_len]
             next_dir = directions[i + seq_len]
 
-            # On ignore les bougies flat
             if "flat" in window or next_dir == "flat":
                 continue
-            # Toutes les bougies de la fenêtre doivent être dans le même sens
             if len(set(window)) != 1:
                 continue
 
             seq_dir = window[0]
-            last_idx = i + seq_len - 1  # dernière bougie de la séquence
+            last_idx = i + seq_len - 1
 
-            # Filtre body ratio sur la dernière bougie (comme ton script actuel)
             br_last = body_ratio(opens[last_idx], highs[last_idx], lows[last_idx], closes[last_idx])
             if br_last < BODY_RATIO_MIN:
                 continue
 
-            # ========== FEATURES ==========
-            # 1. Longueur de séquence et direction
-            f_seq_len = seq_len
-            f_seq_dir = 1 if seq_dir == "up" else 0  # 1=up, 0=down
+            # ---------- DECISION TIMESTAMP T (no-lookahead) ----------
+            T = times[last_idx] + interval_15m_ms
 
-            # 2. Body ratios des bougies de la séquence
+            # Lookup OHLCV de la derniere bougie closed avant T pour chaque MTF
+            mtf_features = {}
+            mtf_ok = True
+            for iv in MTF_INTERVALS:
+                d = mtf[iv]
+                idx = last_closed_index(d["times"], T, INTERVAL_MS[iv])
+                if idx < 0:
+                    mtf_ok = False
+                    break
+                mtf_features[f"open_{iv}"]  = d["opens"][idx]
+                mtf_features[f"high_{iv}"]  = d["highs"][idx]
+                mtf_features[f"low_{iv}"]   = d["lows"][idx]
+                mtf_features[f"close_{iv}"] = d["closes"][idx]
+                mtf_features[f"vol_{iv}"]   = d["volumes"][idx]
+
+            if not mtf_ok:
+                skipped_mtf += 1
+                continue
+
+            # ---------- FEATURES 15m (inchangees) ----------
+            f_seq_len = seq_len
+            f_seq_dir = 1 if seq_dir == "up" else 0
+
             f_body_ratio_last = br_last
             f_body_ratio_avg = sum(
                 body_ratio(opens[j], highs[j], lows[j], closes[j])
                 for j in range(i, i + seq_len)
             ) / seq_len
 
-            # 3. Mèches de la dernière bougie
             f_upper_wick = upper_wick_ratio(opens[last_idx], highs[last_idx], lows[last_idx], closes[last_idx])
             f_lower_wick = lower_wick_ratio(opens[last_idx], highs[last_idx], lows[last_idx], closes[last_idx])
 
-            # 4. Volume relatif sur la dernière bougie
             f_volume_ratio_last = volumes[last_idx] / vol_avg_20[last_idx] if vol_avg_20[last_idx] > 0 else 1
             f_volume_ratio_avg = sum(volumes[j] for j in range(i, i + seq_len)) / seq_len / vol_avg_20[last_idx] if vol_avg_20[last_idx] > 0 else 1
 
-            # 5. Mouvement total en % et en multiples d'ATR
             move_pct = (closes[last_idx] - opens[i]) / opens[i] * 100
             f_move_pct = move_pct
             f_move_atr = abs(closes[last_idx] - opens[i]) / atr_14[last_idx] if atr_14[last_idx] > 0 else 0
 
-            # 6. RSI
             f_rsi = rsi_14[last_idx]
             f_rsi_change_5 = rsi_14[last_idx] - rsi_14[last_idx - RSI_CHANGE_WINDOW] if last_idx >= RSI_CHANGE_WINDOW else 0
 
-            # 7. OBV
             f_obv_slope_10 = (obv[last_idx] - obv[last_idx - OBV_SLOPE_WINDOW]) / abs(obv[last_idx - OBV_SLOPE_WINDOW]) if abs(obv[last_idx - OBV_SLOPE_WINDOW]) > 1e-9 else 0
             f_obv_vs_ema = 1 if obv[last_idx] > ema_obv_20[last_idx] else 0
 
-            # 8. ATR / Volatilité
             f_atr_ratio = atr_14[last_idx] / atr_100_avg[last_idx] if atr_100_avg[last_idx] > 0 else 1
             if f_atr_ratio > VOLATILITY_HIGH:
-                f_volatility_state = 2  # high
+                f_volatility_state = 2
             elif f_atr_ratio < VOLATILITY_LOW:
-                f_volatility_state = 0  # low
+                f_volatility_state = 0
             else:
-                f_volatility_state = 1  # normal
+                f_volatility_state = 1
 
-            # 9. Distance aux EMA (en %)
             price = closes[last_idx]
             f_dist_ema20 = (price - ema_close_20[last_idx]) / ema_close_20[last_idx] * 100
             f_dist_ema50 = (price - ema_close_50[last_idx]) / ema_close_50[last_idx] * 100
             f_dist_ema200 = (price - ema_close_200[last_idx]) / ema_close_200[last_idx] * 100
 
-            # 10. Contexte temporel
             ts_seconds = times[last_idx] // 1000
             tm = time.gmtime(ts_seconds)
             f_hour_utc = tm.tm_hour
-            f_day_of_week = tm.tm_wday  # 0=Lundi, 6=Dimanche
+            f_day_of_week = tm.tm_wday
             f_is_weekend = 1 if f_day_of_week >= 5 else 0
 
-            # ========== LABEL ==========
+            # ---------- LABEL ----------
             expected_reversal = "down" if seq_dir == "up" else "up"
             label = 1 if next_dir == expected_reversal else 0
 
-            rows.append({
+            row = {
                 "timestamp": times[last_idx],
                 "seq_len": f_seq_len,
                 "seq_dir": f_seq_dir,
@@ -289,10 +355,16 @@ def extract_features(klines, max_seq_len=MAX_SEQ_LEN):
                 "hour_utc": f_hour_utc,
                 "day_of_week": f_day_of_week,
                 "is_weekend": f_is_weekend,
-                "label": label,
-            })
+            }
+            row.update(mtf_features)
+            row["label"] = label
+            rows.append(row)
+
+    if skipped_mtf > 0:
+        print(f"  (skipped {skipped_mtf:,} rows en debut d'historique : MTF data insuffisante)")
 
     return rows
+
 
 # ============================================================
 #  MAIN
@@ -302,23 +374,25 @@ def main():
     start = end - (DAYS_BACK * 24 * 60 * 60 * 1000)
 
     print(f"Fetching {DAYS_BACK} days of {INTERVAL} klines for {SYMBOL}...")
-    klines = fetch_all_klines(start, end)
-    print(f"Fetched {len(klines)} klines.")
+    klines_15m = fetch_all_klines(start, end, interval=INTERVAL)
+    print(f"  Fetched {len(klines_15m):,} 15m klines.\n")
+
+    print(f"Fetching MTF klines : {MTF_INTERVALS}...")
+    klines_mtf = fetch_all_timeframes(start, end, MTF_INTERVALS)
+    print()
 
     print("Extracting features and labels...")
-    rows = extract_features(klines, max_seq_len=MAX_SEQ_LEN)
-    print(f"Generated {len(rows)} training examples.")
+    rows = extract_features(klines_15m, klines_mtf, max_seq_len=MAX_SEQ_LEN)
+    print(f"Generated {len(rows):,} training examples.")
 
-    # Statistiques de répartition
-    by_seq = {1:[], 2:[], 3:[], 4:[]}
+    by_seq = {1: [], 2: [], 3: [], 4: []}
     for r in rows:
         by_seq[r["seq_len"]].append(r["label"])
     for sl, labels in by_seq.items():
         if labels:
             wr = sum(labels) / len(labels) * 100
-            print(f"  Seq {sl} bougies : {len(labels):>6} exemples, WR baseline = {wr:.2f}%")
+            print(f"  Seq {sl} bougies : {len(labels):>6,} exemples, WR baseline = {wr:.2f}%")
 
-    # Écriture CSV
     if not rows:
         print("No rows generated. Exiting.")
         return
@@ -330,6 +404,8 @@ def main():
         writer.writerows(rows)
 
     print(f"\nCSV exported : {OUTPUT_CSV}")
+    print(f"Columns ({len(fieldnames)}) : {fieldnames}")
+
 
 if __name__ == "__main__":
     main()

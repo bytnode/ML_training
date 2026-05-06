@@ -15,7 +15,17 @@ REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
 FETCH_WORKERS = 8
 
-INTERVAL_MS = {"15m": 15 * 60 * 1000}
+INTERVAL_MS = {
+    "15m": 15 * 60 * 1000,
+    "30m": 30 * 60 * 1000,
+    "1h":  60 * 60 * 1000,
+    "4h":  4 * 60 * 60 * 1000,
+    "1d":  24 * 60 * 60 * 1000,
+}
+
+# Higher timeframes ajoutees a chaque ligne du dataset (OHLCV de la derniere bougie
+# closed avant le timestamp de decision T = times[last_idx] + 15m).
+MTF_INTERVALS = ["30m", "1h", "4h", "1d"]
 
 # --- Extraction des features ---
 WARMUP = 200          # bars ignorées en début pour stabiliser les indicateurs
@@ -47,23 +57,23 @@ VOLATILITY_LOW = 0.7
 CSV_PATH = "training_data.csv"
 MODEL_OUTPUT = "btc_reversal_model.json"
 
-# --- Split temporel (pas de shuffle) ---
-TEST_DAYS = 3600        # le test set = les TEST_DAYS derniers jours du CSV (730=2ans, 1825=5ans)
-VAL_FRACTION = 0.15     # 15% du segment hors-test (= train+val) devient le set de validation
+TRAIN_DAYS   = 3600     # 1825 jours = 5 ans  (None = utilise tout ce qui reste)
+TEST_DAYS    = 1400      # 365 jours = 1 an
+VAL_FRACTION = 0.15     # 15% du bloc train+val devient le set de validation (la partie la plus recente du bloc)
 
 # --- Évaluation ---
-THRESHOLDS = [0.50, 0.52, 0.55,0.56,0.57, 0.58, 0.60,]
-BREAKDOWN_THRESHOLD = 0.6
+THRESHOLDS = [0.50, 0.52, 0.55,0.56,0.57, 0.58, 0.60,0.61, 0.62]
+BREAKDOWN_THRESHOLD = 0.57
 
 # --- Hyperparamètres XGBoost ---
 XGB_N_ESTIMATORS = 1000
-XGB_MAX_DEPTH = 4
+XGB_MAX_DEPTH = 5
 XGB_LEARNING_RATE = 0.05
 XGB_MIN_CHILD_WEIGHT = 5
 XGB_SUBSAMPLE = 0.8
 XGB_COLSAMPLE_BYTREE = 0.8
 XGB_REG_LAMBDA = False    # désactivé (False = utilise le défaut XGBoost = 1.0)
 XGB_REG_ALPHA = False     # désactivé (False = utilise le défaut XGBoost = 0.0)
-XGB_GAMMA = False         # désactivé (False = utilise le défaut XGBoost = 0.0)
+XGB_GAMMA = False        # désactivé (False = utilise le défaut XGBoost = 0.0)
 XGB_EARLY_STOPPING_ROUNDS = 50
 XGB_RANDOM_STATE = 42
