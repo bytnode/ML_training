@@ -22,3 +22,6 @@ Thumbs.db
 live/logs/*.csv
 live/logs/*.log
 aure.thresholds.json
+
+# Secrets / credentials (Telegram bot, etc.)
+.env

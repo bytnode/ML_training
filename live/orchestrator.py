@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import shutil
 import sys
 import time
@@ -15,7 +16,7 @@ import xgboost as xgb
 
 from settings import (
     MODEL_PATH, THRESHOLDS_PATH, THRESHOLDS_SOURCE,
-    LOGS_DIR, ORCHESTRATOR_LOG,
+    LOGS_DIR, ORCHESTRATOR_LOG, REPO_ROOT,
     WARMUP_CANDLES_15M, WARMUP_CANDLES_MTF,
     RECENT_FETCH_15M, RECENT_FETCH_MTF,
     INTERVAL_15M_MS, CYCLE_FUDGE_SECONDS,
@@ -29,6 +30,40 @@ from store import (
 from notify import send_message, format_decision_message
 
 _log = logging.getLogger("orchestrator")
+
+
+# ---------------------------------------------------------------------------
+# .env loader
+# ---------------------------------------------------------------------------
+def _load_env_file(path: Path) -> int:
+    """Charge un fichier .env (KEY=VALUE par ligne) dans os.environ.
+
+    - Skip blank lines, lignes commencant par #, lignes sans '='.
+    - Si la VALUE est vide, ne touche pas os.environ pour cette clef.
+    - Si KEY est deja set dans os.environ, ne l'ecrase PAS (la vraie env var
+      gagne contre le .env -- pratique pour overrider ponctuellement en CLI).
+    - Strip un eventuel quoting "..." ou '...' autour de la valeur.
+
+    Returns: nombre de variables chargees.
+    """
+    if not path.exists():
+        return 0
+    loaded = 0
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if not key or not value:
+            continue
+        if key not in os.environ:
+            os.environ[key] = value
+            loaded += 1
+    return loaded
 
 
 # ---------------------------------------------------------------------------
@@ -233,8 +268,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="Ne pas envoyer de notif Telegram (decisions seulement loguees).")
     args = parser.parse_args(argv)
 
+    # Charge .env (a la racine du repo) AVANT de setup le logging — comme ca le
+    # logging file handler peut ecrire dans LOGS_DIR sans surprises et les
+    # env vars (Telegram) sont deja en place quand notify.py en a besoin.
+    n_env = _load_env_file(REPO_ROOT / ".env")
+
     _setup_logging()
     _log.info("orchestrator_start dry_run=%s no_notify=%s", args.dry_run, args.no_notify)
+    if n_env:
+        _log.info("env_loaded from %s vars=%d", REPO_ROOT / ".env", n_env)
 
     _ensure_sidecar()
     model = _load_model()
