@@ -28,9 +28,10 @@ python orchestrator.py --dry-run --no-notify
 
 Pre-requis : `aure.json` + `aure.thresholds.json` doivent exister à la racine du repo (Docker bind-mount des fichiers, ne crée pas si absent). Le `.env` à la racine fournit les credentials Telegram via `env_file:` de compose.
 
+Les commandes marchent **depuis `live/` OU depuis `infra/`** indifféremment — `live/docker-compose.yml` est un pointeur (`include:`) vers `infra/docker-compose.yml`. Source unique de vérité = `infra/docker-compose.yml`.
+
 ```powershell
-# Depuis le dossier infra/
-cd infra
+# Depuis live/ (le plus pratique vu que tu y es deja)
 docker compose up -d --build      # build + start en arriere-plan
 docker compose logs -f aure-live  # suivre les logs
 docker compose restart aure-live  # apres avoir remplace aure.json sur l'host
@@ -42,11 +43,21 @@ Modèle / sidecar / `live/logs/` sont montés en volume depuis l'host : pas de r
 ## Architecture
 
 Daemon Python long-running aligné sur les frontières 15min UTC. Chaque cycle :
-1. Sleep until next 15m boundary + 2s fudge.
-2. Fetch les 5 dernières bougies 15m + 3 par MTF (30m/1h/4h/1d) Bitstamp.
-3. Resolve les rows pendantes (`label=NaN` dans `training_data_live.csv`, `outcome=pending` dans `decisions.csv`) si la bougie cible est maintenant fermée.
-4. Détecte les setups qualifiants au dernier index 15m (streak 1-4 same-dir + `body_ratio_last ≥ 0.6`).
-5. Pour chaque setup : extrait 42 features, append `training_data_live.csv` (label=NaN), prédit avec Aure, applique le seuil adaptatif du sidecar, append `decisions.csv`, envoie Telegram si `taken=True`.
+1. Sleep jusqu'à la prochaine frontière 15m pile (`CYCLE_FUDGE_SECONDS = 0`, ex: 12:15:00 UTC).
+2. Boucle de freshness retry : refetch jusqu'à obtenir une bougie 15m strictement plus récente que la précédente (preuve que Bitstamp a bien publié la nouvelle bougie qui vient de fermer). 1s entre essais, max 30 tentatives. Si épuisé, cycle skippé (log WARN) et on attend la frontière suivante.
+3. Fetch les 5 dernières bougies 15m + 3 par MTF (30m/1h/4h/1d) Bitstamp.
+4. Resolve les rows pendantes (`label=NaN` dans `training_data_live.csv`, `outcome=pending` dans `decisions.csv`) si la bougie cible est maintenant fermée.
+5. Détecte les setups qualifiants au dernier index 15m (streak 1-4 same-dir + `body_ratio_last ≥ 0.6`), puis applique le filtre `SEQ_LIVE` (cf. ci-dessous).
+6. Pour chaque setup retenu : extrait 42 features, append `training_data_live.csv` (label=NaN), prédit avec Aure, applique le seuil adaptatif du sidecar, append `decisions.csv`, envoie Telegram si `taken=True`.
+
+## Filtre `SEQ_LIVE`
+
+`live/settings.py:SEQ_LIVE` contrôle sur quelles longueurs de streak Aure tire :
+- `SEQ_LIVE = [2, 3, 4]` (défaut, recommandé) — ne tire qu'à partir de 2 bougies same-dir consécutives. Cohérent avec `backtest/config.py:SEQ_TEST` quand on calibre live ↔ backtest.
+- `SEQ_LIVE = [1]` — test isolé sur les setups single-candle (instable, beaucoup plus de paris).
+- `SEQ_LIVE = None` ou `[]` — pas de filtre, toutes les seq_len 1-4 tirent.
+
+Changement à chaud : édite `live/settings.py` puis `python orchestrator.py` redémarre. **En mode dockerisé, settings.py est copié dans l'image au build** — il faut `docker compose up -d --build` (un simple `restart` ne suffit pas, c'est intentionnel pour ne pas qu'un settings.py modifié à chaud parte en prod sans review).
 
 ## Module collision avec backtest/
 
