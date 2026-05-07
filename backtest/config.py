@@ -58,14 +58,14 @@ CSV_PATH = "training_data.csv"
 MODEL_OUTPUT = "btc_reversal_model.json"
 
 TRAIN_DAYS   = 3600     # 1825 jours = 5 ans  (None = utilise tout ce qui reste)
-TEST_DAYS    = 30      # 365 jours = 1 an
+TEST_DAYS    = 365      # 365 jours = 1 an
 VAL_FRACTION = 0.1   # 15% du bloc train+val devient le set de validation (la partie la plus recente du bloc)
 
 # Filtre du test set : liste des seq_len a evaluer.
 #   None ou liste vide = toutes les seq_len presentes dans le CSV (comportement par defaut).
 #   [2, 3]             = n'evalue que sur les rows seq_len in {2, 3}.
 # N'affecte PAS train/val : le modele est toujours entraine sur tout.
-SEQ_TEST = [2, 3, 4]
+SEQ_TEST = [3]
 
 # --- Évaluation ---
 THRESHOLDS = [0.50, 0.52, 0.55,0.56,0.57, 0.58,0.59, 0.60,0.61, 0.62]
