@@ -8,6 +8,11 @@ INTERVAL = "15m"
 DAYS_BACK = 5000
 OUTPUT_CSV = "training_data.csv"
 
+# --- Multi-pair dataset (consume par data_multi.py uniquement) ---
+SYMBOLS_MULTI = ["btcusd", "ethusd", "solusd", "bnbusd", "xrpusd"]
+SYMBOL_TO_ID = {s: i for i, s in enumerate(SYMBOLS_MULTI)}  # btcusd=0, ethusd=1, solusd=2, bnbusd=3, xrpusd=4
+OUTPUT_CSV_MULTI = "training_data_multi.csv"
+
 # --- API Bitstamp ---
 API_URL = "https://www.bitstamp.net/api/v2/ohlc/{pair}/"
 KLINES_LIMIT = 1000      # max autorisé par Bitstamp
@@ -57,7 +62,7 @@ VOLATILITY_LOW = 0.7
 CSV_PATH = "training_data.csv"
 MODEL_OUTPUT = "btc_reversal_model.json"
 
-TRAIN_DAYS   = 3600     # 1825 jours = 5 ans  (None = utilise tout ce qui reste)
+TRAIN_DAYS   = 4000     # 1825 jours = 5 ans  (None = utilise tout ce qui reste)
 TEST_DAYS    = 365      # 365 jours = 1 an
 VAL_FRACTION = 0.1   # 15% du bloc train+val devient le set de validation (la partie la plus recente du bloc)
 
@@ -65,7 +70,7 @@ VAL_FRACTION = 0.1   # 15% du bloc train+val devient le set de validation (la pa
 #   None ou liste vide = toutes les seq_len presentes dans le CSV (comportement par defaut).
 #   [2, 3]             = n'evalue que sur les rows seq_len in {2, 3}.
 # N'affecte PAS train/val : le modele est toujours entraine sur tout.
-SEQ_TEST = [3]
+SEQ_TEST = [2, 3, 4]
 
 # --- Évaluation ---
 THRESHOLDS = [0.50, 0.52, 0.55,0.56,0.57, 0.58,0.59, 0.60,0.61, 0.62]

@@ -20,15 +20,15 @@ session = requests.Session()
 
 
 # ============================================================
-#  FETCH BITSTAMP (parametre par interval)
+#  FETCH BITSTAMP (parametre par symbol et interval)
 # ============================================================
-def fetch_chunk(start_sec, end_sec, interval):
+def fetch_chunk(symbol, start_sec, end_sec, interval):
     """
-    Appelle Bitstamp OHLC pour un interval donne et normalise au format kline
-    Binance [open_time_ms, open, high, low, close, volume] pour garder le reste
-    du pipeline inchange.
+    Appelle Bitstamp OHLC pour une paire + interval donnes et normalise au
+    format kline Binance [open_time_ms, open, high, low, close, volume] pour
+    garder le reste du pipeline inchange.
     """
-    url = API_URL.format(pair=SYMBOL)
+    url = API_URL.format(pair=symbol)
     step_seconds = INTERVAL_MS[interval] // 1000
     params = {
         "step": step_seconds,
@@ -55,7 +55,7 @@ def fetch_chunk(start_sec, end_sec, interval):
     return []
 
 
-def fetch_all_klines(start_time, end_time, interval):
+def fetch_all_klines(symbol, start_time, end_time, interval):
     step = INTERVAL_MS[interval] * KLINES_LIMIT
     windows = []
     current = start_time
@@ -66,7 +66,7 @@ def fetch_all_klines(start_time, end_time, interval):
 
     all_klines = []
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
-        results = executor.map(lambda w: fetch_chunk(w[0], w[1], interval), windows)
+        results = executor.map(lambda w: fetch_chunk(symbol, w[0], w[1], interval), windows)
         for chunk in results:
             all_klines.extend(chunk)
 
@@ -75,12 +75,12 @@ def fetch_all_klines(start_time, end_time, interval):
     return sorted(by_ts.values(), key=lambda k: k[0])
 
 
-def fetch_all_timeframes(start_time, end_time, intervals):
+def fetch_all_timeframes(symbol, start_time, end_time, intervals):
     """Sequentiel au niveau TF (chaque fetch_all_klines parallelise deja en interne)."""
     out = {}
     for iv in intervals:
         print(f"  Fetching {iv}...", flush=True)
-        klines = fetch_all_klines(start_time, end_time, interval=iv)
+        klines = fetch_all_klines(symbol, start_time, end_time, interval=iv)
         out[iv] = klines
         print(f"    {len(klines):,} bars.")
     return out
@@ -374,11 +374,11 @@ def main():
     start = end - (DAYS_BACK * 24 * 60 * 60 * 1000)
 
     print(f"Fetching {DAYS_BACK} days of {INTERVAL} klines for {SYMBOL}...")
-    klines_15m = fetch_all_klines(start, end, interval=INTERVAL)
+    klines_15m = fetch_all_klines(SYMBOL, start, end, interval=INTERVAL)
     print(f"  Fetched {len(klines_15m):,} 15m klines.\n")
 
     print(f"Fetching MTF klines : {MTF_INTERVALS}...")
-    klines_mtf = fetch_all_timeframes(start, end, MTF_INTERVALS)
+    klines_mtf = fetch_all_timeframes(SYMBOL, start, end, MTF_INTERVALS)
     print()
 
     print("Extracting features and labels...")

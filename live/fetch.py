@@ -13,7 +13,7 @@ _BACKTEST_DIR = os.path.join(os.path.dirname(__file__), "..", "backtest")
 sys.path.insert(0, os.path.abspath(_BACKTEST_DIR))
 
 from data import fetch_all_klines  # noqa: E402
-from config import MTF_INTERVALS, INTERVAL_MS  # noqa: E402
+from config import SYMBOL, MTF_INTERVALS, INTERVAL_MS  # noqa: E402
 
 INTERVAL_15M = "15m"
 
@@ -43,14 +43,14 @@ def _fetch_all(n_15m: int, n_mtf: int) -> dict:
     # 15m
     interval_15m_ms = INTERVAL_MS[INTERVAL_15M]
     start_15m = now_ms - (n_15m + 2) * interval_15m_ms  # +2 marge pour overlap
-    klines_15m = fetch_all_klines(start_15m, now_ms, INTERVAL_15M)
+    klines_15m = fetch_all_klines(SYMBOL, start_15m, now_ms, INTERVAL_15M)
     out[INTERVAL_15M] = klines_15m[-n_15m:] if len(klines_15m) > n_15m else klines_15m
 
     # MTF
     for tf in MTF_INTERVALS:
         tf_ms = INTERVAL_MS[tf]
         start_tf = now_ms - (n_mtf + 2) * tf_ms
-        klines_tf = fetch_all_klines(start_tf, now_ms, tf)
+        klines_tf = fetch_all_klines(SYMBOL, start_tf, now_ms, tf)
         out[tf] = klines_tf[-n_mtf:] if len(klines_tf) > n_mtf else klines_tf
 
     return out
