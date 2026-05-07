@@ -66,6 +66,10 @@ def _ensure_sidecar() -> None:
 
 
 def _load_model() -> xgb.XGBClassifier:
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"model file not found at {MODEL_PATH} — copy aure.json to repo root"
+        )
     model = xgb.XGBClassifier()
     model.load_model(str(MODEL_PATH))
     _log.info("model_loaded %s features=%d", MODEL_PATH.name,
@@ -76,16 +80,26 @@ def _load_model() -> xgb.XGBClassifier:
 def _load_sidecar() -> dict:
     """Returns {'base_threshold': float, 'deltas': dict[str, float]}.
 
-    Si pas de sidecar : fallback {'base_threshold': 0.58, 'deltas': {}}.
+    Si pas de sidecar OU sidecar malforme : fallback
+    {'base_threshold': 0.58, 'deltas': {}} avec un log ERROR. On ne crash
+    pas le daemon — on tourne avec le seuil fixe et l'operateur fixe le
+    sidecar a chaud (et restart pour le reload).
     """
     if not THRESHOLDS_PATH.exists():
         return {"base_threshold": 0.58, "deltas": {}}
-    with open(THRESHOLDS_PATH) as f:
-        data = json.load(f)
-    return {
-        "base_threshold": float(data["base_threshold"]),
-        "deltas": {k: float(v) for k, v in data.get("deltas", {}).items()},
-    }
+    try:
+        with open(THRESHOLDS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return {
+            "base_threshold": float(data["base_threshold"]),
+            "deltas": {k: float(v) for k, v in data.get("deltas", {}).items()},
+        }
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
+        _log.error(
+            "sidecar_malformed %s err=%s — fallback to base=0.58 with no deltas",
+            THRESHOLDS_PATH, e,
+        )
+        return {"base_threshold": 0.58, "deltas": {}}
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +127,12 @@ def _predict_and_decide(model: xgb.XGBClassifier, sidecar: dict, features: dict)
     Returns dict utilise par store.append_decision_row + notify.format_decision_message.
     """
     expected_cols = list(model.get_booster().feature_names)
+    missing = [col for col in expected_cols if col not in features]
+    if missing:
+        raise ValueError(
+            f"_predict_and_decide: features dict missing keys {missing} — "
+            f"verifier que find_setups_at_latest produit le bon schema"
+        )
     df = pd.DataFrame([{col: features[col] for col in expected_cols}])
     confidence = float(model.predict_proba(df)[:, 1][0])
 
