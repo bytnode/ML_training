@@ -312,7 +312,7 @@ from data import (  # noqa: E402
 from config import (  # noqa: E402
     INTERVAL_MS, MTF_INTERVALS, MAX_SEQ_LEN, BODY_RATIO_MIN, WARMUP,
     EMA_CLOSE_PERIODS, RSI_PERIOD, ATR_PERIOD, ATR_LONG_PERIOD,
-    VOL_AVG_PERIOD, OBV_SLOPE_WINDOW, RSI_CHANGE_WINDOW, OBV_EMA_PERIOD,
+    VOL_AVG_PERIOD, OBV_SLOPE_WINDOW, RSI_CHANGE_WINDOW, EMA_OBV_PERIOD,
     VOLATILITY_HIGH, VOLATILITY_LOW,
 )
 
@@ -349,7 +349,7 @@ def find_setups_at_latest(klines_15m: list, klines_mtf: dict) -> list:
 
     # Indicateurs (mirror de extract_features)
     obv = compute_obv(closes, volumes)
-    ema_obv_20 = compute_ema(obv, OBV_EMA_PERIOD)
+    ema_obv_20 = compute_ema(obv, EMA_OBV_PERIOD)
     ema_close_20 = compute_ema(closes, ema_p_short)
     ema_close_50 = compute_ema(closes, ema_p_mid)
     ema_close_200 = compute_ema(closes, ema_p_long)

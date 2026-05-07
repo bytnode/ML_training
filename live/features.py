@@ -4,6 +4,14 @@ features attendues par Aure.
 MIRROR de backtest/data.py:extract_features (lignes 211-371). Si tu ajoutes
 une feature dans extract_features, ajoute-la ici aussi. Pas de label calcule
 ici (la bougie cible n'est pas encore fermee au moment de la decision).
+
+Limitation connue (acceptable) : extract_features filtre aussi les setups
+dont la bougie suivante (target) est flat (open == close). En live, on ne
+connait pas encore la target au moment de la decision, donc on ne peut pas
+appliquer ce filtre. Resultat : Aure peut occasionnellement noter un setup
+dont la target sera flat (cas rare en BTC) — ces cas etaient absents du
+training set, donc la confidence est non calibree dessus. On accepte ce
+gap : pas de fix possible sans connaitre le futur.
 """
 import os
 import sys
@@ -15,7 +23,10 @@ sys.path.insert(0, os.path.abspath(_BACKTEST_DIR))
 from data import (  # noqa: E402
     compute_obv, compute_ema, compute_rsi, compute_atr, compute_volume_avg,
     body_ratio, upper_wick_ratio, lower_wick_ratio, get_direction,
-    last_closed_index, _index_mtf,
+    last_closed_index,
+    _index_mtf,  # private dans backtest/data.py mais utilise legitimement ici
+                 # (live/ est un 2e consommateur). Si renomme cote backtest,
+                 # mettre a jour ici aussi.
 )
 from config import (  # noqa: E402
     INTERVAL_MS, MTF_INTERVALS, MAX_SEQ_LEN, BODY_RATIO_MIN, WARMUP,
