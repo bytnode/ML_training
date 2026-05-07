@@ -180,6 +180,11 @@ def update_pending_outcomes(klines_15m: list) -> int:
     if not pending_mask.any():
         return 0
 
+    # outcome_resolved_at is None for all pending rows and pandas reads it as
+    # float64. Cast to object so that assigning an ISO string doesn't raise a
+    # FutureWarning (and will raise an error in pandas >= 3.0).
+    df["outcome_resolved_at"] = df["outcome_resolved_at"].astype(object)
+
     candle_by_ts = {int(k[0]): k for k in klines_15m}
     now_iso = _utc_iso_now()
     updated = 0
