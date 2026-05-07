@@ -57,7 +57,9 @@ def send_message(text: str) -> bool:
     for attempt in (1, 2):
         try:
             resp = requests.post(url, json=payload, timeout=TELEGRAM_TIMEOUT)
-        except (requests.Timeout, requests.ConnectionError) as e:
+        except requests.RequestException as e:
+            # Catch large : Timeout, ConnectionError, SSLError, ProxyError,
+            # TooManyRedirects, etc. Honore le contrat 'never raises' du module.
             if attempt == 1:
                 time.sleep(2)
                 continue
