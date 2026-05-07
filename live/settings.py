@@ -35,5 +35,18 @@ TELEGRAM_TIMEOUT = 10  # seconds
 # 15min en millisecondes (utilise pour calculer next boundary et target_open_time)
 INTERVAL_15M_MS = 15 * 60 * 1000
 
-# Marge apres frontiere 15min avant de fetch (laisse le temps a Bitstamp de publier)
-CYCLE_FUDGE_SECONDS = 2
+# Marge apres frontiere 15min avant de fetch.
+# 0 = wake-up "logique" pile a la frontiere (ex: 12:15:00 UTC). Bitstamp peut
+# avoir un delai de publication de la bougie qui vient de fermer ; geree
+# dynamiquement par la boucle de freshness retry ci-dessous (pas par cette
+# marge fixe).
+CYCLE_FUDGE_SECONDS = 0
+
+# Au reveil d'un cycle, le daemon refetch jusqu'a obtenir une bougie 15m
+# strictement plus recente que la derniere bougie connue (= preuve que
+# Bitstamp a bien publie la nouvelle bougie qui vient de fermer). Sleep
+# de FRESH_CANDLE_RETRY_INTERVAL secondes entre essais, max
+# FRESH_CANDLE_MAX_RETRIES tentatives. Si epuise, le cycle est skippe
+# (log WARN) et on attend la prochaine frontiere 15min.
+FRESH_CANDLE_RETRY_INTERVAL = 1   # secondes entre retries
+FRESH_CANDLE_MAX_RETRIES = 30     # 30 retries x 1s = 30s de patience max

@@ -20,6 +20,7 @@ from settings import (
     WARMUP_CANDLES_15M, WARMUP_CANDLES_MTF,
     RECENT_FETCH_15M, RECENT_FETCH_MTF,
     INTERVAL_15M_MS, CYCLE_FUDGE_SECONDS,
+    FRESH_CANDLE_RETRY_INTERVAL, FRESH_CANDLE_MAX_RETRIES,
 )
 from fetch import fetch_warmup_window, fetch_recent_window, merge_klines
 from features import find_setups_at_latest
@@ -193,17 +194,57 @@ def _predict_and_decide(model: xgb.XGBClassifier, sidecar: dict, features: dict)
 # ---------------------------------------------------------------------------
 # Run cycle
 # ---------------------------------------------------------------------------
-def run_cycle(model, sidecar, klines_state: dict, no_notify: bool) -> dict:
+def run_cycle(
+    model, sidecar, klines_state: dict, no_notify: bool,
+    wait_for_fresh: bool = True,
+) -> dict:
     """Execute un cycle complet. Mute klines_state in place avec les nouvelles bougies.
+
+    wait_for_fresh : si True (mode daemon), retry le fetch jusqu'a obtenir une
+    bougie 15m strictement plus recente que la derniere connue (= preuve que
+    Bitstamp a publie la nouvelle bougie qui vient de fermer). Si epuise, skip
+    le cycle. False en mode --dry-run (on veut tester le pipeline meme si le
+    fetch ne ramene rien de neuf — typique car warmup vient juste de tourner).
 
     Returns: stats du cycle (dict) pour log.
     """
     cycle_start = time.time()
 
-    # 1. Fetch recent
-    fresh = fetch_recent_window(RECENT_FETCH_15M, RECENT_FETCH_MTF)
-    for tf, candles in fresh.items():
-        klines_state[tf] = merge_klines(klines_state.get(tf, []), candles)
+    # 1. Fetch recent (+ freshness retry en mode daemon).
+    if wait_for_fresh:
+        prev_last_open = klines_state["15m"][-1][0] if klines_state.get("15m") else 0
+        fresh = None
+        fresh_ok = False
+        for attempt in range(1, FRESH_CANDLE_MAX_RETRIES + 1):
+            fresh = fetch_recent_window(RECENT_FETCH_15M, RECENT_FETCH_MTF)
+            for tf, candles in fresh.items():
+                klines_state[tf] = merge_klines(klines_state.get(tf, []), candles)
+            latest_open = klines_state["15m"][-1][0] if klines_state["15m"] else 0
+            if latest_open > prev_last_open:
+                fresh_ok = True
+                if attempt > 1:
+                    _log.info("fresh_candle_obtained attempt=%d", attempt)
+                break
+            if attempt < FRESH_CANDLE_MAX_RETRIES:
+                time.sleep(FRESH_CANDLE_RETRY_INTERVAL)
+
+        if not fresh_ok:
+            _log.warning(
+                "no_fresh_candle after %d retries (last_known_open=%d) — cycle skipped",
+                FRESH_CANDLE_MAX_RETRIES, prev_last_open,
+            )
+            return {
+                "setups": 0,
+                "notifs_sent": 0,
+                "duration_ms": int((time.time() - cycle_start) * 1000),
+                "labels_resolved": 0,
+                "outcomes_resolved": 0,
+            }
+    else:
+        # Mode --dry-run : un seul fetch, pas de freshness check.
+        fresh = fetch_recent_window(RECENT_FETCH_15M, RECENT_FETCH_MTF)
+        for tf, candles in fresh.items():
+            klines_state[tf] = merge_klines(klines_state.get(tf, []), candles)
 
     _log.info("fetched candles_15m=%d candles_30m=%d candles_1h=%d candles_4h=%d candles_1d=%d",
               len(fresh.get("15m", [])), len(fresh.get("30m", [])),
@@ -299,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         _log.info("dry_run executing single cycle")
-        run_cycle(model, sidecar, klines_state, no_notify=args.no_notify)
+        run_cycle(model, sidecar, klines_state, no_notify=args.no_notify, wait_for_fresh=False)
         _log.info("dry_run done")
         return 0
 
