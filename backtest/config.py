@@ -59,7 +59,7 @@ VOLATILITY_LOW = 0.7
 # ============================================================
 
 # --- Fichiers ---
-CSV_PATH = "training_data.csv"
+CSV_PATH = "training_data_multi.csv"
 MODEL_OUTPUT = "btc_reversal_model.json"
 
 TRAIN_DAYS   = 4000     # 1825 jours = 5 ans  (None = utilise tout ce qui reste)
@@ -71,6 +71,14 @@ VAL_FRACTION = 0.1   # 15% du bloc train+val devient le set de validation (la pa
 #   [2, 3]             = n'evalue que sur les rows seq_len in {2, 3}.
 # N'affecte PAS train/val : le modele est toujours entraine sur tout.
 SEQ_TEST = [2, 3, 4]
+
+# Filtre du test set : liste des symboles a evaluer.
+#   None ou liste vide = toutes les paires (comportement par defaut).
+#   ["btcusd"]         = test uniquement sur BTC (utile pour entrainer multi-pair
+#                        et evaluer sur la paire production).
+# N'affecte PAS train/val : le modele est toujours entraine sur tout.
+# Ignore silencieusement (avec warning) si le CSV n'a pas de colonne symbol_id.
+SYMBOL_TEST = ["btcusd"]
 
 # --- Évaluation ---
 THRESHOLDS = [0.50, 0.52, 0.55,0.56,0.57, 0.58,0.59, 0.60,0.61, 0.62]

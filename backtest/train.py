@@ -30,7 +30,8 @@ import xgboost as xgb
 
 from config import (
     CSV_PATH, MODEL_OUTPUT,
-    TRAIN_DAYS, TEST_DAYS, VAL_FRACTION, SEQ_TEST,
+    TRAIN_DAYS, TEST_DAYS, VAL_FRACTION, SEQ_TEST, SYMBOL_TEST,
+    SYMBOL_TO_ID,
     THRESHOLDS, BREAKDOWN_THRESHOLD,
     ADAPTIVE_THRESHOLD, ADAPTIVE_TARGET_WR, ADAPTIVE_CALIB_FRACTION,
     ADAPTIVE_MIN_N_VAL, ADAPTIVE_MIN_N_VAL_SOFT, ADAPTIVE_MIN_N_AT_THRESHOLD,
@@ -316,6 +317,21 @@ def train_and_evaluate(
         if verbose:
             print(f"\nSEQ_TEST = {seq_test_active} : test filtre de {n_before:,} -> {len(test):,} rows")
 
+    # Filtre optionnel sur le test set par symbole (n'affecte ni train ni val).
+    # Silencieux si le CSV n'a pas de colonne symbol_id (mode single-pair legacy).
+    symbol_test_active = SYMBOL_TEST if SYMBOL_TEST else None
+    if symbol_test_active:
+        if "symbol_id" not in test.columns:
+            if verbose:
+                print(f"\nSYMBOL_TEST = {symbol_test_active} ignore (CSV sans colonne symbol_id)")
+            symbol_test_active = None
+        else:
+            target_ids = [SYMBOL_TO_ID[s] for s in symbol_test_active]
+            n_before = len(test)
+            test = test[test["symbol_id"].isin(target_ids)].reset_index(drop=True)
+            if verbose:
+                print(f"SYMBOL_TEST = {symbol_test_active} : test filtre de {n_before:,} -> {len(test):,} rows")
+
     if verbose:
         ignored = train_val_start
         print(f"\nSplit temporel : TRAIN_DAYS={TRAIN_DAYS}, TEST_DAYS={TEST_DAYS}, VAL_FRACTION={VAL_FRACTION}")
@@ -325,7 +341,7 @@ def train_and_evaluate(
         if len(test) > 0:
             print(f"  test  : {len(test):,} rows  ({pd.to_datetime(test['timestamp'].min(), unit='ms').date()} -> {pd.to_datetime(test['timestamp'].max(), unit='ms').date()})")
         else:
-            print(f"  test  : 0 rows  (SEQ_TEST = {seq_test_active} ne matche aucune row)")
+            print(f"  test  : 0 rows  (filtres : SEQ_TEST={seq_test_active}, SYMBOL_TEST={symbol_test_active} ne matchent aucune row)")
 
     feature_cols = [c for c in df.columns if c not in ("timestamp", "label")]
     X_train, y_train = train[feature_cols], train["label"]
@@ -451,6 +467,7 @@ def train_and_evaluate(
         "test_days": TEST_DAYS,
         "val_fraction": VAL_FRACTION,
         "seq_test": ",".join(str(s) for s in seq_test_active) if seq_test_active else "all",
+        "symbol_test": ",".join(symbol_test_active) if symbol_test_active else "all",
         "n_features": len(feature_cols),
         "n_train": len(train),
         "n_val": len(val),
