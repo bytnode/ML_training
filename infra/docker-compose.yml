@@ -1,0 +1,27 @@
+# Compose le daemon Aure live.
+#
+# Build context = racine du repo (un niveau au-dessus de ce fichier) pour que
+# le Dockerfile puisse COPY backtest/ et live/. Le .dockerignore est aussi
+# lu depuis la racine du repo.
+#
+# Usage (depuis ce dossier infra/) :
+#   docker compose up -d --build      # build + start en arriere-plan
+#   docker compose logs -f aure-live  # suivre les logs
+#   docker compose restart aure-live  # restart (pour reload aure.json apres replace)
+#   docker compose down               # stop + remove
+
+services:
+  aure-live:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+    container_name: aure-live
+    restart: unless-stopped
+    env_file: ../.env
+    volumes:
+      # Modele et sidecar (mounts de fichiers, pas dossiers — doivent exister sur l'host avant up).
+      - ../aure.json:/app/aure.json
+      - ../aure.thresholds.json:/app/aure.thresholds.json
+      # Logs et CSVs persistent en host (sinon perdus au container restart).
+      - ../live/logs:/app/live/logs
+    # Pas de port publie : le daemon n'a que des connexions sortantes (Bitstamp + Telegram).

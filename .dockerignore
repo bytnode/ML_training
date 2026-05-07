@@ -1,0 +1,38 @@
+# Lu lors du build Docker (build context = racine du repo, cf. infra/docker-compose.yml).
+# Garde l'image leger : on n'embarque que le code (backtest/ + live/) et les deps Python.
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.git/
+.gitignore
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Docs / specs : pas besoin dans le runtime.
+docs/
+
+# Datasets / artifacts du pipeline backtest (regenerables, gros).
+*.csv
+backtest/training_data*.csv
+backtest/logs/
+backtest/btc_reversal_model.json
+
+# Modele + sidecar : montes en volume au runtime, pas bakes dans l'image.
+aure.json
+aure.thresholds.json
+
+# Secrets : charges via env_file de compose, pas copies dans l'image.
+.env
+
+# Logs live : montes en volume.
+live/logs/
+
+# Pyproject / venv eventuels.
+.venv/
+venv/
+env/

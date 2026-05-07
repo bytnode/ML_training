@@ -24,6 +24,21 @@ python orchestrator.py --no-notify
 python orchestrator.py --dry-run --no-notify
 ```
 
+### Lancement dockerisé (recommandé pour la prod)
+
+Pre-requis : `aure.json` + `aure.thresholds.json` doivent exister à la racine du repo (Docker bind-mount des fichiers, ne crée pas si absent). Le `.env` à la racine fournit les credentials Telegram via `env_file:` de compose.
+
+```powershell
+# Depuis le dossier infra/
+cd infra
+docker compose up -d --build      # build + start en arriere-plan
+docker compose logs -f aure-live  # suivre les logs
+docker compose restart aure-live  # apres avoir remplace aure.json sur l'host
+docker compose down               # stop + remove
+```
+
+Modèle / sidecar / `live/logs/` sont montés en volume depuis l'host : pas de rebuild quand tu retraines, juste un `docker compose restart`.
+
 ## Architecture
 
 Daemon Python long-running aligné sur les frontières 15min UTC. Chaque cycle :
