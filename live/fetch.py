@@ -12,8 +12,8 @@ import time
 _BACKTEST_DIR = os.path.join(os.path.dirname(__file__), "..", "backtest")
 sys.path.insert(0, os.path.abspath(_BACKTEST_DIR))
 
-from data import fetch_all_klines, fetch_all_timeframes  # noqa: E402
-from config import SYMBOL, MTF_INTERVALS, INTERVAL_MS  # noqa: E402
+from data import fetch_all_klines  # noqa: E402
+from config import MTF_INTERVALS, INTERVAL_MS  # noqa: E402
 
 INTERVAL_15M = "15m"
 
