@@ -176,8 +176,8 @@ def run_cycle(model, sidecar, klines_state: dict, no_notify: bool) -> dict:
               len(fresh.get("1d", [])))
 
     # 2. Resolve pendings (avec les klines_15m mises a jour)
-    n_labels = update_pending_labels(klines_state["15m"])
-    n_outcomes = update_pending_outcomes(klines_state["15m"])
+    n_labels, _ = update_pending_labels(klines_state["15m"])
+    n_outcomes, _ = update_pending_outcomes(klines_state["15m"])
     if n_labels or n_outcomes:
         _log.info("pendings_resolved labels=%d outcomes=%d", n_labels, n_outcomes)
 
@@ -245,10 +245,15 @@ def main(argv: list[str] | None = None) -> int:
     klines_state = fetch_warmup_window(WARMUP_CANDLES_15M, WARMUP_CANDLES_MTF)
 
     # Resolve startup pendings (avec les klines warmup)
-    n_labels = update_pending_labels(klines_state["15m"])
-    n_outcomes = update_pending_outcomes(klines_state["15m"])
+    n_labels, rem_labels = update_pending_labels(klines_state["15m"])
+    n_outcomes, rem_outcomes = update_pending_outcomes(klines_state["15m"])
     if n_labels or n_outcomes:
         _log.info("startup_pendings_resolved labels=%d outcomes=%d", n_labels, n_outcomes)
+    if rem_labels or rem_outcomes:
+        # Pendings dont la bougie cible est anterieure a la fenetre de warmup
+        # (typiquement daemon down >50h). Restent NaN/pending indefiniment ;
+        # l'operateur peut regenerer via backtest/data.py si besoin.
+        _log.warning("unresolvable_pending labels=%d outcomes=%d", rem_labels, rem_outcomes)
 
     if args.dry_run:
         _log.info("dry_run executing single cycle")

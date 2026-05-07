@@ -104,7 +104,7 @@ def _append_with_header_if_missing(df: pd.DataFrame, path: Path) -> None:
         df.to_csv(path, mode="w", header=True, index=False)
 
 
-def update_pending_labels(klines_15m: list) -> int:
+def update_pending_labels(klines_15m: list) -> tuple[int, int]:
     """Resoud les rows de training_data_live.csv ou label est NaN.
 
     Pour chaque row pendante :
@@ -113,17 +113,18 @@ def update_pending_labels(klines_15m: list) -> int:
       - si trouvee : label = 1 si direction inverse seq_dir, 0 sinon
       - si pas trouvee (target pas encore close) : laisse NaN
 
-    Returns: nombre de rows mises a jour.
+    Returns: (rows_resolved, rows_remaining_pending).
     """
     if not TRAINING_DATA_LIVE.exists():
-        return 0
+        return (0, 0)
     df = pd.read_csv(TRAINING_DATA_LIVE)
     if df.empty or "label" not in df.columns:
-        return 0
+        return (0, 0)
 
     pending_mask = df["label"].isna()
-    if not pending_mask.any():
-        return 0
+    initial_pending = int(pending_mask.sum())
+    if initial_pending == 0:
+        return (0, 0)
 
     candle_by_ts = {int(k[0]): k for k in klines_15m}
     updated = 0
@@ -156,10 +157,10 @@ def update_pending_labels(klines_15m: list) -> int:
         # On garde nullable Int64 pour pouvoir retenir des NaN sur les rows non encore resolues.
         df["label"] = df["label"].astype("Int64")
         _atomic_write(df, TRAINING_DATA_LIVE)
-    return updated
+    return (updated, initial_pending - updated)
 
 
-def update_pending_outcomes(klines_15m: list) -> int:
+def update_pending_outcomes(klines_15m: list) -> tuple[int, int]:
     """Resoud les rows de decisions.csv ou outcome=='pending'.
 
     Pour chaque row pendante :
@@ -168,17 +169,18 @@ def update_pending_outcomes(klines_15m: list) -> int:
                      outcome_resolved_at = utc iso now
       - sinon : laisse 'pending'
 
-    Returns: nombre de rows mises a jour.
+    Returns: (rows_resolved, rows_remaining_pending).
     """
     if not DECISIONS_CSV.exists():
-        return 0
+        return (0, 0)
     df = pd.read_csv(DECISIONS_CSV)
     if df.empty or "outcome" not in df.columns:
-        return 0
+        return (0, 0)
 
     pending_mask = df["outcome"] == "pending"
-    if not pending_mask.any():
-        return 0
+    initial_pending = int(pending_mask.sum())
+    if initial_pending == 0:
+        return (0, 0)
 
     # outcome_resolved_at is None for all pending rows and pandas reads it as
     # float64. Cast to object so that assigning an ISO string doesn't raise a
@@ -211,7 +213,7 @@ def update_pending_outcomes(klines_15m: list) -> int:
 
     if updated:
         _atomic_write(df, DECISIONS_CSV)
-    return updated
+    return (updated, initial_pending - updated)
 
 
 if __name__ == "__main__":
