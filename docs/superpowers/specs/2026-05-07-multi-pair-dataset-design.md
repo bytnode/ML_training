@@ -1,7 +1,30 @@
 # Spec : Dataset multi-paires (BTC + ETH + SOL + BNB + XRP)
 
 **Date** : 2026-05-07
-**Statut** : approuvé
+**Statut** : ❌ **ABANDONNÉ** (2026-05-07 après-midi)
+
+**Raison de l'abandon** : approche testée (script `data_multi.py` exécuté, modèle
+réentraîné sur les ~1.45M lignes multi-pair, filtre `SYMBOL_TEST=["btcusd"]` ajouté
+pour évaluer sur BTC seulement). Le gain de WR sur le test BTC n'a pas dépassé le
+modèle BTC-only ; la complexité ajoutée (signature `fetch_*(symbol, ...)`, sidecar
+des 5 paires, gestion `symbol_id` côté live) ne valait pas l'effort. L'idée
+multi-crypto est rejetée pour le moment.
+
+**Ce qui a été conservé du spec dans le code** :
+- Le refactor de signature de `fetch_chunk`, `fetch_all_klines`, `fetch_all_timeframes`
+  pour prendre `symbol` en argument (amélioration clean indépendante du multi-pair).
+
+**Ce qui a été retiré** :
+- `backtest/data_multi.py` (supprimé)
+- Constantes `SYMBOLS_MULTI`, `SYMBOL_TO_ID`, `OUTPUT_CSV_MULTI` dans `config.py`
+- Filtre `SYMBOL_TEST` dans `config.py` et sa logique dans `train.py`
+
+Spec gardé en place pour traçabilité historique. **Ne pas suivre comme guide
+d'implémentation.**
+
+---
+
+
 
 ## Problème
 

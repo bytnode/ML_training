@@ -8,11 +8,6 @@ INTERVAL = "15m"
 DAYS_BACK = 5000
 OUTPUT_CSV = "training_data.csv"
 
-# --- Multi-pair dataset (consume par data_multi.py uniquement) ---
-SYMBOLS_MULTI = ["btcusd", "ethusd", "solusd", "bnbusd", "xrpusd"]
-SYMBOL_TO_ID = {s: i for i, s in enumerate(SYMBOLS_MULTI)}  # btcusd=0, ethusd=1, solusd=2, bnbusd=3, xrpusd=4
-OUTPUT_CSV_MULTI = "training_data_multi.csv"
-
 # --- API Bitstamp ---
 API_URL = "https://www.bitstamp.net/api/v2/ohlc/{pair}/"
 KLINES_LIMIT = 1000      # max autorisé par Bitstamp
@@ -71,14 +66,6 @@ VAL_FRACTION = 0.1   # 15% du bloc train+val devient le set de validation (la pa
 #   [2, 3]             = n'evalue que sur les rows seq_len in {2, 3}.
 # N'affecte PAS train/val : le modele est toujours entraine sur tout.
 SEQ_TEST = [2, 3, 4]
-
-# Filtre du test set : liste des symboles a evaluer.
-#   None ou liste vide = toutes les paires (comportement par defaut).
-#   ["btcusd"]         = test uniquement sur BTC (utile pour entrainer multi-pair
-#                        et evaluer sur la paire production).
-# N'affecte PAS train/val : le modele est toujours entraine sur tout.
-# Ignore silencieusement (avec warning) si le CSV n'a pas de colonne symbol_id.
-SYMBOL_TEST = ["btcusd"]
 
 # --- Évaluation ---
 THRESHOLDS = [0.50, 0.52, 0.55,0.56,0.57, 0.58,0.59, 0.60,0.61, 0.62]
