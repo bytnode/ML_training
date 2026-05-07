@@ -17,3 +17,8 @@ env/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Live orchestrator artifacts
+live/logs/*.csv
+live/logs/*.log
+aure.thresholds.json
