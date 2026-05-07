@@ -21,6 +21,7 @@ from settings import (
     RECENT_FETCH_15M, RECENT_FETCH_MTF,
     INTERVAL_15M_MS, CYCLE_FUDGE_SECONDS,
     FRESH_CANDLE_RETRY_INTERVAL, FRESH_CANDLE_MAX_RETRIES,
+    SEQ_LIVE,
 )
 from fetch import fetch_warmup_window, fetch_recent_window, merge_klines
 from features import find_setups_at_latest
@@ -261,6 +262,16 @@ def run_cycle(
     klines_15m = klines_state["15m"]
     klines_mtf = {tf: klines_state[tf] for tf in klines_state if tf != "15m"}
     setups = find_setups_at_latest(klines_15m, klines_mtf)
+
+    # Filtre SEQ_LIVE : ne tirer que sur les seq_len autorises (par defaut [2,3,4]).
+    # None ou liste vide = pas de filtre (tous les seq_len ∈ {1,2,3,4} qualifient).
+    if SEQ_LIVE:
+        n_before_filter = len(setups)
+        setups = [(seq_len, feat) for seq_len, feat in setups if seq_len in SEQ_LIVE]
+        if n_before_filter != len(setups):
+            _log.info("setups_filtered SEQ_LIVE=%s : %d -> %d",
+                      SEQ_LIVE, n_before_filter, len(setups))
+
     _log.info("setups_qualifying=%d", len(setups))
 
     # 4. Pour chaque setup : append + predict + notif

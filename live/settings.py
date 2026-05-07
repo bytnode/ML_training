@@ -27,6 +27,15 @@ RECENT_FETCH_MTF = 3
 FETCH_RETRIES = 3
 FETCH_BACKOFF_BASE = 2  # seconds, exponential
 
+# Filtre live des seq_len pour lesquels Aure tire :
+#   None ou liste vide = tous (1, 2, 3, 4) — Aure tire des qu'une bougie passe
+#                        body_ratio_last >= 0.6 (instable, beaucoup de paris).
+#   [2, 3, 4]          = ne tire que sur des streaks d'au moins 2 bougies
+#                        same-direction. Recommande, coherent avec
+#                        backtest/config.py:SEQ_TEST=[2,3,4].
+#   [1]                = test isole sur les setups single-candle.
+SEQ_LIVE = [2, 3, 4]
+
 # Telegram
 TELEGRAM_BOT_TOKEN_ENV = "AURE_TELEGRAM_BOT_TOKEN"
 TELEGRAM_CHAT_ID_ENV = "AURE_TELEGRAM_CHAT_ID"
