@@ -1,61 +1,83 @@
-"""Configuration locale de l'orchestrateur Aure (live mode).
+"""Live trader configuration. All knobs live here.
 
-Important : ce module s'appelle settings.py et non config.py pour eviter
-la collision de namespace avec backtest/config.py quand sys.path inclut
-backtest/. Voir docs/superpowers/plans/2026-05-07-aure-live-orchestrator.md
-section 'Note d'architecture critique'.
+Note: this is settings.py (not config.py) because we sys.path.insert backtest/modele_15m/
+in the imports below, and that module already exports a top-level `config` we don't
+want to shadow.
 """
+import os
+import sys
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parent
 LOGS_DIR = ROOT / "logs"
+LOGS_DIR.mkdir(exist_ok=True)
 
-TRAINING_DATA_LIVE = LOGS_DIR / "training_data_live.csv"
+# --- Load .env: live/.env takes priority, then repo-root .env fills in missing vars ---
+# (load_dotenv with override=False only sets vars not already in os.environ.)
+load_dotenv(ROOT / ".env", override=False)
+load_dotenv(REPO_ROOT / ".env", override=False)
+
+# --- Logs ---
 DECISIONS_CSV = LOGS_DIR / "decisions.csv"
+BETS_CSV = LOGS_DIR / "bets.csv"
+WALLET_HISTORY_CSV = LOGS_DIR / "wallet_history.csv"
 ORCHESTRATOR_LOG = LOGS_DIR / "orchestrator.log"
 
-MODEL_PATH = REPO_ROOT / "aure.json"
-THRESHOLDS_PATH = REPO_ROOT / "aure.thresholds.json"
-THRESHOLDS_SOURCE = REPO_ROOT / "backtest" / "btc_reversal_model.thresholds.json"
-
-# Cycle parameters
-WARMUP_CANDLES_15M = 200
+# --- Cycle ---
+SEQ_LIVE = [2, 3, 4]                    # seq_len values the daemon fires on
+FRESHNESS_RETRY_MAX = 5
+FRESHNESS_RETRY_DELAY_S = 1
+WARMUP_CANDLES_15M = 250                # need enough history for EMA-200 + obv_slope_10
 WARMUP_CANDLES_MTF = 50
-RECENT_FETCH_15M = 5
-RECENT_FETCH_MTF = 3
-FETCH_RETRIES = 3
-FETCH_BACKOFF_BASE = 2  # seconds, exponential
 
-# Filtre live des seq_len pour lesquels Aure tire :
-#   None ou liste vide = tous (1, 2, 3, 4) — Aure tire des qu'une bougie passe
-#                        body_ratio_last >= 0.6 (instable, beaucoup de paris).
-#   [2, 3, 4]          = ne tire que sur des streaks d'au moins 2 bougies
-#                        same-direction. Recommande, coherent avec
-#                        backtest/config.py:SEQ_TEST=[2,3,4].
-#   [1]                = test isole sur les setups single-candle.
-SEQ_LIVE = [2, 3, 4]
+# --- Bet sizing ---
+BET_FRACTION = 0.10                     # 10% of free USDC per window
+BET_MIN_USDC = 1.00                     # Polymarket minimum order
+BET_MAX_FRACTION = 0.95                 # safety: refuse to bet > 95% of balance
 
-# Telegram
-TELEGRAM_BOT_TOKEN_ENV = "AURE_TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID_ENV = "AURE_TELEGRAM_CHAT_ID"
-TELEGRAM_TIMEOUT = 10  # seconds
+# --- Settlement reconciliation ---
+SETTLEMENT_STUCK_AFTER_CYCLES = 6       # ~90min after window close
 
-# 15min en millisecondes (utilise pour calculer next boundary et target_open_time)
-INTERVAL_15M_MS = 15 * 60 * 1000
+# --- Polymarket / Polygon (env vars are mandatory; no defaults for keys) ---
+POLYGON_PRIVATE_KEY = os.environ.get("POLYGON_PRIVATE_KEY")
+POLYGON_EOA_ADDRESS = os.environ.get("POLYGON_EOA_ADDRESS")
+POLYMARKET_PROXY_ADDRESS = os.environ.get("POLYMARKET_PROXY_ADDRESS")
+POLYGON_RPC_URL = os.environ.get("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com")
+CLOB_HOST = os.environ.get("CLOB_HOST", "https://clob.polymarket.com")
+GAMMA_HOST = os.environ.get("GAMMA_HOST", "https://gamma-api.polymarket.com")
+POLYMARKET_API_TIMEOUT = 10
+MATIC_LOW_THRESHOLD = 0.5
 
-# Marge apres frontiere 15min avant de fetch.
-# 0 = wake-up "logique" pile a la frontiere (ex: 12:15:00 UTC). Bitstamp peut
-# avoir un delai de publication de la bougie qui vient de fermer ; geree
-# dynamiquement par la boucle de freshness retry ci-dessous (pas par cette
-# marge fixe).
-CYCLE_FUDGE_SECONDS = 0
+# --- Telegram (optional; if missing, daemon runs but doesn't notify) ---
+TELEGRAM_BOT_TOKEN = os.environ.get("AURE_TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("AURE_TELEGRAM_CHAT_ID")
+TELEGRAM_TIMEOUT = 10
 
-# Au reveil d'un cycle, le daemon refetch jusqu'a obtenir une bougie 15m
-# strictement plus recente que la derniere bougie connue (= preuve que
-# Bitstamp a bien publie la nouvelle bougie qui vient de fermer). Sleep
-# de FRESH_CANDLE_RETRY_INTERVAL secondes entre essais, max
-# FRESH_CANDLE_MAX_RETRIES tentatives. Si epuise, le cycle est skippe
-# (log WARN) et on attend la prochaine frontiere 15min.
-FRESH_CANDLE_RETRY_INTERVAL = 1   # secondes entre retries
-FRESH_CANDLE_MAX_RETRIES = 30     # 30 retries x 1s = 30s de patience max
+# --- Model paths (absolute, used by orchestrator to inject into predict module) ---
+MODEL_PATH = REPO_ROOT / "backtest" / "modele_15m" / "btc_reversal_model.json"
+SIDECAR_PATH = REPO_ROOT / "backtest" / "modele_15m" / "btc_reversal_model.thresholds.json"
+
+# --- sys.path injection so we can import data.py / predict.py from backtest/modele_15m/ ---
+_BACKTEST_MODEL_DIR = str(REPO_ROOT / "backtest" / "modele_15m")
+if _BACKTEST_MODEL_DIR not in sys.path:
+    sys.path.insert(0, _BACKTEST_MODEL_DIR)
+
+
+def assert_env_ready():
+    """Raise on startup if mandatory env vars are missing."""
+    missing = [
+        name for name, val in [
+            ("POLYGON_PRIVATE_KEY", POLYGON_PRIVATE_KEY),
+            ("POLYGON_EOA_ADDRESS", POLYGON_EOA_ADDRESS),
+            ("POLYMARKET_PROXY_ADDRESS", POLYMARKET_PROXY_ADDRESS),
+        ]
+        if not val
+    ]
+    if missing:
+        raise RuntimeError(
+            f"Missing required env vars in .env: {missing}. "
+            f"See docs/superpowers/specs/2026-05-08-polymarket-live-trader-design.md."
+        )

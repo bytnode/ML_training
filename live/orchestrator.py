@@ -1,382 +1,447 @@
-"""Daemon principal de l'orchestrateur Aure live."""
+"""Live trader daemon: detect setups, ask the model, place real Polymarket bets.
+
+Cycle (every 15min UTC boundary):
+    1. Sleep until next xx:00 / xx:15 / xx:30 / xx:45 UTC
+    2. Freshness retry (max 5) until Bitstamp publishes the new candle
+    3. Resolve pending bets whose target window has closed
+    4. Fetch new candles (15m + MTF), merge into rolling buffer
+    5. Detect qualifying setups for seq_len in [2, 3, 4]
+    6. Build features per candidate
+    7. Decide: predict_proba + should_take_bet (adaptive sidecar) -> pick highest-confidence taken
+    8. Place bet on Polymarket if any
+    9. Telegram + wallet snapshot
+
+CLI:
+    python orchestrator.py            # run forever
+    python orchestrator.py --dry-run  # one cycle, log everything, no real order
+"""
 from __future__ import annotations
 
 import argparse
 import json
 import logging
-import os
-import shutil
-import sys
+import math
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-import pandas as pd
+import settings  # FIRST — triggers sys.path injection for predict / data imports
+
 import xgboost as xgb
 
-from settings import (
-    MODEL_PATH, THRESHOLDS_PATH, THRESHOLDS_SOURCE,
-    LOGS_DIR, ORCHESTRATOR_LOG, REPO_ROOT,
-    WARMUP_CANDLES_15M, WARMUP_CANDLES_MTF,
-    RECENT_FETCH_15M, RECENT_FETCH_MTF,
-    INTERVAL_15M_MS, CYCLE_FUDGE_SECONDS,
-    FRESH_CANDLE_RETRY_INTERVAL, FRESH_CANDLE_MAX_RETRIES,
-    SEQ_LIVE,
+# After settings: predict / data are reachable.
+import predict as model_predict  # noqa: E402
+
+import fetch  # noqa: E402
+import features as feat_mod  # noqa: E402
+import decide  # noqa: E402
+import store  # noqa: E402
+import notify  # noqa: E402
+from polymarket import PolymarketClient, MarketNotFoundError, from_settings  # noqa: E402
+
+# Constants from backtest config (via sys.path injection in settings).
+from config import (  # noqa: E402
+    INTERVAL_MS, ADAPTIVE_TARGET_WR,
 )
-from fetch import fetch_warmup_window, fetch_recent_window, merge_klines
-from features import find_setups_at_latest
-from store import (
-    append_training_row, append_decision_row,
-    update_pending_labels, update_pending_outcomes,
-)
-from notify import send_message, format_decision_message
 
-_log = logging.getLogger("orchestrator")
+logger = logging.getLogger("live.orchestrator")
+INTERVAL_15M_MS = INTERVAL_MS["15m"]
 
 
-# ---------------------------------------------------------------------------
-# .env loader
-# ---------------------------------------------------------------------------
-def _load_env_file(path: Path) -> int:
-    """Charge un fichier .env (KEY=VALUE par ligne) dans os.environ.
+# ============================================================
+#  Model + sidecar injection (avoids cwd-dependent loading)
+# ============================================================
+def inject_model_and_sidecar():
+    """Pre-populate predict._model and predict._thresholds with absolute paths.
 
-    - Skip blank lines, lignes commencant par #, lignes sans '='.
-    - Si la VALUE est vide, ne touche pas os.environ pour cette clef.
-    - Si KEY est deja set dans os.environ, ne l'ecrase PAS (la vraie env var
-      gagne contre le .env -- pratique pour overrider ponctuellement en CLI).
-    - Strip un eventuel quoting "..." ou '...' autour de la valeur.
-
-    Returns: nombre de variables chargees.
+    Avoids predict.py's lazy load of MODEL_OUTPUT (relative path = wrong cwd).
     """
-    if not path.exists():
-        return 0
-    loaded = 0
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        if not key or not value:
-            continue
-        if key not in os.environ:
-            os.environ[key] = value
-            loaded += 1
-    return loaded
-
-
-# ---------------------------------------------------------------------------
-# Setup logging
-# ---------------------------------------------------------------------------
-def _setup_logging() -> None:
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    fmt = "%(asctime)sZ %(levelname)s  %(message)s"
-    datefmt = "%Y-%m-%dT%H:%M:%S"
-    file_handler = logging.FileHandler(ORCHESTRATOR_LOG, encoding="utf-8")
-    stream_handler = logging.StreamHandler()
-    formatter = logging.Formatter(fmt, datefmt=datefmt)
-    formatter.converter = time.gmtime
-    file_handler.setFormatter(formatter)
-    stream_handler.setFormatter(formatter)
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    root.handlers = [file_handler, stream_handler]
-
-
-# ---------------------------------------------------------------------------
-# Model + sidecar loading
-# ---------------------------------------------------------------------------
-def _ensure_sidecar() -> None:
-    """Copie backtest/btc_reversal_model.thresholds.json -> aure.thresholds.json
-    si ce dernier n'existe pas. Idempotent."""
-    if THRESHOLDS_PATH.exists():
-        return
-    if not THRESHOLDS_SOURCE.exists():
-        _log.warning("sidecar_missing source=%s — Aure utilisera un seuil fixe (fallback)",
-                     THRESHOLDS_SOURCE)
-        return
-    shutil.copy2(THRESHOLDS_SOURCE, THRESHOLDS_PATH)
-    _log.info("sidecar_copied %s -> %s", THRESHOLDS_SOURCE.name, THRESHOLDS_PATH.name)
-
-
-def _load_model() -> xgb.XGBClassifier:
-    if not MODEL_PATH.exists():
+    if not settings.MODEL_PATH.exists():
+        raise FileNotFoundError(f"Model not found: {settings.MODEL_PATH}")
+    if not settings.SIDECAR_PATH.exists():
         raise FileNotFoundError(
-            f"model file not found at {MODEL_PATH} — copy aure.json to repo root"
+            f"Sidecar not found: {settings.SIDECAR_PATH}. "
+            f"Run 'cd backtest/modele_15m && python train.py' to regenerate."
         )
-    model = xgb.XGBClassifier()
-    model.load_model(str(MODEL_PATH))
-    _log.info("model_loaded %s features=%d", MODEL_PATH.name,
-              len(model.get_booster().feature_names))
-    return model
+
+    m = xgb.XGBClassifier()
+    m.load_model(str(settings.MODEL_PATH))
+    model_predict._model = m
+
+    with open(settings.SIDECAR_PATH) as f:
+        model_predict._thresholds = json.load(f)
 
 
-def _load_sidecar() -> dict:
-    """Returns {'base_threshold': float, 'deltas': dict[str, float]}.
+# ============================================================
+#  Cycle helpers
+# ============================================================
+def next_15m_boundary_seconds(now_s: float | None = None) -> int:
+    """Returns the next xx:00 / xx:15 / xx:30 / xx:45 UTC as unix seconds."""
+    if now_s is None:
+        now_s = time.time()
+    return ((int(now_s) // 900) + 1) * 900
 
-    Si pas de sidecar OU sidecar malforme : fallback
-    {'base_threshold': 0.58, 'deltas': {}} avec un log ERROR. On ne crash
-    pas le daemon — on tourne avec le seuil fixe et l'operateur fixe le
-    sidecar a chaud (et restart pour le reload).
+
+def sleep_until_boundary():
+    target = next_15m_boundary_seconds()
+    delay = target - time.time()
+    if delay > 0:
+        logger.info("sleeping %.1fs until next 15m boundary (target=%d)", delay, target)
+        time.sleep(delay)
+
+
+def split_klines(klines: list[list]) -> tuple[list, list, list, list, list, list]:
+    opens = [float(k[1]) for k in klines]
+    highs = [float(k[2]) for k in klines]
+    lows = [float(k[3]) for k in klines]
+    closes = [float(k[4]) for k in klines]
+    volumes = [float(k[5]) for k in klines]
+    times = [int(k[0]) for k in klines]
+    return opens, highs, lows, closes, volumes, times
+
+
+# ============================================================
+#  Pending settlement reconciliation (step 3 of cycle)
+# ============================================================
+def reconcile_pending(client: PolymarketClient, cycle_count_by_bet: dict[str, int]) -> None:
+    pendings = store.read_pending_bets()
+    if not pendings:
+        return
+
+    now_ms = int(time.time() * 1000)
+    for row in pendings:
+        target_end = int(row["target_window_end_ms"])
+        if target_end >= now_ms:
+            continue
+
+        bet_id = row["bet_id"]
+        market_slug = row["polymarket_slug"]
+        cycle_count_by_bet[bet_id] = cycle_count_by_bet.get(bet_id, 0) + 1
+
+        result = client.read_settlement(market_slug)
+        if result is None:
+            if cycle_count_by_bet[bet_id] >= settings.SETTLEMENT_STUCK_AFTER_CYCLES:
+                logger.error("settlement_stuck bet_id=%s slug=%s", bet_id, market_slug)
+                store.update_bet_outcome(bet_id, "stuck", 0.0)
+                notify.alert(
+                    "Settlement stuck",
+                    f"bet_id={bet_id} slug={market_slug} "
+                    f"({cycle_count_by_bet[bet_id]} cycles past close)",
+                )
+            continue
+
+        winning = result["winning_outcome"]
+        bet_direction = row["bet_direction"]
+        shares_filled = float(row.get("shares_filled") or 0)
+        usdc_spent = float(row.get("usdc_spent") or 0)
+
+        if winning == bet_direction:
+            outcome = "win"
+            realized_pnl = shares_filled - usdc_spent
+        else:
+            outcome = "loss"
+            realized_pnl = -usdc_spent
+
+        store.update_bet_outcome(bet_id, outcome, realized_pnl, result.get("resolved_at"))
+        notify.bet_resolved(bet_direction, outcome, realized_pnl)
+        logger.info(
+            "settlement bet_id=%s outcome=%s pnl=%+.4f winning=%s direction=%s",
+            bet_id, outcome, realized_pnl, winning, bet_direction,
+        )
+
+
+# ============================================================
+#  Bet placement (step 8 of cycle)
+# ============================================================
+def place_bet(client: PolymarketClient, chosen: dict, target_window_start_ms: int,
+              dry_run: bool) -> str | None:
+    """Place a real (or simulated) Polymarket order for the chosen setup.
+    Returns bet_id if a row was written to bets.csv, else None.
     """
-    if not THRESHOLDS_PATH.exists():
-        return {"base_threshold": 0.58, "deltas": {}}
+    target_window_end_ms = target_window_start_ms + INTERVAL_15M_MS
+    bet_direction = chosen["bet_direction"]
+
+    # Read balance pre-trade
+    balance_pre = client.get_usdc_balance()
+    bet_usdc = math.floor(balance_pre * settings.BET_FRACTION * 100) / 100  # 2-decimal precision
+
+    if bet_usdc < settings.BET_MIN_USDC:
+        logger.error("balance_low usdc=%.4f bet_size=%.4f", balance_pre, bet_usdc)
+        notify.alert("Balance low", f"USDC={balance_pre:.4f}, can't place ${bet_usdc:.2f} bet")
+        return None
+    if bet_usdc > balance_pre * settings.BET_MAX_FRACTION:
+        logger.error("sizing_anomaly bet=%.4f balance=%.4f", bet_usdc, balance_pre)
+        notify.alert("Sizing anomaly", f"bet=${bet_usdc:.2f} > 95% of balance ${balance_pre:.2f}")
+        return None
+
+    # Resolve target market
     try:
-        with open(THRESHOLDS_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-        return {
-            "base_threshold": float(data["base_threshold"]),
-            "deltas": {k: float(v) for k, v in data.get("deltas", {}).items()},
-        }
-    except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
-        _log.error(
-            "sidecar_malformed %s err=%s — fallback to base=0.58 with no deltas",
-            THRESHOLDS_PATH, e,
-        )
-        return {"base_threshold": 0.58, "deltas": {}}
+        market = client.find_btc_15m_market(target_window_start_ms // 1000)
+    except MarketNotFoundError as e:
+        logger.warning("market_not_found ts=%d reason=%s", target_window_start_ms, e)
+        notify.alert("Market not found", f"window_start={target_window_start_ms}")
+        return None
 
+    token_id = market["down_token_id"] if bet_direction == "down" else market["up_token_id"]
 
-# ---------------------------------------------------------------------------
-# Sleep alignment
-# ---------------------------------------------------------------------------
-def next_boundary_ms(now_ms: int) -> int:
-    """Retourne le prochain open_time_ms 15m strictement apres now_ms."""
-    return ((now_ms // INTERVAL_15M_MS) + 1) * INTERVAL_15M_MS
-
-
-def sleep_until(target_ms: int) -> None:
-    while True:
-        delta = target_ms / 1000 - time.time()
-        if delta <= 0:
-            return
-        time.sleep(min(delta, 30))  # capping a 30s pour eviter sleep trop long
-
-
-# ---------------------------------------------------------------------------
-# Predict + decide
-# ---------------------------------------------------------------------------
-def _predict_and_decide(model: xgb.XGBClassifier, sidecar: dict, features: dict) -> dict:
-    """Calcule confidence, effective_threshold, taken, bet_direction.
-
-    Returns dict utilise par store.append_decision_row + notify.format_decision_message.
-    """
-    expected_cols = list(model.get_booster().feature_names)
-    missing = [col for col in expected_cols if col not in features]
-    if missing:
-        raise ValueError(
-            f"_predict_and_decide: features dict missing keys {missing} — "
-            f"verifier que find_setups_at_latest produit le bon schema"
-        )
-    df = pd.DataFrame([{col: features[col] for col in expected_cols}])
-    confidence = float(model.predict_proba(df)[:, 1][0])
-
-    bucket_v = int(features["volatility_state"])
-    bucket_w = int(features["is_weekend"])
-    bucket_key = f"{bucket_v}_{bucket_w}"
-    delta = sidecar["deltas"].get(bucket_key, 0.0)
-    effective_threshold = sidecar["base_threshold"] + delta
-
-    bet_direction = "down" if features["seq_dir"] == 1 else "up"
-    taken = confidence >= effective_threshold
-
-    return {
-        "confidence": confidence,
-        "effective_threshold": effective_threshold,
-        "bucket_v": bucket_v,
-        "bucket_w": bucket_w,
+    bet_id = str(uuid.uuid4())
+    bet_row: dict = {
+        "bet_id": bet_id,
+        "decision_timestamp": chosen["features"]["timestamp"],
+        "target_window_start_ms": target_window_start_ms,
+        "target_window_end_ms": target_window_end_ms,
+        "polymarket_slug": market["market_slug"],
+        "polymarket_condition_id": market["condition_id"],
+        "polymarket_token_id": token_id,
         "bet_direction": bet_direction,
-        "taken": taken,
+        "bet_size_usdc": bet_usdc,
+        "wallet_balance_pre_usdc": balance_pre,
+        "outcome": "pending",
     }
 
+    if dry_run:
+        logger.info("[DRY RUN] would place_market_order token=%s usdc=%.4f", token_id, bet_usdc)
+        bet_row.update({
+            "polymarket_order_id": "DRY_RUN",
+            "order_status": "filled",
+            "fill_price_avg": None,
+            "shares_filled": 0.0,
+            "usdc_spent": 0.0,
+            "fee_usdc": 0.0,
+            "wallet_balance_post_usdc": balance_pre,
+        })
+        store.append_bet(bet_row)
+        return bet_id
 
-# ---------------------------------------------------------------------------
-# Run cycle
-# ---------------------------------------------------------------------------
-def run_cycle(
-    model, sidecar, klines_state: dict, no_notify: bool,
-    wait_for_fresh: bool = True,
-) -> dict:
-    """Execute un cycle complet. Mute klines_state in place avec les nouvelles bougies.
+    # Real order
+    result = client.place_market_order(token_id, bet_usdc)
+    balance_post = client.get_usdc_balance()
+    bet_row.update({
+        "polymarket_order_id": result.get("order_id"),
+        "order_status": result["status"],
+        "fill_price_avg": result.get("average_fill_price"),
+        "shares_filled": result.get("shares_filled"),
+        "usdc_spent": result.get("usdc_spent"),
+        "fee_usdc": result.get("fee_usdc"),
+        "wallet_balance_post_usdc": balance_post,
+    })
 
-    wait_for_fresh : si True (mode daemon), retry le fetch jusqu'a obtenir une
-    bougie 15m strictement plus recente que la derniere connue (= preuve que
-    Bitstamp a publie la nouvelle bougie qui vient de fermer). Si epuise, skip
-    le cycle. False en mode --dry-run (on veut tester le pipeline meme si le
-    fetch ne ramene rien de neuf — typique car warmup vient juste de tourner).
-
-    Returns: stats du cycle (dict) pour log.
-    """
-    cycle_start = time.time()
-
-    # 1. Fetch recent (+ freshness retry en mode daemon).
-    if wait_for_fresh:
-        prev_last_open = klines_state["15m"][-1][0] if klines_state.get("15m") else 0
-        fresh = None
-        fresh_ok = False
-        for attempt in range(1, FRESH_CANDLE_MAX_RETRIES + 1):
-            fresh = fetch_recent_window(RECENT_FETCH_15M, RECENT_FETCH_MTF)
-            for tf, candles in fresh.items():
-                klines_state[tf] = merge_klines(klines_state.get(tf, []), candles)
-            latest_open = klines_state["15m"][-1][0] if klines_state["15m"] else 0
-            if latest_open > prev_last_open:
-                fresh_ok = True
-                if attempt > 1:
-                    _log.info("fresh_candle_obtained attempt=%d", attempt)
-                break
-            if attempt < FRESH_CANDLE_MAX_RETRIES:
-                time.sleep(FRESH_CANDLE_RETRY_INTERVAL)
-
-        if not fresh_ok:
-            _log.warning(
-                "no_fresh_candle after %d retries (last_known_open=%d) — cycle skipped",
-                FRESH_CANDLE_MAX_RETRIES, prev_last_open,
-            )
-            return {
-                "setups": 0,
-                "notifs_sent": 0,
-                "duration_ms": int((time.time() - cycle_start) * 1000),
-                "labels_resolved": 0,
-                "outcomes_resolved": 0,
-            }
-    else:
-        # Mode --dry-run : un seul fetch, pas de freshness check.
-        fresh = fetch_recent_window(RECENT_FETCH_15M, RECENT_FETCH_MTF)
-        for tf, candles in fresh.items():
-            klines_state[tf] = merge_klines(klines_state.get(tf, []), candles)
-
-    _log.info("fetched candles_15m=%d candles_30m=%d candles_1h=%d candles_4h=%d candles_1d=%d",
-              len(fresh.get("15m", [])), len(fresh.get("30m", [])),
-              len(fresh.get("1h", [])), len(fresh.get("4h", [])),
-              len(fresh.get("1d", [])))
-
-    # 2. Resolve pendings (avec les klines_15m mises a jour)
-    n_labels, _ = update_pending_labels(klines_state["15m"])
-    n_outcomes, _ = update_pending_outcomes(klines_state["15m"])
-    if n_labels or n_outcomes:
-        _log.info("pendings_resolved labels=%d outcomes=%d", n_labels, n_outcomes)
-
-    # 3. Detect setups
-    klines_15m = klines_state["15m"]
-    klines_mtf = {tf: klines_state[tf] for tf in klines_state if tf != "15m"}
-    setups = find_setups_at_latest(klines_15m, klines_mtf)
-
-    # Filtre SEQ_LIVE : ne tirer que sur les seq_len autorises (par defaut [2,3,4]).
-    # None ou liste vide = pas de filtre (tous les seq_len ∈ {1,2,3,4} qualifient).
-    if SEQ_LIVE:
-        n_before_filter = len(setups)
-        setups = [(seq_len, feat) for seq_len, feat in setups if seq_len in SEQ_LIVE]
-        if n_before_filter != len(setups):
-            _log.info("setups_filtered SEQ_LIVE=%s : %d -> %d",
-                      SEQ_LIVE, n_before_filter, len(setups))
-
-    _log.info("setups_qualifying=%d", len(setups))
-
-    # 4. Pour chaque setup : append + predict + notif
-    notifs_sent = 0
-    for seq_len, features in setups:
-        append_training_row(features)
-        decision = _predict_and_decide(model, sidecar, features)
-
-        notified_at = None
-        if decision["taken"] and not no_notify:
-            price = float(klines_15m[-1][4])  # close de la derniere bougie
-            msg = format_decision_message(features, decision, price=price)
-            ok = send_message(msg)
-            if ok:
-                notified_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                notifs_sent += 1
-        decision["notified_at"] = notified_at
-
-        append_decision_row(features, decision)
-        _log.info(
-            "decision seq_len=%d confidence=%.3f threshold=%.3f bucket=%d_%d taken=%s direction=%s",
-            seq_len, decision["confidence"], decision["effective_threshold"],
-            decision["bucket_v"], decision["bucket_w"], decision["taken"],
-            decision["bet_direction"],
+    if result["status"] != "filled":
+        bet_row["outcome"] = "loss"
+        bet_row["realized_pnl_usdc"] = 0.0
+        bet_row["outcome_resolved_at_iso"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        notify.alert(
+            f"Order {result['status']}",
+            f"bet_id={bet_id} reason={result.get('error_msg', 'unknown')}",
         )
 
-    duration_ms = int((time.time() - cycle_start) * 1000)
-    _log.info("cycle_end duration_ms=%d notifs_sent=%d", duration_ms, notifs_sent)
-    return {
-        "setups": len(setups),
-        "notifs_sent": notifs_sent,
-        "duration_ms": duration_ms,
-        "labels_resolved": n_labels,
-        "outcomes_resolved": n_outcomes,
-    }
+    store.append_bet(bet_row)
+
+    if result["status"] == "filled":
+        notify.bet_placed(
+            direction=bet_direction,
+            bet_size_usdc=bet_usdc,
+            fill_price=result.get("average_fill_price"),
+            confidence=chosen["confidence"],
+            effective_threshold=ADAPTIVE_TARGET_WR + 0.0,  # log the adaptive base; per-row delta omitted for now
+            target_window_start_ms=target_window_start_ms,
+        )
+
+    return bet_id
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Daemon Aure live orchestrator")
+# ============================================================
+#  Cycle (one iteration of the daemon loop)
+# ============================================================
+def run_cycle(client: PolymarketClient, last_known_open_ms: int | None,
+              cycle_settlement_counter: dict, dry_run: bool) -> int | None:
+    """Run one cycle. Returns the new last_known_open_ms (or None if cycle skipped)."""
+    cycle_t0 = time.time()
+    logger.info("cycle_start dry_run=%s", dry_run)
+
+    # ----- Step 3: reconcile pending settlements (before fetch, runs even on skipped cycles) -----
+    reconcile_pending(client, cycle_settlement_counter)
+
+    # ----- Step 4: fetch (with freshness retry) -----
+    try:
+        if last_known_open_ms is None:
+            klines_15m = fetch.fetch_warmup_15m()
+        else:
+            fresh_15m = fetch.freshness_retry(last_known_open_ms)
+            klines_15m = fetch.fetch_warmup_15m()
+            klines_15m = fetch.merge_klines(klines_15m, fresh_15m)
+    except TimeoutError as e:
+        logger.warning("cycle_skip reason=stale_candle err=%s", e)
+        return None
+
+    if len(klines_15m) < settings.WARMUP_CANDLES_15M // 2:
+        logger.warning("cycle_skip reason=insufficient_warmup n=%d", len(klines_15m))
+        return None
+
+    klines_mtf = fetch.fetch_warmup_mtf()
+
+    opens, highs, lows, closes, volumes, times = split_klines(klines_15m)
+    last_idx = len(closes) - 1
+    last_open_ms = times[last_idx]
+
+    # ----- Step 5: detect qualifying setups -----
+    candidates = feat_mod.detect_qualifying_setups(opens, highs, lows, closes, last_idx)
+    if not candidates:
+        logger.info("no_setup last_idx=%d last_open=%d", last_idx, last_open_ms)
+        store.append_wallet_snapshot({
+            "cycle_action": "no_setup",
+            "usdc_balance": client.get_usdc_balance(),
+            "matic_balance": client.get_matic_balance(),
+            "pending_bets_n": len(store.read_pending_bets()),
+            "pending_bets_exposure_usdc": sum(
+                float(r.get("bet_size_usdc") or 0) for r in store.read_pending_bets()
+            ),
+        })
+        return last_open_ms
+
+    # ----- Step 6: build features -----
+    enriched = []
+    for c in candidates:
+        f = feat_mod.build_features(
+            opens, highs, lows, closes, volumes, times, klines_mtf,
+            c["last_idx"], c["seq_len"], c["seq_dir"],
+        )
+        if f is None:
+            logger.warning("feature_build_failed seq_len=%d (insufficient MTF)", c["seq_len"])
+            continue
+        enriched.append({**c, "features": f})
+
+    if not enriched:
+        logger.warning("cycle_skip reason=no_features_built")
+        return last_open_ms
+
+    # ----- Step 7: decide -----
+    evaluated = decide.evaluate_candidates(enriched)
+    chosen = decide.pick_chosen(evaluated)
+
+    # Append decisions.csv (one row per candidate)
+    decision_rows = []
+    for c in evaluated:
+        is_chosen = (chosen is not None and c is chosen)
+        eff_th = ADAPTIVE_TARGET_WR + _delta_for_bucket(c["bucket_v"], c["bucket_w"])
+        row = {
+            **c["features"],
+            "bet_direction": c["bet_direction"],
+            "confidence": c["confidence"],
+            "effective_threshold": eff_th,
+            "bucket_v": c["bucket_v"],
+            "bucket_w": c["bucket_w"],
+            "taken": c["taken"],
+            "is_chosen": is_chosen,
+            "bet_id": "",  # filled below if order placed
+        }
+        decision_rows.append(row)
+
+    if chosen is None:
+        store.append_decisions(decision_rows)
+        logger.info(
+            "no_take candidates=%d (max_conf=%.4f)", len(evaluated),
+            max((c["confidence"] for c in evaluated), default=0.0),
+        )
+        store.append_wallet_snapshot({
+            "cycle_action": "no_take",
+            "usdc_balance": client.get_usdc_balance(),
+            "matic_balance": client.get_matic_balance(),
+            "pending_bets_n": len(store.read_pending_bets()),
+            "pending_bets_exposure_usdc": sum(
+                float(r.get("bet_size_usdc") or 0) for r in store.read_pending_bets()
+            ),
+        })
+        return last_open_ms
+
+    # ----- Step 8: place bet -----
+    target_window_start_ms = last_open_ms + INTERVAL_15M_MS
+    bet_id = place_bet(client, chosen, target_window_start_ms, dry_run)
+    if bet_id is not None:
+        # Stamp the chosen decision row with the bet_id
+        for r in decision_rows:
+            if r["is_chosen"]:
+                r["bet_id"] = bet_id
+                break
+    store.append_decisions(decision_rows)
+
+    # ----- Step 9: wallet snapshot -----
+    pendings = store.read_pending_bets()
+    store.append_wallet_snapshot({
+        "cycle_action": "bet_placed" if bet_id else "market_not_found",
+        "usdc_balance": client.get_usdc_balance(),
+        "matic_balance": client.get_matic_balance(),
+        "pending_bets_n": len(pendings),
+        "pending_bets_exposure_usdc": sum(float(r.get("bet_size_usdc") or 0) for r in pendings),
+    })
+
+    logger.info("cycle_end duration_ms=%d", int((time.time() - cycle_t0) * 1000))
+    return last_open_ms
+
+
+def _delta_for_bucket(vol_state: int, is_weekend: int) -> float:
+    """Read the per-bucket delta from the cached sidecar."""
+    sidecar = model_predict.get_thresholds()
+    delta = sidecar.get("deltas", {}).get(f"{int(vol_state)}_{int(is_weekend)}", 0.0)
+    return float(delta) if delta is not None else 0.0
+
+
+# ============================================================
+#  Boot + main loop
+# ============================================================
+def boot(client: PolymarketClient) -> None:
+    """Verify model + sidecar load, log wallet, MATIC sanity check."""
+    inject_model_and_sidecar()
+    usdc = client.get_usdc_balance()
+    matic = client.get_matic_balance()
+    logger.info("boot eoa=%s proxy=%s usdc=%.4f matic=%.6f",
+                client.eoa_address, client.proxy_address, usdc, matic)
+    if matic < settings.MATIC_LOW_THRESHOLD:
+        notify.alert("MATIC low", f"balance={matic:.6f} (threshold {settings.MATIC_LOW_THRESHOLD})")
+
+
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        handlers=[
+            logging.FileHandler(settings.ORCHESTRATOR_LOG, mode="a", encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Live Polymarket trader for modele_15m.")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Execute UN seul cycle puis quitte (test rapide).")
-    parser.add_argument("--no-notify", action="store_true",
-                        help="Ne pas envoyer de notif Telegram (decisions seulement loguees).")
-    args = parser.parse_args(argv)
+                        help="Run one cycle, log everything, don't place a real order.")
+    args = parser.parse_args()
 
-    # Charge .env (a la racine du repo) AVANT de setup le logging — comme ca le
-    # logging file handler peut ecrire dans LOGS_DIR sans surprises et les
-    # env vars (Telegram) sont deja en place quand notify.py en a besoin.
-    n_env = _load_env_file(REPO_ROOT / ".env")
+    setup_logging()
+    settings.assert_env_ready()
+    client = from_settings()
+    boot(client)
 
-    _setup_logging()
-    _log.info("orchestrator_start dry_run=%s no_notify=%s", args.dry_run, args.no_notify)
-    if n_env:
-        _log.info("env_loaded from %s vars=%d", REPO_ROOT / ".env", n_env)
-
-    _ensure_sidecar()
-    model = _load_model()
-    sidecar = _load_sidecar()
-
-    # Warmup
-    _log.info("fetching_warmup candles_15m=%d candles_mtf=%d", WARMUP_CANDLES_15M, WARMUP_CANDLES_MTF)
-    klines_state = fetch_warmup_window(WARMUP_CANDLES_15M, WARMUP_CANDLES_MTF)
-
-    # Resolve startup pendings (avec les klines warmup)
-    n_labels, rem_labels = update_pending_labels(klines_state["15m"])
-    n_outcomes, rem_outcomes = update_pending_outcomes(klines_state["15m"])
-    if n_labels or n_outcomes:
-        _log.info("startup_pendings_resolved labels=%d outcomes=%d", n_labels, n_outcomes)
-    if rem_labels or rem_outcomes:
-        # Pendings dont la bougie cible est anterieure a la fenetre de warmup
-        # (typiquement daemon down >50h). Restent NaN/pending indefiniment ;
-        # l'operateur peut regenerer via backtest/data.py si besoin.
-        _log.warning("unresolvable_pending labels=%d outcomes=%d", rem_labels, rem_outcomes)
+    cycle_settlement_counter: dict[str, int] = {}
+    last_known_open_ms: int | None = None
 
     if args.dry_run:
-        _log.info("dry_run executing single cycle")
-        run_cycle(model, sidecar, klines_state, no_notify=args.no_notify, wait_for_fresh=False)
-        _log.info("dry_run done")
-        return 0
+        last_known_open_ms = run_cycle(client, None, cycle_settlement_counter, dry_run=True)
+        logger.info("dry_run done last_open_ms=%s", last_known_open_ms)
+        return
 
-    # Daemon loop
     while True:
-        now_ms = int(time.time() * 1000)
-        target_ms = next_boundary_ms(now_ms) + CYCLE_FUDGE_SECONDS * 1000
-        target_iso = datetime.fromtimestamp(target_ms / 1000, tz=timezone.utc).strftime("%H:%M:%S UTC")
-        _log.info("sleeping_until %s", target_iso)
+        sleep_until_boundary()
         try:
-            sleep_until(target_ms)
-        except KeyboardInterrupt:
-            _log.info("orchestrator_stopping (keyboard interrupt)")
-            return 0
-
-        _log.info("cycle_start")
-        try:
-            run_cycle(model, sidecar, klines_state, no_notify=args.no_notify)
-        except KeyboardInterrupt:
-            _log.info("orchestrator_stopping (keyboard interrupt mid-cycle)")
-            return 0
-        except Exception as e:
-            _log.exception("cycle_failed err=%s", e)
-            # On continue : prochain cycle dans 15min.
+            new_open = run_cycle(client, last_known_open_ms, cycle_settlement_counter, dry_run=False)
+            if new_open is not None:
+                last_known_open_ms = new_open
+        except Exception as e:  # noqa: BLE001 — we log + re-raise so Docker can restart us
+            logger.exception("cycle_crashed: %s", e)
+            notify.alert("Daemon crashed", f"{type(e).__name__}: {e}")
+            raise
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

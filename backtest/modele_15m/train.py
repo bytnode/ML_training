@@ -1,10 +1,11 @@
 """
-Entrainement + evaluation du modele XGBoost.
+Entrainement + evaluation du modele XGBoost (decision adaptative uniquement).
 
 Usage CLI :
     python train.py
-        Entraine avec les hyperparams de config.py, sauvegarde le modele,
-        affiche l'evaluation, et appende un row dans logs/runs.csv.
+        Entraine avec les hyperparams de config.py, sauvegarde le modele
+        + le sidecar des deltas, affiche l'evaluation, et appende un row
+        dans logs/runs.csv.
 
 API librairie :
     from train import train_and_evaluate
@@ -13,9 +14,9 @@ API librairie :
         save_model=False,
         verbose=False,
         log_run=True,
-        run_label="sweep:max_depth=6",
+        run_label="manual",
     )
-    # metrics est un dict avec hyperparams + best_iteration + val_logloss + WR par seuil + breakdown
+    # metrics : hyperparams + best_iteration + val_logloss + WR adaptatif (total + par seq_len)
 """
 
 import argparse
@@ -31,8 +32,7 @@ import xgboost as xgb
 from config import (
     CSV_PATH, MODEL_OUTPUT,
     TRAIN_DAYS, TEST_DAYS, VAL_FRACTION, SEQ_TEST,
-    THRESHOLDS, BREAKDOWN_THRESHOLD,
-    ADAPTIVE_THRESHOLD, ADAPTIVE_TARGET_WR, ADAPTIVE_CALIB_FRACTION,
+    ADAPTIVE_TARGET_WR, ADAPTIVE_CALIB_FRACTION,
     ADAPTIVE_MIN_N_VAL, ADAPTIVE_MIN_N_VAL_SOFT, ADAPTIVE_MIN_N_AT_THRESHOLD,
     ADAPTIVE_DELTA_CLAMP,
     XGB_N_ESTIMATORS, XGB_MAX_DEPTH, XGB_LEARNING_RATE,
@@ -59,10 +59,6 @@ LOGS_DIR = ROOT / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 RUNS_CSV = LOGS_DIR / "runs.csv"
 PREDICTIONS_CSV = LOGS_DIR / "test_predictions.csv"
-
-# Ensemble de seuils logges dans runs.csv. Independant de THRESHOLDS (config) pour
-# garantir un schema CSV stable meme si l'utilisateur change THRESHOLDS.
-LOG_THRESHOLDS = [0.50, 0.55, 0.58, 0.60, 0.62]
 
 
 # ============================================================
@@ -145,7 +141,7 @@ def compute_adaptive_thresholds(
     Calcule un delta de seuil par bucket (volatility_state, is_weekend) sur les
     `calib_days` derniers jours de val. Si un bucket a < min_n_val rows dans la
     fenetre de calib, fallback sur l'integralite de val. Si toujours insuffisant,
-    delta = 0 (fallback final = comportement BREAKDOWN_THRESHOLD pur).
+    delta = 0 (= bucket evalue a la base ADAPTIVE_TARGET_WR, sans ajustement).
 
     Renvoie (deltas_dict, report_list) :
       deltas_dict = {"vol_wknd": delta_float, ...} (cles "0_0" .. "2_1")
@@ -221,11 +217,13 @@ def compute_adaptive_thresholds(
     return deltas, report
 
 
-def save_thresholds_sidecar(model_path, deltas, base_th, metadata=None):
-    """Ecrit le sidecar JSON a cote du modele (btc_reversal_model.thresholds.json)."""
+def save_thresholds_sidecar(model_path, deltas, metadata=None):
+    """Ecrit le sidecar JSON a cote du modele (btc_reversal_model.thresholds.json).
+
+    Le sidecar ne contient QUE les deltas par bucket (+ metadata d'audit).
+    La base du seuil adaptatif = config.ADAPTIVE_TARGET_WR (source unique de verite)."""
     sidecar = Path(model_path).with_suffix(".thresholds.json")
     payload = {
-        "base_threshold": float(base_th),
         "deltas": {k: float(v) for k, v in deltas.items()},
         "metadata": metadata or {},
     }
@@ -256,7 +254,7 @@ def apply_adaptive_threshold(df, probas, deltas, base_th):
 
 
 # ============================================================
-#  Train + evaluate (fonction principale, appelable depuis sweep.py)
+#  Train + evaluate (fonction principale, exposee aussi en API librairie)
 # ============================================================
 def train_and_evaluate(
     overrides: dict | None = None,
@@ -270,13 +268,13 @@ def train_and_evaluate(
     Entraine et evalue le modele.
 
     overrides       : dict d'hyperparams a surcharger sur ceux de config.py.
-    save_model      : si True, ecrit le modele dans MODEL_OUTPUT (config).
-    verbose         : si True, imprime l'evaluation complete (table seuils + breakdown + importance).
+    save_model      : si True, ecrit le modele dans MODEL_OUTPUT (config) + le sidecar des deltas.
+    verbose         : si True, imprime l'evaluation complete (calibration + breakdown adaptatif + importance).
     log_run         : si True, append une ligne dans logs/runs.csv.
     run_label       : etiquette du run (visible dans runs.csv pour filtrer ulterieurement).
     log_predictions : si True, ecrit logs/test_predictions.csv (test set + colonne confidence).
 
-    Retourne un dict de metriques (hyperparams + WR par seuil + breakdown + meta).
+    Retourne un dict de metriques (hyperparams + WR adaptatif total + WR par seq_len + meta).
     """
     t0 = time.time()
 
@@ -374,10 +372,10 @@ def train_and_evaluate(
     # ---- Adaptive threshold calibration (sur val, jamais sur test) ----
     adaptive_deltas = {}
     adaptive_report = []
-    if ADAPTIVE_THRESHOLD and len(val) > 0:
+    if len(val) > 0:
         y_pred_val = model.predict_proba(X_val)[:, 1]
         adaptive_deltas, adaptive_report = compute_adaptive_thresholds(
-            val, y_pred_val, BREAKDOWN_THRESHOLD,
+            val, y_pred_val, ADAPTIVE_TARGET_WR,
         )
 
     # ---- Test predictions ----
@@ -387,22 +385,15 @@ def train_and_evaluate(
     if log_predictions:
         _write_test_predictions(test, y_pred, PREDICTIONS_CSV)
 
-    # WR + n + pct_vol pour chaque seuil de LOG_THRESHOLDS
-    threshold_metrics = {}
-    for th in LOG_THRESHOLDS:
-        mask = y_pred >= th
-        n = int(mask.sum())
-        wr = float(y_test[mask].mean()) if n > 0 else None
-        pct_vol = n / len(y_test) if len(y_test) else 0.0
-        threshold_metrics[th] = {"n": n, "wr": wr, "pct_vol": pct_vol}
-
-    # Breakdown au seuil BREAKDOWN_THRESHOLD
-    th = BREAKDOWN_THRESHOLD
+    # ---- Decision adaptative sur test (mask take/skip par row) ----
     test_full = test.copy()
     test_full["pred"] = y_pred
-    test_full["taken"] = test_full["pred"] >= th
-    total_taken = int(test_full["taken"].sum())
-    total_wr = float(test_full[test_full["taken"]]["label"].mean()) if total_taken > 0 else None
+    adaptive_take = apply_adaptive_threshold(test_full, y_pred, adaptive_deltas, ADAPTIVE_TARGET_WR)
+    test_full["taken"] = adaptive_take
+    adaptive_total_taken = int(adaptive_take.sum())
+    adaptive_total_wr = float(y_test[adaptive_take].mean()) if adaptive_total_taken > 0 else None
+
+    # Breakdown par seq_len SOUS la decision adaptative.
     breakdown_per_seq = {}
     for sl in [1, 2, 3, 4]:
         sub = test_full[(test_full["seq_len"] == sl) & test_full["taken"]]
@@ -411,35 +402,24 @@ def train_and_evaluate(
             "wr": float(sub["label"].mean()) if len(sub) > 0 else None,
         }
 
-    # ---- Evaluation adaptative sur test (head-to-head vs threshold fixe) ----
-    if ADAPTIVE_THRESHOLD and adaptive_deltas:
-        adaptive_take = apply_adaptive_threshold(test_full, y_pred, adaptive_deltas, BREAKDOWN_THRESHOLD)
-        adaptive_total_taken = int(adaptive_take.sum())
-        adaptive_total_wr = float(y_test[adaptive_take].mean()) if adaptive_total_taken > 0 else None
-    else:
-        adaptive_take = None
-        adaptive_total_taken = 0
-        adaptive_total_wr = None
-
     duration = time.time() - t0
 
-    # ---- Save model + sidecar ----
+    # ---- Save model + sidecar (sidecar obligatoire si on save le modele) ----
     if save_model:
         model.save_model(MODEL_OUTPUT)
-        if ADAPTIVE_THRESHOLD and adaptive_deltas:
-            save_thresholds_sidecar(
-                MODEL_OUTPUT, adaptive_deltas, BREAKDOWN_THRESHOLD,
-                metadata={
-                    "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                    "calib_fraction": ADAPTIVE_CALIB_FRACTION,
-                    "calib_days_resolved": ADAPTIVE_CALIB_DAYS,
-                    "test_days": TEST_DAYS,
-                    "target_wr": ADAPTIVE_TARGET_WR,
-                    "min_n_val": ADAPTIVE_MIN_N_VAL,
-                    "min_n_at_threshold": ADAPTIVE_MIN_N_AT_THRESHOLD,
-                    "clamp": list(ADAPTIVE_DELTA_CLAMP),
-                },
-            )
+        save_thresholds_sidecar(
+            MODEL_OUTPUT, adaptive_deltas,
+            metadata={
+                "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "calib_fraction": ADAPTIVE_CALIB_FRACTION,
+                "calib_days_resolved": ADAPTIVE_CALIB_DAYS,
+                "test_days": TEST_DAYS,
+                "target_wr": ADAPTIVE_TARGET_WR,
+                "min_n_val": ADAPTIVE_MIN_N_VAL,
+                "min_n_at_threshold": ADAPTIVE_MIN_N_AT_THRESHOLD,
+                "clamp": list(ADAPTIVE_DELTA_CLAMP),
+            },
+        )
 
     # ---- Build metrics dict (tout flat, pour le CSV) ----
     metrics = {
@@ -458,22 +438,15 @@ def train_and_evaluate(
         "best_iteration": best_iter,
         "val_logloss_best": round(val_logloss_best, 6),
         "baseline_wr": round(baseline_wr, 5),
-        "breakdown_threshold": th,
-        "breakdown_total_taken": total_taken,
-        "breakdown_total_wr": round(total_wr, 5) if total_wr is not None else None,
     }
     for k, v in hp.items():
         metrics[f"hp_{k}"] = v
-    for th_, m in threshold_metrics.items():
-        metrics[f"wr_at_{th_:.2f}"] = round(m["wr"], 5) if m["wr"] is not None else None
-        metrics[f"n_at_{th_:.2f}"] = m["n"]
-        metrics[f"pct_at_{th_:.2f}"] = round(m["pct_vol"], 5)
+    # WR / n par seq_len SOUS la decision adaptative.
     for sl, m in breakdown_per_seq.items():
         metrics[f"wr_seq{sl}"] = round(m["wr"], 5) if m["wr"] is not None else None
         metrics[f"n_seq{sl}"] = m["n"]
 
-    # Adaptive threshold metrics (toujours ajoutees, NaN si feature off)
-    metrics["adaptive_threshold_enabled"] = bool(ADAPTIVE_THRESHOLD)
+    # Adaptive threshold metrics
     metrics["adaptive_calib_fraction"] = ADAPTIVE_CALIB_FRACTION
     metrics["adaptive_calib_days"] = ADAPTIVE_CALIB_DAYS
     metrics["adaptive_target_wr"] = ADAPTIVE_TARGET_WR
@@ -485,13 +458,8 @@ def train_and_evaluate(
 
     # ---- Print + log ----
     if verbose:
-        _print_evaluation(metrics, breakdown_per_seq, model, feature_cols, train, test, y_pred, y_test)
-        if ADAPTIVE_THRESHOLD:
-            _print_adaptive_section(
-                adaptive_report, adaptive_total_taken, adaptive_total_wr,
-                metrics["breakdown_total_taken"], metrics["breakdown_total_wr"],
-                len(y_test),
-            )
+        _print_evaluation(metrics, breakdown_per_seq, model, feature_cols, train, test)
+        _print_adaptive_section(adaptive_report)
 
     if log_run:
         append_to_runs_csv(metrics)
@@ -536,31 +504,20 @@ def append_to_runs_csv(metrics: dict) -> None:
 
 
 # ============================================================
-#  Pretty-print de l'evaluation (preserve l'output console historique)
+#  Pretty-print de l'evaluation (decision adaptative uniquement)
 # ============================================================
-def _print_evaluation(metrics, breakdown_per_seq, model, feature_cols, train, test, y_pred, y_test):
+def _print_evaluation(metrics, breakdown_per_seq, model, feature_cols, train, test):
     print("\n" + "=" * 70)
-    print("  EVALUATION SUR LE TEST SET (out-of-sample)")
+    print("  EVALUATION SUR LE TEST SET (out-of-sample, decision adaptative)")
     print("=" * 70)
     print(f"\nBaseline (filtre body_ratio seul) : {metrics['baseline_wr'] * 100:.2f}% WR sur {metrics['n_test']} paris")
 
-    print(f"\n{'Seuil':<8}{'Paris pris':<14}{'Win rate':<12}{'% volume conserve'}")
-    print("-" * 55)
-    # Affiche les seuils de THRESHOLDS (config) pour preserver l'output historique.
-    # y_pred est deja calcule dans train_and_evaluate, on le reutilise.
-    for th in THRESHOLDS:
-        mask = y_pred >= th
-        n_bets = int(mask.sum())
-        if n_bets == 0:
-            print(f"{th:<8}{'0':<14}{'N/A':<12}{'0.00%'}")
-            continue
-        wr = y_test[mask].mean() * 100
-        pct_vol = n_bets / len(y_test) * 100
-        print(f"{th:<8}{n_bets:<14}{wr:>6.2f}%{'':<5}{pct_vol:>6.2f}%")
-
-    print(f"\n--- Breakdown par longueur de sequence (seuil={metrics['breakdown_threshold']}) ---")
-    total_wr_pct = (metrics['breakdown_total_wr'] or 0) * 100
-    print(f"  TOTAL paris pris par l'IA : {metrics['breakdown_total_taken']} (WR = {total_wr_pct:.2f}%)")
+    total_taken = metrics["adaptive_total_taken"]
+    total_wr = metrics["adaptive_total_wr"]
+    total_pct = total_taken / metrics["n_test"] * 100 if metrics["n_test"] else 0.0
+    total_wr_str = f"{total_wr * 100:.2f}%" if total_wr is not None else "N/A"
+    print(f"\n--- Breakdown par longueur de sequence (decision adaptative) ---")
+    print(f"  TOTAL paris pris par l'IA : {total_taken} ({total_pct:.2f}% volume), WR = {total_wr_str}")
     for sl, m in breakdown_per_seq.items():
         if m["n"] > 0:
             print(f"  Seq {sl}b : {m['n']:>5} paris, WR = {m['wr'] * 100:.2f}%")
@@ -575,8 +532,8 @@ def _print_evaluation(metrics, breakdown_per_seq, model, feature_cols, train, te
     print(f"\nDuration : {metrics['duration_sec']}s | best_iteration : {metrics['best_iteration']} | val_logloss : {metrics['val_logloss_best']}")
 
 
-def _print_adaptive_section(report, ada_taken, ada_wr, fixed_taken, fixed_wr, n_test):
-    """Print : (1) calibration par bucket, (2) head-to-head adaptatif vs fixe sur test."""
+def _print_adaptive_section(report):
+    """Print la table de calibration par bucket (vol, wknd)."""
     print("\n" + "=" * 70)
     print(f"  CALIBRATION SEUIL ADAPTATIF (sur {ADAPTIVE_CALIB_DAYS}j de val "
           f"= {ADAPTIVE_CALIB_FRACTION:.0%} de TEST_DAYS={TEST_DAYS}, target_wr={ADAPTIVE_TARGET_WR})")
@@ -594,25 +551,6 @@ def _print_adaptive_section(report, ada_taken, ada_wr, fixed_taken, fixed_wr, n_
         print(f"  ({vol}, {wknd}){'':<7}{r['n_calib']:<10}{r['n_used']:<10}"
               f"{r['threshold_clamped']:<10.3f}{wr_str:<10}"
               f"{r['delta']:+.3f}    {r['source_flag']}")
-
-    print("\n" + "=" * 70)
-    print("  HEAD-TO-HEAD SUR TEST : seuil fixe vs seuil adaptatif")
-    print("=" * 70)
-    fixed_pct = fixed_taken / n_test * 100 if n_test else 0.0
-    ada_pct = ada_taken / n_test * 100 if n_test else 0.0
-    fixed_wr_str = f"{(fixed_wr or 0) * 100:.2f}%" if fixed_wr is not None else "N/A"
-    ada_wr_str = f"{(ada_wr or 0) * 100:.2f}%" if ada_wr is not None else "N/A"
-    print(f"  Fixe    (BREAKDOWN_THRESHOLD={BREAKDOWN_THRESHOLD}) : "
-          f"{fixed_taken:>5} paris ({fixed_pct:.2f}% volume), WR = {fixed_wr_str}")
-    print(f"  Adaptatif                                        : "
-          f"{ada_taken:>5} paris ({ada_pct:.2f}% volume), WR = {ada_wr_str}")
-    if fixed_wr is not None and ada_wr is not None:
-        wr_delta = (ada_wr - fixed_wr) * 100
-        n_delta = ada_taken - fixed_taken
-        sign = "+" if wr_delta >= 0 else ""
-        n_sign = "+" if n_delta >= 0 else ""
-        print(f"  Delta                                            : "
-              f"{n_sign}{n_delta} paris, {sign}{wr_delta:.2f}pp WR")
 
 
 # ============================================================

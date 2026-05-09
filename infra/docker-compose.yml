@@ -4,11 +4,16 @@
 # le Dockerfile puisse COPY backtest/ et live/. Le .dockerignore est aussi
 # lu depuis la racine du repo.
 #
-# Usage (depuis ce dossier infra/) :
+# Usage (au choix, depuis infra/ OU depuis live/) :
 #   docker compose up -d --build      # build + start en arriere-plan
 #   docker compose logs -f aure-live  # suivre les logs
 #   docker compose restart aure-live  # restart (pour reload aure.json apres replace)
 #   docker compose down               # stop + remove
+#
+# live/docker-compose.yml inclut ce fichier via "include:" pour permettre
+# de lancer aussi depuis live/. Le "name: aure-live" garantit que les deux
+# entry points referent au meme projet docker.
+name: aure-live
 
 services:
   aure-live:
@@ -19,9 +24,10 @@ services:
     restart: unless-stopped
     env_file: ../.env
     volumes:
-      # Modele et sidecar (mounts de fichiers, pas dossiers — doivent exister sur l'host avant up).
-      - ../aure.json:/app/aure.json
-      - ../aure.thresholds.json:/app/aure.thresholds.json
+      # Modele + sidecar montes a /app/backtest/modele_15m/ pour matcher les chemins absolus
+      # de live/settings.py (MODEL_PATH = REPO_ROOT/backtest/modele_15m/btc_reversal_model.json).
+      - ../backtest/modele_15m/btc_reversal_model.json:/app/backtest/modele_15m/btc_reversal_model.json:ro
+      - ../backtest/modele_15m/btc_reversal_model.thresholds.json:/app/backtest/modele_15m/btc_reversal_model.thresholds.json:ro
       # Logs et CSVs persistent en host (sinon perdus au container restart).
       - ../live/logs:/app/live/logs
-    # Pas de port publie : le daemon n'a que des connexions sortantes (Bitstamp + Telegram).
+    # Pas de port publie : le daemon n'a que des connexions sortantes (Bitstamp + Polymarket + Telegram).

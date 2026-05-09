@@ -1,8 +1,12 @@
 # Modèle XGBoost entraîné (artefact regénérable via train.py)
 btc_reversal_model.json
+btc_updown_model.json
+btc_updown_model.thresholds.json
 
-# Datasets et logs CSV (regénérables ou volumineux)
+# Datasets et logs (regénérables ou volumineux)
 *.csv
+*.parquet
+*.db
 
 # Python
 __pycache__/
