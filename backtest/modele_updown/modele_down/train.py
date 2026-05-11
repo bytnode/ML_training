@@ -1,16 +1,12 @@
 """
 Entrainement + evaluation du modele XGBoost DOWN-only.
 
-Le modèle est entraîné à prédire :
-    label = 1 si la prochaine bougie est ROUGE (close < open)
-            0 si verte
-    -> sa sortie P(label=1) = P(next is down) = confidence DOWN
+Le modele predit P(next is down) (label=1 si la prochaine bougie est rouge).
+Decision DOWN : take ssi P(down) >= seuil_effectif(row), avec seuil determine
+par ADAPTIVE_STRATEGY (asym_wknd_excl V1 ou asym_wknd_excl_hour_boost V2).
 
-Décision adaptative (axe unique, identique à modele_15m) :
-  - Le sidecar contient un seul `deltas` dict (1 delta par bucket vol×wknd).
-  - On prend le pari DOWN ssi
-        P(down) >= ADAPTIVE_TARGET_WR + delta(bucket)
-  - Plus de logique UP/DOWN à arbitrer : tous les paris sont des paris DOWN.
+Calibration par QUANTILE : T_axis = val_pool quantile (1 - ASYM_VOL_FRAC_axis).
+Stable cross-window contrairement a l'ancienne target_wr/target_hit.
 
 Usage CLI :
     python train.py
@@ -29,9 +25,10 @@ import xgboost as xgb
 from config import (
     DB_PATH, MODEL_OUTPUT,
     TRAIN_DAYS, TEST_DAYS, VAL_FRACTION,
-    ADAPTIVE_TARGET_WR, ADAPTIVE_CALIB_FRACTION,
-    ADAPTIVE_MIN_N_VAL, ADAPTIVE_MIN_N_VAL_SOFT, ADAPTIVE_MIN_N_AT_THRESHOLD,
-    ADAPTIVE_DELTA_CLAMP,
+    ADAPTIVE_STRATEGY,
+    ASYM_VOL_FRAC_WEEKDAY, ASYM_VOL_FRAC_WEEKEND, ASYM_SKIP_CELLS,
+    ASYM_USE_FULL_VAL,
+    ASYM_HOUR_BOOST_GOOD_HOURS, ASYM_HOUR_BOOST_DELTA,
     XGB_N_ESTIMATORS, XGB_MAX_DEPTH, XGB_LEARNING_RATE,
     XGB_MIN_CHILD_WEIGHT, XGB_SUBSAMPLE, XGB_COLSAMPLE_BYTREE,
     XGB_REG_LAMBDA, XGB_REG_ALPHA, XGB_GAMMA,
@@ -39,13 +36,6 @@ from config import (
     XGB_SCALE_POS_WEIGHT,
 )
 from features import build_training_dataframe
-
-# Grille de seuils candidats. La sortie du modèle est P(down) qu'on calibre
-# directement comme un score de confiance.
-ADAPTIVE_TH_GRID = np.round(np.arange(0.50, 0.7501, 0.005), 4)
-
-ADAPTIVE_BUCKETS = [(v, w) for v in (0, 1, 2) for w in (0, 1)]
-ADAPTIVE_CALIB_DAYS = max(1, int(TEST_DAYS * ADAPTIVE_CALIB_FRACTION))
 
 ROOT = Path(__file__).resolve().parent
 LOGS_DIR = ROOT / "logs"
@@ -100,158 +90,16 @@ def _resolve_scale_pos_weight(spw_cfg, y_train) -> float | None:
 
 
 # ============================================================
-#  Calibration du seuil adaptatif (axe unique : P(down))
+#  Sidecar writers
 # ============================================================
-def _compute_bucket_threshold(probas, labels, target_wr, base_th, min_n_at_th, clamp):
-    """
-    Pour un bucket donné, calibre un threshold T en deux étapes :
-
-    1. **target_hit** : si un threshold T atteint WR >= target_wr (avec
-       n_at_T >= min_n_at_th), on prend le PLUS PETIT T qui satisfait
-       la cible -> max de bets à WR >= target.
-
-    2. **strict_fallback** : sinon, target_wr est inatteignable. On respecte
-       la rigueur demandée en n'autorisant que les thresholds T >= base_th
-       (= au moins aussi stricts que le seuil de base demandé). Parmi ceux-là,
-       on prend celui à plus haute WR observée. Si aucun T >= base_th n'a
-       assez de bets, on renvoie None et le bucket est skippé (0 pari).
-
-    Cette logique garantit que **augmenter target_wr resserre toujours
-    le threshold effectif**, jamais l'inverse.
-    """
-    candidates = []
-    for th in ADAPTIVE_TH_GRID:
-        mask = probas >= th
-        n = int(mask.sum())
-        if n < min_n_at_th:
-            continue
-        wr = float(labels[mask].mean())
-        candidates.append((float(th), n, wr))
-
-    if not candidates:
-        return None
-
-    above_target = [c for c in candidates if c[2] >= target_wr]
-    if above_target:
-        # Cas idéal : on prend le plus petit T qui atteint la cible WR.
-        chosen = min(above_target, key=lambda c: c[0])
-        flag = "target_hit"
-    else:
-        # Cible inatteignable : on n'accepte que les T >= base_th, càd
-        # au moins aussi stricts que ce que l'utilisateur a demandé.
-        strict_candidates = [c for c in candidates if c[0] >= base_th]
-        if not strict_candidates:
-            # Même base_th est trop strict pour avoir assez de bets.
-            # On skippe le bucket entièrement.
-            return None
-        chosen = max(strict_candidates, key=lambda c: c[2])
-        flag = "strict_fallback"
-
-    th, n, wr = chosen
-    delta_raw = th - base_th
-    delta = max(clamp[0], min(clamp[1], delta_raw))
-    return {
-        "threshold_chosen":  th,
-        "threshold_clamped": base_th + delta,
-        "n_at_th":           n,
-        "wr_at_th":          wr,
-        "delta_raw":         float(delta_raw),
-        "delta":             float(delta),
-        "source_flag":       flag,
-    }
-
-
-def compute_adaptive_thresholds(
-    val_df, p_down_val, base_th,
-    calib_days=ADAPTIVE_CALIB_DAYS,
-    min_n_val=ADAPTIVE_MIN_N_VAL,
-    min_n_val_soft=ADAPTIVE_MIN_N_VAL_SOFT,
-    target_wr=ADAPTIVE_TARGET_WR,
-    min_n_at_th=ADAPTIVE_MIN_N_AT_THRESHOLD,
-    clamp=ADAPTIVE_DELTA_CLAMP,
-):
-    """
-    Calibre un delta par bucket (volatility_state, is_weekend) directement
-    sur P(down) du val set.
-    """
-    if len(val_df) == 0 or "volatility_state" not in val_df.columns or "is_weekend" not in val_df.columns:
-        return {}, []
-
-    probas = np.asarray(p_down_val, dtype=float)
-    labels = val_df["label"].to_numpy().astype(int)
-
-    ms_per_day = 86_400 * 1000
-    val_max_ts = int(val_df["timestamp"].max())
-    calib_cutoff = val_max_ts - calib_days * ms_per_day
-
-    timestamps = val_df["timestamp"].to_numpy()
-    vol_arr = val_df["volatility_state"].astype(int).to_numpy()
-    wknd_arr = val_df["is_weekend"].astype(int).to_numpy()
-    calib_mask = timestamps >= calib_cutoff
-
-    deltas: dict[str, float] = {}
-    report: list[dict] = []
-    for vol, wknd in ADAPTIVE_BUCKETS:
-        key = f"{vol}_{wknd}"
-        bucket_full = (vol_arr == vol) & (wknd_arr == wknd)
-        bucket_calib = bucket_full & calib_mask
-        n_calib = int(bucket_calib.sum())
-        n_full = int(bucket_full.sum())
-
-        if n_calib >= min_n_val:
-            use_mask, source, n_used = bucket_calib, "calib_window", n_calib
-        elif n_full >= min_n_val:
-            use_mask, source, n_used = bucket_full, "fallback_full_val", n_full
-        elif n_full >= min_n_val_soft:
-            use_mask, source, n_used = bucket_full, "low_conf_full_val", n_full
-        else:
-            deltas[key] = 0.0
-            report.append({
-                "bucket": (vol, wknd),
-                "n_calib": n_calib, "n_full": n_full,
-                "n_used": 0, "source_flag": "insufficient_data",
-                "delta": 0.0, "delta_raw": 0.0,
-                "threshold_chosen": base_th, "threshold_clamped": base_th,
-                "n_at_th": 0, "wr_at_th": None,
-            })
-            continue
-
-        res = _compute_bucket_threshold(
-            probas[use_mask], labels[use_mask],
-            target_wr, base_th, min_n_at_th, clamp,
-        )
-        if res is None:
-            deltas[key] = 0.0
-            report.append({
-                "bucket": (vol, wknd),
-                "n_calib": n_calib, "n_full": n_full,
-                "n_used": n_used, "source_flag": f"{source}:no_candidates",
-                "delta": 0.0, "delta_raw": 0.0,
-                "threshold_chosen": base_th, "threshold_clamped": base_th,
-                "n_at_th": 0, "wr_at_th": None,
-            })
-            continue
-
-        deltas[key] = res["delta"]
-        report.append({
-            "bucket": (vol, wknd),
-            "n_calib": n_calib, "n_full": n_full,
-            "n_used": n_used, "source_flag": f"{source}:{res['source_flag']}",
-            **res,
-        })
-
-    return deltas, report
-
-
-def save_thresholds_sidecar(model_path, deltas, metadata=None):
-    """Sidecar JSON : un seul dict `deltas` (1 delta par bucket vol×wknd).
-
-    Format :
-        {"deltas": {"vol_wknd": float, ...}, "metadata": {...}}
-    """
+def save_thresholds_sidecar_asym(model_path, thresholds_per_wknd: dict, skip_cells: list,
+                                  metadata=None):
+    """Sidecar V1 (asym_wknd_excl) : 2 seuils (weekday/weekend) + skip cells."""
     sidecar = Path(model_path).with_suffix(".thresholds.json")
     payload = {
-        "deltas":   {k: float(v) for k, v in deltas.items()},
+        "strategy": "asym_wknd_excl",
+        "thresholds_per_wknd": {str(int(k)): float(v) for k, v in thresholds_per_wknd.items()},
+        "skip_cells": [[int(v), int(w)] for (v, w) in skip_cells],
         "metadata": metadata or {},
     }
     with open(sidecar, "w") as f:
@@ -259,26 +107,171 @@ def save_thresholds_sidecar(model_path, deltas, metadata=None):
     return sidecar
 
 
-def apply_adaptive_threshold(df, p_down, deltas, base_th):
-    """
-    Renvoie un mask bool de même longueur que p_down :
-      take[i] = P(down)[i] >= base_th + delta(bucket(i))
+def save_thresholds_sidecar_asym_hour_boost(model_path, thresholds_per_wknd: dict,
+                                             skip_cells: list, good_hours: tuple,
+                                             hour_boost_delta: float, metadata=None):
+    """Sidecar V2 (asym_wknd_excl_hour_boost) : V1 + champ optional `hour_boost`."""
+    sidecar = Path(model_path).with_suffix(".thresholds.json")
+    payload = {
+        "strategy": "asym_wknd_excl_hour_boost",
+        "thresholds_per_wknd": {str(int(k)): float(v) for k, v in thresholds_per_wknd.items()},
+        "skip_cells": [[int(v), int(w)] for (v, w) in skip_cells],
+        "hour_boost": {
+            "good_hours": [int(h) for h in good_hours],
+            "delta": float(hour_boost_delta),
+        },
+        "metadata": metadata or {},
+    }
+    with open(sidecar, "w") as f:
+        json.dump(payload, f, indent=2)
+    return sidecar
 
-    Si volatility_state / is_weekend manquent : delta = 0 partout.
+
+# ============================================================
+#  Hour-of-day helper (UTC, derive du timestamp en ms)
+# ============================================================
+def hour_of_day_from_ms(ts_ms: np.ndarray) -> np.ndarray:
+    """Renvoie l'heure UTC (0..23) pour chaque timestamp ms.
+    Compatible avec les bougies 15m (timestamp = open time, aligne sur 15m).
+    """
+    ts_ms = np.asarray(ts_ms, dtype=np.int64)
+    return ((ts_ms // (15 * 60 * 1000)) % 96 // 4).astype(int)
+
+
+# ============================================================
+#  Asymmetric weekday/weekend strategy with cell exclusions (V1)
+# ============================================================
+def compute_thresholds_asym_wknd_excl(
+    val_df,
+    p_down_val,
+    vol_frac_wd: float = ASYM_VOL_FRAC_WEEKDAY,
+    vol_frac_we: float = ASYM_VOL_FRAC_WEEKEND,
+    skip_cells=ASYM_SKIP_CELLS,
+    use_full_val: bool = ASYM_USE_FULL_VAL,
+    calib_days: int = 55,
+):
+    """Calibration par quantile :
+      T_axis = val_pool_quantile(1 - vol_frac_axis)
+             = on garde le top vol_frac_axis du val non-skip de l'axe.
+
+    Stable cross-window car le quantile s'auto-ajuste a la distribution
+    p_down de la fenetre val.
+
+    Renvoie :
+        thresholds_per_wknd : {0: T_wd, 1: T_we}
+        report : list[dict]
+    """
+    skip_set = set((int(v), int(w)) for (v, w) in skip_cells)
+
+    if len(val_df) == 0 or "volatility_state" not in val_df.columns or "is_weekend" not in val_df.columns:
+        return {0: 1.0, 1: 1.0}, []
+
+    if use_full_val:
+        mask = np.ones(len(val_df), dtype=bool)
+    else:
+        ms_per_day = 86_400 * 1000
+        val_max_ts = int(val_df["timestamp"].max())
+        cutoff = val_max_ts - calib_days * ms_per_day
+        mask = val_df["timestamp"].to_numpy() >= cutoff
+
+    probas = np.asarray(p_down_val, dtype=float)
+    labels = val_df["label"].to_numpy().astype(int)
+    vol_arr = val_df["volatility_state"].astype(int).to_numpy()
+    wknd_arr = val_df["is_weekend"].astype(int).to_numpy()
+
+    not_skipped = np.ones(len(val_df), dtype=bool)
+    for (v, w) in skip_set:
+        not_skipped &= ~((vol_arr == v) & (wknd_arr == w))
+    cal_mask = mask & not_skipped
+
+    thresholds_per_wknd = {}
+    report = []
+    for wknd_axis, vol_frac in ((0, vol_frac_wd), (1, vol_frac_we)):
+        axis_mask = cal_mask & (wknd_arr == wknd_axis)
+        n_axis = int(axis_mask.sum())
+        if n_axis < 30 or vol_frac <= 0:
+            thresholds_per_wknd[wknd_axis] = 1.0
+            report.append({
+                "axis": "weekday" if wknd_axis == 0 else "weekend",
+                "wknd": wknd_axis, "vol_frac": vol_frac, "n_val": n_axis,
+                "T": None, "wr_val_at_T": None, "n_at_T": 0,
+                "source": "insufficient_data" if n_axis < 30 else "vol_frac=0",
+            })
+            continue
+
+        pb = probas[axis_mask]
+        yb = labels[axis_mask]
+        T = float(np.quantile(pb, 1.0 - vol_frac))
+        bet = pb >= T
+        n_at_T = int(bet.sum())
+        wr_val = float(yb[bet].mean()) if n_at_T > 0 else 0.0
+
+        thresholds_per_wknd[wknd_axis] = T
+        report.append({
+            "axis": "weekday" if wknd_axis == 0 else "weekend",
+            "wknd": wknd_axis, "vol_frac": vol_frac, "n_val": n_axis,
+            "T": T, "wr_val_at_T": wr_val, "n_at_T": n_at_T, "source": "quantile",
+        })
+
+    return thresholds_per_wknd, report
+
+
+def apply_thresholds_asym_wknd_excl(df, p_down, thresholds_per_wknd: dict,
+                                     skip_cells=ASYM_SKIP_CELLS) -> np.ndarray:
+    """V1 application : take[i] = (cell pas dans skip) AND (p_down[i] >= T_wknd(i))."""
+    p_down = np.asarray(p_down, dtype=float)
+    if len(df) == 0:
+        return np.zeros(0, dtype=bool)
+    if "volatility_state" not in df.columns or "is_weekend" not in df.columns:
+        return np.zeros(len(p_down), dtype=bool)
+
+    skip_set = set((int(v), int(w)) for (v, w) in skip_cells)
+    vol = df["volatility_state"].astype(int).to_numpy()
+    wknd = df["is_weekend"].astype(int).to_numpy()
+
+    take = np.zeros(len(p_down), dtype=bool)
+    for i in range(len(p_down)):
+        if (int(vol[i]), int(wknd[i])) in skip_set:
+            continue
+        T = thresholds_per_wknd.get(int(wknd[i]), 1.0)
+        if p_down[i] >= T:
+            take[i] = True
+    return take
+
+
+def apply_thresholds_asym_hour_boost(df, p_down, thresholds_per_wknd: dict,
+                                      skip_cells=ASYM_SKIP_CELLS,
+                                      good_hours=ASYM_HOUR_BOOST_GOOD_HOURS,
+                                      hour_boost_delta: float = ASYM_HOUR_BOOST_DELTA) -> np.ndarray:
+    """V2 application : V1 thresholds + boost horaire.
+
+    Pour les rows dont l'heure UTC ∈ good_hours, le seuil effectif est abaisse
+    de `hour_boost_delta` (skip cells non boostees).
     """
     p_down = np.asarray(p_down, dtype=float)
     if len(df) == 0:
         return np.zeros(0, dtype=bool)
     if "volatility_state" not in df.columns or "is_weekend" not in df.columns:
-        return p_down >= base_th
+        return np.zeros(len(p_down), dtype=bool)
+    if "timestamp" not in df.columns:
+        return np.zeros(len(p_down), dtype=bool)
 
+    skip_set = set((int(v), int(w)) for (v, w) in skip_cells)
+    good_hours_set = set(int(h) for h in good_hours)
     vol = df["volatility_state"].astype(int).to_numpy()
     wknd = df["is_weekend"].astype(int).to_numpy()
-    delta_per_row = np.array(
-        [deltas.get(f"{int(v)}_{int(w)}", 0.0) for v, w in zip(vol, wknd)],
-        dtype=float,
-    )
-    return p_down >= (base_th + delta_per_row)
+    hour = hour_of_day_from_ms(df["timestamp"].to_numpy())
+
+    take = np.zeros(len(p_down), dtype=bool)
+    for i in range(len(p_down)):
+        if (int(vol[i]), int(wknd[i])) in skip_set:
+            continue
+        T = thresholds_per_wknd.get(int(wknd[i]), 1.0)
+        if int(hour[i]) in good_hours_set:
+            T = T - hour_boost_delta
+        if p_down[i] >= T:
+            take[i] = True
+    return take
 
 
 # ============================================================
@@ -385,24 +378,32 @@ def train_and_evaluate(
     best_iter = int(model.best_iteration)
     val_logloss_best = float(model.evals_result()["validation_0"]["logloss"][best_iter])
 
-    # ---- Calibration adaptative (sur val, axe unique = P(down)) ----
-    deltas: dict[str, float] = {}
+    if ADAPTIVE_STRATEGY not in ("asym_wknd_excl", "asym_wknd_excl_hour_boost"):
+        raise ValueError(
+            f"ADAPTIVE_STRATEGY={ADAPTIVE_STRATEGY!r} non supporte. "
+            f"Choix valides : 'asym_wknd_excl' (V1) ou 'asym_wknd_excl_hour_boost' (V2)."
+        )
+
+    # ---- Calibration adaptative (asym pooled par quantile sur val) ----
+    thresholds_per_wknd: dict = {}
     report: list[dict] = []
     if len(val) > 0:
         p_down_val = model.predict_proba(X_val)[:, 1]
-        deltas, report = compute_adaptive_thresholds(val, p_down_val, ADAPTIVE_TARGET_WR)
+        thresholds_per_wknd, report = compute_thresholds_asym_wknd_excl(val, p_down_val)
 
     # ---- Test predictions ----
     p_down_test = model.predict_proba(X_test)[:, 1]
-    baseline_wr_down = float(y_test.mean())  # P(label=1=down) sur le test
+    baseline_wr_down = float(y_test.mean())
 
-    # ---- Décision adaptative sur test ----
-    take_test = apply_adaptive_threshold(test, p_down_test, deltas, ADAPTIVE_TARGET_WR)
+    # ---- Decision sur test (V1 ou V2) ----
+    if ADAPTIVE_STRATEGY == "asym_wknd_excl_hour_boost":
+        take_test = apply_thresholds_asym_hour_boost(test, p_down_test, thresholds_per_wknd)
+    else:
+        take_test = apply_thresholds_asym_wknd_excl(test, p_down_test, thresholds_per_wknd)
     label_arr = y_test.to_numpy().astype(int)
 
     n_test = len(test)
     n_total = int(take_test.sum())
-    # WR = fraction des paris DOWN qui étaient corrects (= label=1=down)
     wr_total = float(label_arr[take_test].mean()) if n_total > 0 else None
 
     if log_predictions:
@@ -413,20 +414,33 @@ def train_and_evaluate(
     # ---- Save model + sidecar ----
     if save_model:
         model.save_model(MODEL_OUTPUT)
-        save_thresholds_sidecar(
-            MODEL_OUTPUT, deltas,
-            metadata={
-                "trained_at":          datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "calib_fraction":      ADAPTIVE_CALIB_FRACTION,
-                "calib_days_resolved": ADAPTIVE_CALIB_DAYS,
-                "test_days":           TEST_DAYS,
-                "target_wr":           ADAPTIVE_TARGET_WR,
-                "min_n_val":           ADAPTIVE_MIN_N_VAL,
-                "min_n_at_threshold":  ADAPTIVE_MIN_N_AT_THRESHOLD,
-                "clamp":               list(ADAPTIVE_DELTA_CLAMP),
-                "model_kind":          "down_only",
-            },
-        )
+        common_metadata = {
+            "trained_at":   datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "test_days":    TEST_DAYS,
+            "model_kind":   "down_only",
+        }
+        calib_meta = {
+            "calib_method":      "quantile",
+            "vol_frac_weekday":  ASYM_VOL_FRAC_WEEKDAY,
+            "vol_frac_weekend":  ASYM_VOL_FRAC_WEEKEND,
+            "use_full_val":      ASYM_USE_FULL_VAL,
+        }
+        if ADAPTIVE_STRATEGY == "asym_wknd_excl_hour_boost":
+            save_thresholds_sidecar_asym_hour_boost(
+                MODEL_OUTPUT, thresholds_per_wknd, list(ASYM_SKIP_CELLS),
+                ASYM_HOUR_BOOST_GOOD_HOURS, ASYM_HOUR_BOOST_DELTA,
+                metadata={
+                    **common_metadata,
+                    **calib_meta,
+                    "hour_boost_good_hours": list(ASYM_HOUR_BOOST_GOOD_HOURS),
+                    "hour_boost_delta":      ASYM_HOUR_BOOST_DELTA,
+                },
+            )
+        else:
+            save_thresholds_sidecar_asym(
+                MODEL_OUTPUT, thresholds_per_wknd, list(ASYM_SKIP_CELLS),
+                metadata={**common_metadata, **calib_meta},
+            )
 
     # ---- Metrics ----
     metrics = {
@@ -448,14 +462,18 @@ def train_and_evaluate(
     for k, v in hp.items():
         metrics[f"hp_{k}"] = v
 
-    metrics["adaptive_calib_fraction"] = ADAPTIVE_CALIB_FRACTION
-    metrics["adaptive_calib_days"]     = ADAPTIVE_CALIB_DAYS
-    metrics["adaptive_target_wr"]      = ADAPTIVE_TARGET_WR
-    metrics["adaptive_total_taken"]    = n_total
-    metrics["adaptive_total_wr"]       = round(wr_total, 5) if wr_total is not None else None
-    for vol, wknd in ADAPTIVE_BUCKETS:
-        key = f"{vol}_{wknd}"
-        metrics[f"delta_v{vol}_w{wknd}"] = round(deltas[key], 5) if key in deltas else None
+    metrics["adaptive_strategy"]    = ADAPTIVE_STRATEGY
+    metrics["adaptive_total_taken"] = n_total
+    metrics["adaptive_total_wr"]    = round(wr_total, 5) if wr_total is not None else None
+    metrics["calib_method"]    = "quantile"
+    metrics["vol_frac_weekday"] = ASYM_VOL_FRAC_WEEKDAY
+    metrics["vol_frac_weekend"] = ASYM_VOL_FRAC_WEEKEND
+    metrics["asym_T_weekday"]  = round(thresholds_per_wknd.get(0, 1.0), 5) if thresholds_per_wknd else None
+    metrics["asym_T_weekend"]  = round(thresholds_per_wknd.get(1, 1.0), 5) if thresholds_per_wknd else None
+    metrics["asym_skip_cells"] = str(list(ASYM_SKIP_CELLS))
+    if ADAPTIVE_STRATEGY == "asym_wknd_excl_hour_boost":
+        metrics["asym_hour_boost_good_hours"] = str(list(ASYM_HOUR_BOOST_GOOD_HOURS))
+        metrics["asym_hour_boost_delta"]      = ASYM_HOUR_BOOST_DELTA
 
     # ---- Print + log ----
     if verbose:
@@ -539,23 +557,23 @@ def _print_evaluation(metrics, model, feature_cols):
 
 def _print_adaptive_section(report):
     print("\n" + "=" * 70)
-    print(f"  CALIBRATION SEUIL ADAPTATIF (DOWN-only, calibre P(down))")
-    print(f"  sur {ADAPTIVE_CALIB_DAYS}j de val "
-          f"= {ADAPTIVE_CALIB_FRACTION:.0%} de TEST_DAYS={TEST_DAYS}, target_wr={ADAPTIVE_TARGET_WR}")
+    name = "ASYM_WKND_EXCL_HOUR_BOOST (V2)" if ADAPTIVE_STRATEGY == "asym_wknd_excl_hour_boost" else "ASYM_WKND_EXCL (V1)"
+    print(f"  CALIBRATION {name} (DOWN-only) - methode quantile")
+    print(f"  vol_frac_weekday={ASYM_VOL_FRAC_WEEKDAY}  vol_frac_weekend={ASYM_VOL_FRAC_WEEKEND}")
+    print(f"  skip_cells={list(ASYM_SKIP_CELLS)}  use_full_val={ASYM_USE_FULL_VAL}")
+    if ADAPTIVE_STRATEGY == "asym_wknd_excl_hour_boost":
+        print(f"  HOUR BOOST: good_hours={list(ASYM_HOUR_BOOST_GOOD_HOURS)}  delta={ASYM_HOUR_BOOST_DELTA}")
     print("=" * 70)
     if not report:
-        print("  (aucun bucket calibré — val vide ou colonnes manquantes)")
+        print("  (aucun seuil calibre - val vide ou colonnes manquantes)")
         return
-
-    print(f"  {'(vol, wknd)':<14}{'n_calib':<10}{'n_used':<10}{'th_pick':<10}"
-          f"{'wr@th':<10}{'delta':<10}{'source'}")
-    print("  " + "-" * 80)
+    print(f"  {'axis':<10} {'vol_frac':<10} {'n_val':<8} {'T':<10} {'wr_val@T':<10} {'n_val@T':<8} {'source'}")
+    print("  " + "-" * 72)
     for r in report:
-        vol, wknd = r["bucket"]
-        wr_str = f"{r['wr_at_th']:.4f}" if r["wr_at_th"] is not None else "  N/A "
-        print(f"  ({vol}, {wknd}){'':<7}{r['n_calib']:<10}{r['n_used']:<10}"
-              f"{r['threshold_clamped']:<10.3f}{wr_str:<10}"
-              f"{r['delta']:+.3f}    {r['source_flag']}")
+        T_str = f"{r['T']:.4f}" if r["T"] is not None else "N/A"
+        wr_str = f"{r['wr_val_at_T']:.4f}" if r["wr_val_at_T"] is not None else "N/A"
+        print(f"  {r['axis']:<10} {r['vol_frac']:<10.4f} {r['n_val']:<8} "
+              f"{T_str:<10} {wr_str:<10} {r['n_at_T']:<8} {r['source']}")
 
 
 def _print_bet_samples(test_df, p_down, take, label_raw, n_samples=5):
@@ -571,8 +589,24 @@ def _print_bet_samples(test_df, p_down, take, label_raw, n_samples=5):
     bet_idx = np.where(take_arr)[0]
 
     print("\n" + "=" * 70)
-    print(f"  ÉCHANTILLON ALÉATOIRE — {n_samples} paris DOWN")
+    print(f"  ECHANTILLON ALEATOIRE - {n_samples} paris DOWN")
     print("=" * 70)
+
+    # Moyennes de P(down) sur les paris effectivement pris :
+    #   - all   : sur tous les paris pris
+    #   - wins  : sur les paris gagnants (label = 1 = bougie rouge)
+    #   - loss  : sur les paris perdants (label = 0 = bougie verte)
+    win_mask = take_arr & (label_arr == 1)
+    loss_mask = take_arr & (label_arr == 0)
+    n_taken = int(take_arr.sum())
+    n_wins = int(win_mask.sum())
+    n_loss = int(loss_mask.sum())
+    mean_p_taken = float(p_down_arr[take_arr].mean()) if n_taken > 0 else 0.0
+    mean_p_wins = float(p_down_arr[win_mask].mean()) if n_wins > 0 else 0.0
+    mean_p_loss = float(p_down_arr[loss_mask].mean()) if n_loss > 0 else 0.0
+    print(f"\n  Moyenne P(down) sur les {n_taken} paris pris   : {mean_p_taken*100:.2f}%")
+    print(f"  Moyenne P(down) sur les {n_wins:>5} paris gagnants : {mean_p_wins*100:.2f}%")
+    print(f"  Moyenne P(down) sur les {n_loss:>5} paris perdants : {mean_p_loss*100:.2f}%  (delta = {(mean_p_wins - mean_p_loss)*100:+.2f}pp)")
 
     print(f"\n  Paris DOWN pris (sur {len(bet_idx)} au total) :")
     if len(bet_idx) == 0:
@@ -584,14 +618,14 @@ def _print_bet_samples(test_df, p_down, take, label_raw, n_samples=5):
     sampled = rng.choice(bet_idx, size=sample_size, replace=False)
     sampled = np.sort(sampled)
 
-    print(f"    {'date (UTC)':<22}{'P(down)':<14}{'résultat'}")
+    print(f"    {'date (UTC)':<22}{'P(down)':<14}{'resultat'}")
     print(f"    {'-' * 50}")
     for i in sampled:
         ts_str = pd.to_datetime(int(timestamps_arr[i]), unit="ms", utc=True) \
                    .strftime("%Y-%m-%d %H:%M")
         p = p_down_arr[i]
-        ok = label_arr[i] == 1   # label=1 si la bougie suivante était bien rouge
-        res = "✓ correct (down)" if ok else "✗ raté (up)"
+        ok = label_arr[i] == 1   # label=1 si la bougie suivante etait bien rouge
+        res = "[OK] correct (down)" if ok else "[KO] rate (up)"
         print(f"    {ts_str:<22}{p*100:>6.2f}%       {res}")
 
 

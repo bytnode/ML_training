@@ -40,7 +40,7 @@ Sorties :
     - logs/feature_analysis.csv       : tableau complet pour spreadsheet
 
 Usage :
-    cd backtest/modele_updown
+    cd backtest/modele_updown/modele_down
     python analyze_features.py
 """
 

@@ -89,6 +89,10 @@ def sleep_until_boundary():
     if delay > 0:
         logger.info("sleeping %.1fs until next 15m boundary (target=%d)", delay, target)
         time.sleep(delay)
+    # Safety: time.sleep() can return early due to clock skew (observed: ~5-6s
+    # systematic drift in Docker on Windows). Wait the remainder if needed.
+    while time.time() < target:
+        time.sleep(min(0.5, max(0.0, target - time.time())))
 
 
 def split_klines(klines: list[list]) -> tuple[list, list, list, list, list, list]:
@@ -282,7 +286,17 @@ def run_cycle(client: PolymarketClient, last_known_open_ms: int | None,
     klines_mtf = fetch.fetch_warmup_mtf()
 
     opens, highs, lows, closes, volumes, times = split_klines(klines_15m)
-    last_idx = len(closes) - 1
+
+    # The latest candle in the buffer is usually still in progress (its close
+    # is the live mid-price at fetch time, not the final close). We only ever
+    # analyze a fully-closed candle. Skip the latest if it has not closed yet.
+    now_ms = int(time.time() * 1000)
+    latest_idx = len(closes) - 1
+    latest_open_ms = times[latest_idx]
+    if latest_open_ms + INTERVAL_15M_MS <= now_ms:
+        last_idx = latest_idx
+    else:
+        last_idx = latest_idx - 1
     last_open_ms = times[last_idx]
 
     # ----- Step 5: detect qualifying setups -----
@@ -298,7 +312,7 @@ def run_cycle(client: PolymarketClient, last_known_open_ms: int | None,
                 float(r.get("bet_size_usdc") or 0) for r in store.read_pending_bets()
             ),
         })
-        return last_open_ms
+        return latest_open_ms
 
     # ----- Step 6: build features -----
     enriched = []
@@ -314,7 +328,7 @@ def run_cycle(client: PolymarketClient, last_known_open_ms: int | None,
 
     if not enriched:
         logger.warning("cycle_skip reason=no_features_built")
-        return last_open_ms
+        return latest_open_ms
 
     # ----- Step 7: decide -----
     evaluated = decide.evaluate_candidates(enriched)
@@ -353,7 +367,7 @@ def run_cycle(client: PolymarketClient, last_known_open_ms: int | None,
                 float(r.get("bet_size_usdc") or 0) for r in store.read_pending_bets()
             ),
         })
-        return last_open_ms
+        return latest_open_ms
 
     # ----- Step 8: place bet -----
     target_window_start_ms = last_open_ms + INTERVAL_15M_MS
@@ -377,7 +391,7 @@ def run_cycle(client: PolymarketClient, last_known_open_ms: int | None,
     })
 
     logger.info("cycle_end duration_ms=%d", int((time.time() - cycle_t0) * 1000))
-    return last_open_ms
+    return latest_open_ms
 
 
 def _delta_for_bucket(vol_state: int, is_weekend: int) -> float:

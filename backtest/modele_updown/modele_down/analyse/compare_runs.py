@@ -20,7 +20,7 @@ Diagnostic :
     val_logloss ↓ + test_wr ↓   -> drift val/test, elargir la fenetre
 
 Usage :
-    cd backtest/modele_updown
+    cd backtest/modele_updown/modele_down
     python compare_runs.py            # 2 dernieres runs
     python compare_runs.py 5          # 5 dernieres
     python compare_runs.py --all      # toutes

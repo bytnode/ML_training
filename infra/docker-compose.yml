@@ -1,18 +1,13 @@
-# Compose le daemon Aure live.
+# Live Polymarket trader (modele_15m) — Docker setup.
 #
-# Build context = racine du repo (un niveau au-dessus de ce fichier) pour que
-# le Dockerfile puisse COPY backtest/ et live/. Le .dockerignore est aussi
-# lu depuis la racine du repo.
+# Build context = repo root (one level above this file) so the Dockerfile can
+# COPY backtest/ and live/. The .dockerignore is also read from the repo root.
 #
-# Usage (au choix, depuis infra/ OU depuis live/) :
-#   docker compose up -d --build      # build + start en arriere-plan
-#   docker compose logs -f aure-live  # suivre les logs
-#   docker compose restart aure-live  # restart (pour reload aure.json apres replace)
+# Usage (from infra/) :
+#   docker compose up -d --build      # build + start in background
+#   docker compose logs -f aure-live  # follow logs
+#   docker compose restart aure-live  # restart (e.g. after model retrain)
 #   docker compose down               # stop + remove
-#
-# live/docker-compose.yml inclut ce fichier via "include:" pour permettre
-# de lancer aussi depuis live/. Le "name: aure-live" garantit que les deux
-# entry points referent au meme projet docker.
 name: aure-live
 
 services:
@@ -22,12 +17,13 @@ services:
       dockerfile: infra/Dockerfile
     container_name: aure-live
     restart: unless-stopped
-    env_file: ../.env
+    # Secrets live in live/.env (gitignored). The container reads them as env vars.
+    env_file: ../live/.env
     volumes:
-      # Modele + sidecar montes a /app/backtest/modele_15m/ pour matcher les chemins absolus
-      # de live/settings.py (MODEL_PATH = REPO_ROOT/backtest/modele_15m/btc_reversal_model.json).
+      # Model + sidecar mounted at /app/backtest/modele_15m/ to match
+      # live/settings.py (MODEL_PATH = REPO_ROOT/backtest/modele_15m/btc_reversal_model.json).
       - ../backtest/modele_15m/btc_reversal_model.json:/app/backtest/modele_15m/btc_reversal_model.json:ro
       - ../backtest/modele_15m/btc_reversal_model.thresholds.json:/app/backtest/modele_15m/btc_reversal_model.thresholds.json:ro
-      # Logs et CSVs persistent en host (sinon perdus au container restart).
+      # Logs persist on host (otherwise lost on container restart).
       - ../live/logs:/app/live/logs
-    # Pas de port publie : le daemon n'a que des connexions sortantes (Bitstamp + Polymarket + Telegram).
+    # No port published: daemon only does outbound (Bitstamp + Polymarket + Telegram).

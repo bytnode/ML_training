@@ -25,7 +25,7 @@ Ce fichier remplace l'ancienne chaîne :
 Les anciens scripts sont laissés sur disque mais ne sont plus utiles.
 
 Usage :
-    cd backtest/modele_updown
+    cd backtest/modele_updown/modele_down
     python data.py                 # ~3-5 min : 6 TFs en parallèle + agrégation
     python train.py                # entraîne sur le master CSV produit
 

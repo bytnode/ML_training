@@ -1,31 +1,58 @@
-# Modèle XGBoost entraîné (artefact regénérable via train.py)
+# ============================================================
+#  Model artifacts (regenerable via train.py)
+# ============================================================
 btc_reversal_model.json
+btc_reversal_model.thresholds.json
 btc_updown_model.json
 btc_updown_model.thresholds.json
+aure.json
+aure.thresholds.json
 
-# Datasets et logs (regénérables ou volumineux)
+# ============================================================
+#  Datasets, logs, databases (regenerable or big)
+# ============================================================
 *.csv
 *.parquet
 *.db
+*.sqlite
+*.sqlite3
+*.log
 
-# Python
+# ============================================================
+#  Python
+# ============================================================
 __pycache__/
 *.py[cod]
+*.so
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+build/
+dist/
+
+# Virtualenvs
 .venv/
 venv/
 env/
 
-# Éditeurs / OS
+# ============================================================
+#  Editors / OS
+# ============================================================
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
 
-# Live orchestrator artifacts
-live/logs/*.csv
-live/logs/*.log
-aure.thresholds.json
-
-# Secrets / credentials (Telegram bot, etc.)
+# ============================================================
+#  Secrets / credentials (.env at any depth)
+# ============================================================
 .env
+.env.*
+!.env.example
+
+# ============================================================
+#  Stray / typo files
+# ============================================================
+backtest/modele_updown/python

@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-This file is package-scoped: see the repo-root `CLAUDE.md` (`../../CLAUDE.md`) for repo-wide conventions and for `modele_15m`.
+This file is package-scoped: see the repo-root `CLAUDE.md` (`../../../CLAUDE.md`) for repo-wide conventions and for `modele_15m`.
 
 ## What this package is
 
@@ -21,18 +21,18 @@ take DOWN bet  iff  P(down) >= ADAPTIVE_TARGET_WR + delta(volatility_state, is_w
 ```
 6 buckets total (vol ∈ {0,1,2} × wknd ∈ {0,1}), one delta per bucket, written to `btc_updown_model.thresholds.json`. **Do not reintroduce a separate UP delta** — the sidecar shape is `{"deltas": {"v_w": float, ...}, "metadata": {...}}` and `predict.decide()` / `api.evaluate_on_slice()` assume that shape.
 
-## Working-directory contract — `cd backtest/modele_updown/` first
+## Working-directory contract — `cd backtest/modele_updown/modele_down/` first
 
-`config.py` uses **relative paths**: `DB_PATH = "db/btc_multi_tf_15m.csv"` and `MODEL_OUTPUT = "btc_updown_model.json"`. The patch scripts also do `Path(__file__).resolve().parent / "db" / ...`, so running from the package root is fine, but launching `python backtest/modele_updown/train.py` from the repo root will read/write into the wrong place. Always `cd` first.
+`config.py` uses **relative paths**: `DB_PATH = "db/btc_multi_tf_15m.csv"` and `MODEL_OUTPUT = "btc_updown_model.json"`. The patch scripts also do `Path(__file__).resolve().parent / "db" / ...`, so running from the package root is fine, but launching `python backtest/modele_updown/modele_down/train.py` from the repo root will read/write into the wrong place. Always `cd` first.
 
-`logs/` is anchored by `Path(__file__)` (in `train.py`), so it lives under `backtest/modele_updown/logs/` regardless. The artifacts (`runs.csv`, `test_predictions.csv`) are gitignored CSVs.
+`logs/` is anchored by `Path(__file__)` (in `train.py`), so it lives under `backtest/modele_updown/modele_down/logs/` regardless. The artifacts (`runs.csv`, `test_predictions.csv`) are gitignored CSVs.
 
 ## Build pipeline — order matters
 
 The CSV `db/btc_multi_tf_15m.csv` is built incrementally by a chain of scripts. Each one is idempotent (skips columns already present), but **the order matters** because later scripts read columns produced by earlier ones:
 
 ```powershell
-cd backtest\modele_updown
+cd backtest\modele_updown\modele_down
 
 # 1. Cold fetch — DROPs the SQLite tables and refetches ~5000 days of OHLCV from
 #    Bitstamp on 5 timeframes (15m, 30m, 1h, 4h, 1d), computes 9 normalized

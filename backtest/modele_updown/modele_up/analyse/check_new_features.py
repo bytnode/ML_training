@@ -34,7 +34,7 @@ Mode `--multi-seed N` :
   Default 1 (XGB_RANDOM_STATE de config.py).
 
 Usage :
-    cd backtest/modele_updown
+    cd backtest/modele_updown/modele_down
     python check_new_features.py FEATURE [FEATURE ...]            # ablation
     python check_new_features.py --quick FEATURE [FEATURE ...]    # rapide
     python check_new_features.py --multi-seed 3 FEATURE
@@ -54,18 +54,17 @@ from sklearn.metrics import log_loss
 from xgboost import XGBClassifier
 
 from config import (
-    DB_PATH, TRAIN_DAYS, TEST_DAYS, VAL_FRACTION,
-    ADAPTIVE_TARGET_WR, XGB_RANDOM_STATE,
+    DB_PATH, TRAIN_DAYS, TEST_DAYS, VAL_FRACTION, XGB_RANDOM_STATE,
 )
 from features import build_training_dataframe
 from train import (
     build_hyperparams,
     _resolve_scale_pos_weight,
-    compute_adaptive_thresholds,
-    apply_adaptive_threshold,
+    compute_thresholds_asym_wknd_excl,
+    apply_thresholds_asym_wknd_excl,
 )
 
-EXCLUDED = {"timestamp", "label", "volatility_state"}
+EXCLUDED = {"timestamp", "label", "volatility_state", "is_weekend"}
 
 
 # ============================================================================
@@ -128,8 +127,8 @@ def _run_one(df: pd.DataFrame, feature_cols: list[str], seed: int) -> dict:
     p_test = model.predict_proba(X_test)[:, 1]
     test_ll = float(log_loss(y_test, p_test))
 
-    deltas, _ = compute_adaptive_thresholds(val, p_val, ADAPTIVE_TARGET_WR)
-    take = apply_adaptive_threshold(test, p_test, deltas, ADAPTIVE_TARGET_WR)
+    thresholds_per_wknd, _ = compute_thresholds_asym_wknd_excl(val, p_val)
+    take = apply_thresholds_asym_wknd_excl(test, p_test, thresholds_per_wknd)
     n_taken = int(take.sum())
     wr = float(y_test.to_numpy()[take].mean()) if n_taken > 0 else 0.0
     ev = n_taken * (wr - 0.5)
@@ -321,8 +320,7 @@ def main() -> int:
 
     print(f"\nMode : ABLATION FULL  (production-parity, "
           f"{args.multi_seed} seed{'s' if args.multi_seed > 1 else ''})")
-    print(f"Hyperparams : 1000 trees + early stopping + adaptive threshold "
-          f"(target_wr={ADAPTIVE_TARGET_WR})")
+    print(f"Hyperparams : 1000 trees + early stopping + asym_wknd_excl V1 calibration")
     train, val, test = _split(df)
     print(f"Split : train={len(train):,} | val={len(val):,} | test={len(test):,}")
     print()

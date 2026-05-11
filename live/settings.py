@@ -28,7 +28,7 @@ ORCHESTRATOR_LOG = LOGS_DIR / "orchestrator.log"
 
 # --- Cycle ---
 SEQ_LIVE = [2, 3, 4]                    # seq_len values the daemon fires on
-FRESHNESS_RETRY_MAX = 5
+FRESHNESS_RETRY_MAX = 12                # 12 retries x 1s = 12s of slack for Bitstamp publishing
 FRESHNESS_RETRY_DELAY_S = 1
 WARMUP_CANDLES_15M = 250                # need enough history for EMA-200 + obv_slope_10
 WARMUP_CANDLES_MTF = 50

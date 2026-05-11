@@ -18,13 +18,12 @@ docs/
 
 # Datasets / artifacts du pipeline backtest (regenerables, gros).
 *.csv
-backtest/training_data*.csv
-backtest/logs/
-backtest/btc_reversal_model.json
+backtest/modele_15m/training_data*.csv
+backtest/modele_15m/logs/
 
 # Modele + sidecar : montes en volume au runtime, pas bakes dans l'image.
-aure.json
-aure.thresholds.json
+backtest/modele_15m/btc_reversal_model.json
+backtest/modele_15m/btc_reversal_model.thresholds.json
 
 # Secrets : charges via env_file de compose, pas copies dans l'image.
 .env
