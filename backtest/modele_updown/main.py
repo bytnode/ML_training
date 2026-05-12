@@ -15,10 +15,25 @@ Working-directory contract :
 """
 from __future__ import annotations
 
+import sys
+
+# Force UTF-8 stdout on legacy Windows terminals (cp1252 can't encode box-drawing
+# / arrows). Must happen before rich.Console is instantiated.
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except AttributeError:
+        pass
+
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 from modele_up import api as api_up
 from modele_down import api as api_down
@@ -122,16 +137,122 @@ def main() -> None:
     }
     append_run(stats)
 
-    print(f"=== TEAM modele_updown ===")
-    print(f"window      : {_fmt_ms(start_ms)} -> {_fmt_ms(end_ms)} ({TEAM_TEST_DAYS} days)")
-    print(f"up   solo   : {len(up_bets):>5} bets, WR={up_wr:.4f}")
-    print(f"down solo   : {len(down_bets):>5} bets, WR={down_wr:.4f}")
-    print(f"cancelled   : {cancelled:>5} timestamps where both fired (opposite directions)")
-    print(f"team kept   : {kept_up} up + {kept_down} down = {len(team_bets)} bets, WR={team_wr:.4f}")
-    if not team_bets.empty:
-        print(f"team vs solo: {team_wr - up_wr:+.4f} vs up, {team_wr - down_wr:+.4f} vs down")
-    print(f"written     : {TEAM_BETS_CSV.relative_to(ROOT)}")
-    print(f"logged      : {TEAM_RUNS_CSV.relative_to(ROOT)}")
+    _render_report(stats, team_wr, up_wr, down_wr)
+
+
+def _wr_color(wr: float) -> str:
+    """Map WR to a semantic color band (Rich style string)."""
+    if pd.isna(wr):
+        return "dim"
+    if wr >= 0.60:
+        return "bold bright_green"
+    if wr >= 0.55:
+        return "green"
+    if wr >= 0.50:
+        return "yellow"
+    return "red"
+
+
+def _render_report(stats: dict, team_wr: float, up_wr: float, down_wr: float) -> None:
+    console = Console()
+
+    header = Text.assemble(
+        ("TEAM ", "bold cyan"),
+        ("modele_updown", "bold magenta"),
+        ("  -  backtest report", "dim"),
+    )
+    window = Text.assemble(
+        ("window  ", "dim"),
+        (f"{stats['window_start']}  ->  {stats['window_end']}", "white"),
+        (f"   ({stats['window_days']} days)", "dim"),
+    )
+    console.print(Panel(Text("\n").join([header, window]), border_style="cyan", padding=(0, 2)))
+
+    # --- Solo performance ---
+    solo = Table(
+        title="Solo performance",
+        title_style="bold cyan",
+        border_style="cyan",
+        header_style="bold",
+        show_lines=False,
+        expand=False,
+    )
+    solo.add_column("Model", style="bold")
+    solo.add_column("Bets", justify="right")
+    solo.add_column("Winrate", justify="right")
+    solo.add_column("vs 50%", justify="right", style="dim")
+
+    solo.add_row(
+        Text("▲ modele_up", style="bright_blue"),
+        f"{stats['up_solo_bets']:>5}",
+        Text(f"{up_wr*100:6.2f}%", style=_wr_color(up_wr)),
+        f"{(up_wr-0.5)*100:+5.2f} pp",
+    )
+    solo.add_row(
+        Text("▼ modele_down", style="bright_red"),
+        f"{stats['down_solo_bets']:>5}",
+        Text(f"{down_wr*100:6.2f}%", style=_wr_color(down_wr)),
+        f"{(down_wr-0.5)*100:+5.2f} pp",
+    )
+    console.print(solo)
+
+    # --- Team coherence ---
+    coh = Table(
+        title="Team coherence",
+        title_style="bold cyan",
+        border_style="cyan",
+        header_style="bold",
+        show_lines=False,
+        expand=False,
+    )
+    coh.add_column("Bucket", style="bold")
+    coh.add_column("Count", justify="right")
+    coh.add_column("Note", style="dim")
+
+    cancelled_style = "red" if stats["cancelled"] > 0 else "dim"
+    coh.add_row("Cancelled", Text(f"{stats['cancelled']:>5}", style=cancelled_style),
+                "both models fired -> opposite directions")
+    coh.add_row(Text("Kept UP", style="bright_blue"), f"{stats['team_kept_up']:>5}",
+                "up fired, down abstained")
+    coh.add_row(Text("Kept DOWN", style="bright_red"), f"{stats['team_kept_down']:>5}",
+                "down fired, up abstained")
+    coh.add_row(Text("Total team", style="bold"), Text(f"{stats['team_bets']:>5}", style="bold"),
+                "bets actually taken by the team")
+    console.print(coh)
+
+    # --- Final headline ---
+    delta_up = team_wr - up_wr
+    delta_dn = team_wr - down_wr
+    headline = Text.assemble(
+        ("TEAM WINRATE  ", "bold"),
+        (f"{team_wr*100:.2f}%", f"bold {_wr_color(team_wr)}"),
+        ("   on ", "dim"),
+        (f"{stats['team_bets']}", "bold"),
+        (" bets", "dim"),
+        ("\n", ""),
+        ("vs solo       ", "dim"),
+        (f"{delta_up*100:+.2f} pp", "green" if delta_up >= 0 else "red"),
+        ("  vs up,   ", "dim"),
+        (f"{delta_dn*100:+.2f} pp", "green" if delta_dn >= 0 else "red"),
+        ("  vs down", "dim"),
+    )
+    console.print(Panel(headline, border_style=_wr_color(team_wr), padding=(0, 2)))
+
+    # --- Files written ---
+    console.print(
+        Text.assemble(
+            ("  written  ", "dim"),
+            (f"{TEAM_BETS_CSV.relative_to(ROOT)}", "white"),
+            (f"   ({stats['team_bets']} rows)", "dim"),
+        )
+    )
+    console.print(
+        Text.assemble(
+            ("  logged   ", "dim"),
+            (f"{TEAM_RUNS_CSV.relative_to(ROOT)}", "white"),
+            ("   (+1 line)", "dim"),
+        )
+    )
 
 
 if __name__ == "__main__":

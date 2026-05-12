@@ -1,0 +1,57 @@
+# Keep the Docker build context small. Without this, the modele_*/DB and
+# logs/ folders push the context to ~500 MB.
+
+# Python caches
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Local logs (mounted as a volume at runtime, not baked in)
+logs/
+modele_up/logs/
+modele_down/logs/
+
+# Training data + DB (NOT needed at inference time)
+modele_up/DB/
+modele_down/DB/
+modele_down/db/
+
+# Training-only helper scripts (not used by live.py)
+modele_up/analyse/
+modele_down/analyse/
+
+# Training pipeline modules (live.py only needs config + data + model artifacts)
+modele_up/features.py
+modele_up/predict.py
+modele_up/train.py
+modele_up/api.py
+modele_down/features.py
+modele_down/predict.py
+modele_down/train.py
+modele_down/api.py
+
+# Backtest / team script (not part of live)
+main.py
+
+# Raw CSV / parquet / sqlite anywhere in tree
+*.csv
+*.parquet
+*.db
+
+# Docs / notes
+*.md
+docs/
+
+# Tooling / VCS
+.git/
+.gitignore
+.venv/
+.idea/
+.vscode/
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.*.yml

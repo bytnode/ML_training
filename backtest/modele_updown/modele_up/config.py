@@ -75,8 +75,8 @@ ADAPTIVE_STRATEGY = "asym_wknd_excl_hour_boost"
 # trouve sur TEST_DAYS=365 (V1=1761 paris @ 59.23%):
 #   - weekday : T_wd=0.594 = val_weekday_pool quantile_98.7 (275/21706 = 1.27%)
 #   - weekend : T_we=0.555 = val_weekend_pool quantile_83.3 (1499/8960 = 16.72%)
-ASYM_VOL_FRAC_WEEKDAY = 0.013       # top 1.3% du val weekday non-skip
-ASYM_VOL_FRAC_WEEKEND = 0.167       # top 16.7% du val weekend non-skip
+ASYM_VOL_FRAC_WEEKDAY = 0.018       # top 1.3% du val weekday non-skip
+ASYM_VOL_FRAC_WEEKEND = 0.18       # top 16.7% du val weekend non-skip
 ASYM_SKIP_CELLS = ((2, 0), (2, 1))  # (volatility_state, is_weekend) exclus
 ASYM_USE_FULL_VAL = True            # True = full val, False = derniers 55j
 
