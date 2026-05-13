@@ -30,16 +30,18 @@ COPY live.py ./live.py
 COPY live_helpers/ ./live_helpers/
 
 # --- Model artifacts + minimal package code needed at runtime ---
+# The two sister packages live under 15min/. The directory name starts with a
+# digit (not a valid Python identifier) so consumers add 15min/ to sys.path.
 # modele_up : config + model + sidecar
-COPY modele_up/config.py                       ./modele_up/config.py
-COPY modele_up/btc_updown_model.json           ./modele_up/btc_updown_model.json
-COPY modele_up/btc_updown_model.thresholds.json ./modele_up/btc_updown_model.thresholds.json
+COPY 15min/modele_up/config.py                       ./15min/modele_up/config.py
+COPY 15min/modele_up/btc_updown_model.json           ./15min/modele_up/btc_updown_model.json
+COPY 15min/modele_up/btc_updown_model.thresholds.json ./15min/modele_up/btc_updown_model.thresholds.json
 
 # modele_down : config + data.py (used by features_down via sys.path) + model + sidecar
-COPY modele_down/config.py                      ./modele_down/config.py
-COPY modele_down/data.py                        ./modele_down/data.py
-COPY modele_down/btc_updown_model.json          ./modele_down/btc_updown_model.json
-COPY modele_down/btc_updown_model.thresholds.json ./modele_down/btc_updown_model.thresholds.json
+COPY 15min/modele_down/config.py                      ./15min/modele_down/config.py
+COPY 15min/modele_down/data.py                        ./15min/modele_down/data.py
+COPY 15min/modele_down/btc_updown_model.json          ./15min/modele_down/btc_updown_model.json
+COPY 15min/modele_down/btc_updown_model.thresholds.json ./15min/modele_down/btc_updown_model.thresholds.json
 
 # Logs directory (mounted as a host volume in docker-compose.yml)
 RUN mkdir -p /app/logs

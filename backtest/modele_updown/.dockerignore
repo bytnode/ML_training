@@ -9,27 +9,27 @@ __pycache__/
 
 # Local logs (mounted as a volume at runtime, not baked in)
 logs/
-modele_up/logs/
-modele_down/logs/
+15min/modele_up/logs/
+15min/modele_down/logs/
 
 # Training data + DB (NOT needed at inference time)
-modele_up/DB/
-modele_down/DB/
-modele_down/db/
+15min/modele_up/DB/
+15min/modele_down/DB/
+15min/modele_down/db/
 
 # Training-only helper scripts (not used by live.py)
-modele_up/analyse/
-modele_down/analyse/
+15min/modele_up/analyse/
+15min/modele_down/analyse/
 
 # Training pipeline modules (live.py only needs config + data + model artifacts)
-modele_up/features.py
-modele_up/predict.py
-modele_up/train.py
-modele_up/api.py
-modele_down/features.py
-modele_down/predict.py
-modele_down/train.py
-modele_down/api.py
+15min/modele_up/features.py
+15min/modele_up/predict.py
+15min/modele_up/train.py
+15min/modele_up/api.py
+15min/modele_down/features.py
+15min/modele_down/predict.py
+15min/modele_down/train.py
+15min/modele_down/api.py
 
 # Backtest / team script (not part of live)
 main.py
@@ -55,3 +55,8 @@ Dockerfile
 .dockerignore
 docker-compose.yml
 docker-compose.*.yml
+
+# Secrets - never bake into image (compose reads .env at runtime via env_file)
+.env
+.env.*
+!.env.example

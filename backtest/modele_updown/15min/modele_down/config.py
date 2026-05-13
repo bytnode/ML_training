@@ -71,8 +71,8 @@ ADAPTIVE_STRATEGY = "asym_wknd_excl_hour_boost"
 # Parametres asym (V1 + V2 partagent le meme bloc) :
 # Fraction de val non-skip a garder par axe. Valeurs initiales heritees du
 # modele_up. A retuner par audit cross-window si besoin pour DOWN.
-ASYM_VOL_FRAC_WEEKDAY = 0.025       # top 1.3% du val weekday non-skip
-ASYM_VOL_FRAC_WEEKEND = 0.12       # top 16.7% du val weekend non-skip
+ASYM_VOL_FRAC_WEEKDAY = 0.025      # top 1.3% du val weekday non-skip
+ASYM_VOL_FRAC_WEEKEND = 0.1       # top 16.7% du val weekend non-skip
 ASYM_SKIP_CELLS = ((2, 0), (2, 1))  # (volatility_state, is_weekend) exclus
 ASYM_USE_FULL_VAL = True            # True = full val, False = derniers 55j
 

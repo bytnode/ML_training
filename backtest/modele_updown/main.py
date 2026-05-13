@@ -35,6 +35,13 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+# 15min/ contains modele_up and modele_down. The directory name starts with a
+# digit so we can't write `from 15min.modele_up import ...` directly -- inject
+# 15min/ into sys.path and import the packages as top-level instead.
+_15MIN_DIR = str(Path(__file__).resolve().parent / "15min")
+if _15MIN_DIR not in sys.path:
+    sys.path.insert(0, _15MIN_DIR)
+
 from modele_up import api as api_up
 from modele_down import api as api_down
 

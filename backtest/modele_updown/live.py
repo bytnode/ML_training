@@ -42,15 +42,16 @@ from rich.text import Text
 from live_helpers import fetch
 from live_helpers import features_up as feat_up_mod
 from live_helpers import features_down as feat_dn_mod
+from live_helpers import notify
 
 ROOT = Path(__file__).resolve().parent
 LOGS_DIR = ROOT / "logs"
 LIVE_CSV = LOGS_DIR / "live_predictions.csv"
 
-UP_MODEL_PATH = ROOT / "modele_up" / "btc_updown_model.json"
-UP_SIDECAR    = ROOT / "modele_up" / "btc_updown_model.thresholds.json"
-DN_MODEL_PATH = ROOT / "modele_down" / "btc_updown_model.json"
-DN_SIDECAR    = ROOT / "modele_down" / "btc_updown_model.thresholds.json"
+UP_MODEL_PATH = ROOT / "15min" / "modele_up" / "btc_updown_model.json"
+UP_SIDECAR    = ROOT / "15min" / "modele_up" / "btc_updown_model.thresholds.json"
+DN_MODEL_PATH = ROOT / "15min" / "modele_down" / "btc_updown_model.json"
+DN_SIDECAR    = ROOT / "15min" / "modele_down" / "btc_updown_model.thresholds.json"
 
 PAIR = "btcusd"
 WARMUP_15M = 3200   # >= 2880 (volume_rel_30d) + margin
@@ -315,6 +316,7 @@ def main():
     model_dn = _load_model(DN_MODEL_PATH)
     sidecar_dn = _load_sidecar(DN_SIDECAR)
     console.print("[dim]Models + sidecars loaded.[/dim]")
+    notify.send_startup()
 
     pending: dict | None = None
     stats = {"cycles": 0, "bets": 0, "correct": 0, "pass": 0, "cancel": 0}
@@ -411,7 +413,27 @@ def main():
             cycle_n = stats["cycles"] + 1
             render_cycle(cycle_n, just_closed_open, resolution, prediction, stats)
 
-            # === 6. Save pending for next cycle ===
+            # === 6. Telegram notif (only when a real bet was just resolved) ===
+            if resolution is not None and pending is not None and pending["team"] in ("UP", "DOWN"):
+                bet_conf = pending["p_up"] if pending["team"] == "UP" else pending["p_dn"]
+                target_ms = pending["target_open"]
+                close_ms = target_ms + INTERVAL_15M_MS
+                notify.send_resolution(
+                    cycle_n=stats["cycles"],  # # of the cycle that just RESOLVED
+                    bar_close_ts_iso=pd.Timestamp(close_ms, unit="ms", tz="UTC")
+                                       .strftime("%Y-%m-%d %H:%M UTC"),
+                    direction=pending["team"],
+                    confidence=bet_conf,
+                    window_open_iso=pd.Timestamp(target_ms, unit="ms", tz="UTC").strftime("%H:%M"),
+                    window_close_iso=pd.Timestamp(close_ms,   unit="ms", tz="UTC").strftime("%H:%M UTC"),
+                    open_price=resolution["open"],
+                    close_price=resolution["close"],
+                    correct=bool(resolution["correct"]),
+                    running_bets=stats["bets"],
+                    running_wr=(stats["correct"] / stats["bets"]) if stats["bets"] else None,
+                )
+
+            # === 7. Save pending for next cycle ===
             pending = {"target_open": next_boundary_ms, "team": team,
                        "p_up": p_up, "p_dn": p_dn}
 
