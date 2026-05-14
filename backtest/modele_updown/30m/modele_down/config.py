@@ -4,14 +4,14 @@
 
 # --- Source de données ---
 SYMBOL = "btcusd"
-INTERVAL = "15m"
+INTERVAL = "30m"
 DAYS_BACK = 5000
-DB_PATH = "db/btc_multi_tf_15m.parquet"  # CSV 15m lu par features.py + train.py
+DB_PATH = "db/btc_multi_tf_30m.parquet"
 
 # --- Higher timeframes ajoutés à chaque ligne du dataset (no-lookahead via
 # last_closed_index : OHLCV de la dernière bougie closed avant le timestamp
-# de décision T = times[i] + 15m).
-MTF_INTERVALS = ["30m", "1h", "4h", "1d"]
+# de décision T = times[i] + 30m).
+MTF_INTERVALS = ["1h", "4h", "1d"]
 
 INTERVAL_MS = {
     "15m": 15 * 60 * 1000,

@@ -2,12 +2,12 @@
 data.py — pipeline complet pour modele_updown.
 
 Un seul fichier qui :
-  1. Fetch OHLCV BTC/USD depuis Bitstamp sur 6 timeframes (5m, 15m, 30m, 1h, 4h, 1d)
+  1. Fetch OHLCV BTC/USD depuis Bitstamp sur 5 timeframes (15m, 30m, 1h, 4h, 1d)
   2. Calcule les 9 features normalisées par TF + persiste close & volume bruts
-  3. Construit le master 15m (.parquet) avec UNIQUEMENT des features normalisées :
-       - 9  features de base 15m
-       - 9  features 5m (lookup no-lookahead, 5m close-aligned uniquement)
-       - 25 features MTF (30m/1h/4h/1d, déjà filtrées : on n'écrit que les colonnes
+  3. Construit le master 30m (.parquet) avec UNIQUEMENT des features normalisées :
+       - 9  features de base 30m
+       - 9  features 15m (lookup no-lookahead, 15m close-aligned uniquement)
+       - 18 features MTF (1h/4h/1d, déjà filtrées : on n'écrit que les colonnes
             qui survivent au drop — pas de calcul inutile)
        -  7 features Tier 1 dérivées : dist_ema_20, return_3, return_96,
             hour_sin, hour_cos, upper_wick, lower_wick
@@ -17,7 +17,7 @@ Un seul fichier qui :
   Les valeurs BRUTES close/volume sont persistées dans la SQLite (table candles)
   mais ne sont JAMAIS écrites dans les sorties (parquet ou CSV). Phase 4 les
   charge depuis SQLite, les utilise pour calculer MACD/BB/MFI, puis les drop
-  avant l'écriture du master 15m.
+  avant l'écriture du master 30m.
 
 Ce fichier remplace l'ancienne chaîne :
   data.py + fetch_and_add_5m.py + add_tier1_features.py + drop_redundant_features.py
@@ -25,9 +25,9 @@ Ce fichier remplace l'ancienne chaîne :
 Les anciens scripts sont laissés sur disque mais ne sont plus utiles.
 
 Usage :
-    cd backtest/modele_updown/modele_down
-    python data.py                 # ~3-5 min : 6 TFs en parallèle + agrégation
-    python train.py                # entraîne sur le master CSV produit
+    cd backtest/modele_updown/30m/modele_down
+    python data.py                 # ~3-5 min : 5 TFs en parallèle + agrégation
+    python train.py                # entraîne sur le master parquet produit
 
 Schéma SQLite (table `candles`) :
     timeframe         TEXT
@@ -79,7 +79,6 @@ DEFAULT_DB_PATH = "DB/btc_multi_tf.db"
 
 # (step_ms, step_sec)
 TIMEFRAMES: dict[str, tuple[int, int]] = {
-    "5m":  ( 5 * 60 * 1000,           5 * 60),
     "15m": (15 * 60 * 1000,          15 * 60),
     "30m": (30 * 60 * 1000,          30 * 60),
     "1h":  (60 * 60 * 1000,          60 * 60),
@@ -113,8 +112,8 @@ MFI_PERIOD    = 14
 RV_SHORT_WINDOW = 20
 RV_LONG_WINDOW  = 100
 
-INTERVAL_5M_MS  = 5  * 60 * 1000
 INTERVAL_15M_MS = 15 * 60 * 1000
+INTERVAL_30M_MS = 30 * 60 * 1000
 
 DB_WRITE_LOCK = threading.Lock()
 
@@ -132,13 +131,10 @@ DB_WRITE_LOCK = threading.Lock()
 #
 # Pour chaque MTF on liste explicitement les colonnes À CALCULER (post-drop).
 MTF_KEPT_COLS: dict[str, list[str]] = {
-    # 5m : 9 features (body_signed exclu, atr_pct gardé)
-    "5m":  ["open_ret", "high_ret", "low_ret", "close_ret",
+    # 15m : 9 features (contexte fin, full set — analogue au rôle du 5m côté 15min)
+    "15m": ["open_ret", "high_ret", "low_ret", "close_ret",
             "volume_ratio", "body_ratio_close", "body_ratio_avg",
             "obv_pressure", "atr_pct"],
-    # 30m : 7 (body_signed PURE, atr_pct STRONG, obv_pressure WEAK)
-    "30m": ["open_ret", "high_ret", "low_ret", "close_ret",
-            "volume_ratio", "body_ratio_close", "body_ratio_avg"],
     # 1h : 5 (body_signed PURE, atr_pct STRONG, obv_pressure/high_ret/body_ratio_avg WEAK)
     "1h":  ["open_ret", "low_ret", "close_ret",
             "volume_ratio", "body_ratio_close"],
@@ -391,10 +387,10 @@ def compute_normalized_features(df: pd.DataFrame) -> pd.DataFrame:
 def process_timeframe_to_candles(db_path: Path, timeframe: str) -> int:
     """Lit candles_raw du TF, calcule features, INSERT dans candles.
 
-    Cas spécial 5m : on calcule les features sur la série COMPLÈTE (les rolling
+    Cas spécial 15m : on calcule les features sur la série COMPLÈTE (les rolling
     SMA20/EWMA14/etc. ont besoin de toutes les bougies contiguës), puis on FILTRE
-    pour ne garder que la 5m close-aligned avec chaque 15m (open_time = T + 10min).
-    On passe ainsi de ~1.4M rows à ~470k rows en DB & CSV, sans dégrader les
+    pour ne garder que la 15m close-aligned avec chaque 30m (open_time = T + 15min).
+    On passe ainsi de ~2x rows à ~1x rows en DB & CSV, sans dégrader les
     features (qui ont vu la série complète au moment du calcul).
     """
     conn = sqlite3.connect(db_path)
@@ -412,15 +408,15 @@ def process_timeframe_to_candles(db_path: Path, timeframe: str) -> int:
 
     feat = compute_normalized_features(df)
 
-    if timeframe == "5m":
-        # Garde les 5m dont open_time tombe à T + 10min pour un T multiple de 15min.
-        # Ce sont exactement les 5m qui ferment à T + 15min = close du 15m.
-        offset_ms = feat["timestamp_ms"].to_numpy(dtype=np.int64) % INTERVAL_15M_MS
-        keep_mask = offset_ms == (10 * 60 * 1000)
+    if timeframe == "15m":
+        # Garde les 15m dont open_time tombe à T + 15min pour un T multiple de 30min.
+        # Ce sont exactement les 15m qui ferment à T + 30min = close du 30m.
+        offset_ms = feat["timestamp_ms"].to_numpy(dtype=np.int64) % INTERVAL_30M_MS
+        keep_mask = offset_ms == (15 * 60 * 1000)
         n_before = len(feat)
         feat = feat.loc[keep_mask].reset_index(drop=True)
-        print(f"    [5m] filtre close-align : {n_before:,} -> {len(feat):,} rows "
-              f"(garde 1/3, les autres ne sont pas utilisées par le 15m)")
+        print(f"    [15m] filtre close-align : {n_before:,} -> {len(feat):,} rows "
+              f"(garde 1/2, les autres ne sont pas utilisées par le 30m)")
 
     def _f(v):
         return None if pd.isna(v) else float(v)
@@ -500,7 +496,7 @@ def export_timeframe_csv(db_path: Path, timeframe: str, csv_path: Path) -> int:
 
 
 # ============================================================================
-# Phase 4 — Master 15m feature DataFrame (Tier 0 + 5m + MTF + Tier 1 + Tier 2)
+# Phase 4 — Master 30m feature DataFrame (Tier 0 + 15m + MTF + Tier 1 + Tier 2)
 # ============================================================================
 
 def _load_tf(db_path: Path, timeframe: str) -> pd.DataFrame:
@@ -522,25 +518,25 @@ def _load_tf(db_path: Path, timeframe: str) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def _add_lookup_features(df_15m: pd.DataFrame, df_other: pd.DataFrame,
+def _add_lookup_features(df_30m: pd.DataFrame, df_other: pd.DataFrame,
                          tf_label: str, tf_step_ms: int,
                          kept_cols: list[str]) -> int:
     """
-    Pour chaque row 15m, ajoute les colonnes `kept_cols` du TF supérieur
-    (ou inférieur 5m), suffixées par tf_label. Lookup no-lookahead :
-    on prend la dernière bougie `df_other` *fermée* à T = open_15m + 15m.
+    Pour chaque row 30m, ajoute les colonnes `kept_cols` du TF supérieur
+    (ou inférieur 15m), suffixées par tf_label. Lookup no-lookahead :
+    on prend la dernière bougie `df_other` *fermée* à T = open_30m + 30m.
 
-    Pour 5m : T - 5m est l'open de la dernière 5m fermée à T.
-    Pour 30m+ : T - tf_step est l'open de la dernière bougie supérieure fermée à T.
+    Pour 15m : T - 15m est l'open de la dernière 15m fermée à T.
+    Pour 1h+ : T - tf_step est l'open de la dernière bougie supérieure fermée à T.
     """
-    times_15m = df_15m["timestamp_ms"].to_numpy(dtype=np.int64)
+    times_30m = df_30m["timestamp_ms"].to_numpy(dtype=np.int64)
     times_oth = df_other["timestamp_ms"].to_numpy(dtype=np.int64)
-    decision_times = times_15m + INTERVAL_15M_MS
+    decision_times = times_30m + INTERVAL_30M_MS
     target = decision_times - tf_step_ms
     indices = np.searchsorted(times_oth, target, side="right") - 1
     valid = indices >= 0
 
-    n = len(df_15m)
+    n = len(df_30m)
     n_added = 0
     for col in kept_cols:
         new_col = f"{col}_{tf_label}"
@@ -548,7 +544,7 @@ def _add_lookup_features(df_15m: pd.DataFrame, df_other: pd.DataFrame,
         if valid.any():
             src = df_other[col].to_numpy(dtype=float)
             values[valid] = src[indices[valid]]
-        df_15m[new_col] = values
+        df_30m[new_col] = values
         n_added += 1
     return n_added
 
@@ -697,107 +693,81 @@ def _add_tier2(df: pd.DataFrame) -> int:
     return n_added
 
 
-def build_master_15m(db_path: Path, out_path: Path) -> tuple[int, int]:
-    """
-    Construit le DataFrame final 15m (Tier 0 + 5m + MTF + Tier 1 + Tier 2)
-    et l'écrit selon l'extension de out_path :
-      - .parquet -> df.to_parquet (recommandé, ~5-10x plus petit + lecture plus rapide)
-      - .csv     -> df.to_csv     (texte, plus gros mais lisible)
-    Renvoie (n_rows, n_cols).
-    """
-    print("\n--- Phase 4/5 : construction du master 15m DataFrame ---")
+def build_master_30m(db_path: Path, out_path: Path) -> tuple[int, int]:
+    """Construit le DataFrame final 30m (Tier 0 + 15m + MTF + Tier 1 + Tier 2)."""
+    print("\n--- Phase 4/5 : construction du master 30m DataFrame ---")
     t0 = time.time()
 
-    # 4.1 — base 15m
+    # 4.1 — base 30m
+    df_30m = _load_tf(db_path, "30m")
+    print(f"  [base 30m] {len(df_30m):,} rows × {len(df_30m.columns)} cols (avec close+volume)")
+
+    # 4.2 — 15m lookups (no-lookahead, fine context)
     df_15m = _load_tf(db_path, "15m")
-    print(f"  [base 15m] {len(df_15m):,} rows × {len(df_15m.columns)} cols (avec close+volume)")
-
-    # 4.2 — 5m lookups (no-lookahead)
-    df_5m = _load_tf(db_path, "5m")
-    if not df_5m.empty:
-        n_5m = _add_lookup_features(df_15m, df_5m, "5m",
-                                    INTERVAL_5M_MS, MTF_KEPT_COLS["5m"])
-        print(f"  [5m lookup] +{n_5m} cols")
+    if not df_15m.empty:
+        n_15m = _add_lookup_features(df_30m, df_15m, "15m",
+                                     INTERVAL_15M_MS, MTF_KEPT_COLS["15m"])
+        print(f"  [15m lookup] +{n_15m} cols")
     else:
-        print(f"  [5m lookup] skip (table 5m vide)")
+        print(f"  [15m lookup] skip (table 15m vide)")
 
-    # 4.3 — MTF lookups (30m, 1h, 4h, 1d) — colonnes filtrées post-drop
-    for tf in ["30m", "1h", "4h", "1d"]:
+    # 4.3 — MTF lookups (1h, 4h, 1d)
+    for tf in ["1h", "4h", "1d"]:
         df_oth = _load_tf(db_path, tf)
         if df_oth.empty:
             print(f"  [{tf} lookup] skip (table vide)")
             continue
         step_ms, _ = TIMEFRAMES[tf]
-        n = _add_lookup_features(df_15m, df_oth, tf, step_ms, MTF_KEPT_COLS[tf])
+        n = _add_lookup_features(df_30m, df_oth, tf, step_ms, MTF_KEPT_COLS[tf])
         print(f"  [{tf} lookup] +{n} cols (post-drop)")
 
     # 4.4 — Tier 1 derived (7 cols)
-    n_t1 = _add_tier1_derived(df_15m)
+    n_t1 = _add_tier1_derived(df_30m)
     print(f"  [Tier 1 derived] +{n_t1} cols (dist_ema_20, return_3/96, hour_sin/cos, wicks)")
 
-    # 4.5 — Tier 2 (9 cols : MACD ×3, BB ×2, MFI ×1, rv ×3)
-    n_t2 = _add_tier2(df_15m)
+    # 4.5 — Tier 2 (9 cols)
+    n_t2 = _add_tier2(df_30m)
     print(f"  [Tier 2] +{n_t2} cols (MACD ×3, BB ×2, MFI ×1, rv ×3)")
 
-    # 4.6 — Precalcule des colonnes derivees (label, volatility_state, is_weekend).
-    # Avant : features.py les calculait au load-time, ce qui le forcait a relire
-    # atr_pct et open_ret depuis la SQLite. Maintenant on les ecrit directement
-    # dans le parquet -> features.py n'a plus besoin de la SQLite du tout.
+    # 4.6 — derived columns
+    ts_dt = pd.to_datetime(df_30m["timestamp_ms"], unit="ms", utc=True)
+    df_30m["is_weekend"] = (ts_dt.dt.dayofweek >= 5).astype(int)
 
-    # is_weekend (UTC, samedi/dimanche)
-    ts_dt = pd.to_datetime(df_15m["timestamp_ms"], unit="ms", utc=True)
-    df_15m["is_weekend"] = (ts_dt.dt.dayofweek >= 5).astype(int)
-
-    # volatility_state : ratio atr_pct / SMA(atr_pct, ATR_LONG_PERIOD)
-    #   0 = low (< VOLATILITY_LOW), 1 = mid (default), 2 = high (> VOLATILITY_HIGH)
-    atr_long = df_15m["atr_pct"].rolling(window=ATR_LONG_PERIOD, min_periods=20).mean()
-    atr_ratio = df_15m["atr_pct"] / atr_long
+    atr_long = df_30m["atr_pct"].rolling(window=ATR_LONG_PERIOD, min_periods=20).mean()
+    atr_ratio = df_30m["atr_pct"] / atr_long
     vol_state = np.where(atr_ratio > VOLATILITY_HIGH, 2,
                 np.where(atr_ratio < VOLATILITY_LOW, 0, 1))
     vol_state = np.where(np.isnan(atr_ratio.to_numpy()), 1, vol_state)
-    df_15m["volatility_state"] = vol_state.astype(int)
+    df_30m["volatility_state"] = vol_state.astype(int)
 
-    # label : 1 si bougie i+1 ROUGE (close[i+1] < open[i+1])
-    # NaN pour : flat current, flat next, derniere row (pas de "next"),
-    # ou current/next NaN (warmup). features.py drop les NaN avant le training.
-    cr = df_15m["close_ret"].to_numpy()
-    or_ = df_15m["open_ret"].to_numpy()
+    cr = df_30m["close_ret"].to_numpy()
+    or_ = df_30m["open_ret"].to_numpy()
     cr_next = np.concatenate([cr[1:], [np.nan]])
     or_next = np.concatenate([or_[1:], [np.nan]])
-    invalid = (
-        (cr == or_) | (cr_next == or_next)        # flat current ou next
-        | np.isnan(cr) | np.isnan(or_)
-        | np.isnan(cr_next) | np.isnan(or_next)
-    )
+    invalid = ((cr == or_) | (cr_next == or_next)
+               | np.isnan(cr) | np.isnan(or_)
+               | np.isnan(cr_next) | np.isnan(or_next))
     label = np.where(invalid, np.nan, (cr_next < or_next).astype(float))
-    df_15m["label"] = label
+    df_30m["label"] = label
     n_valid_label = int(np.sum(~np.isnan(label)))
     print(f"  [derived] +3 cols : is_weekend, volatility_state, label "
-          f"({n_valid_label:,} labels valides / {len(df_15m):,})")
+          f"({n_valid_label:,} labels valides / {len(df_30m):,})")
 
-    # 4.7 — Drop des colonnes inutiles APRES le precalcul.
-    # - close/volume : valeurs brutes USD, fuite d'echelle pour XGBoost.
-    # - atr_pct, open_ret : ont servi au precalcul ci-dessus, plus utiles ensuite.
-    # Toutes restent disponibles dans candles (SQLite) pour diagnostics.
-    df_15m = df_15m.drop(columns=["close", "volume", "atr_pct", "open_ret"])
+    df_30m = df_30m.drop(columns=["close", "volume", "atr_pct", "open_ret"])
 
-    # 4.7 — Export selon l'extension
     suffix = out_path.suffix.lower()
     if suffix == ".parquet":
-        df_15m.to_parquet(out_path, index=False)
+        df_30m.to_parquet(out_path, index=False)
     elif suffix == ".csv":
-        df_15m.to_csv(out_path, index=False)
+        df_30m.to_csv(out_path, index=False)
     else:
-        raise ValueError(
-            f"Extension non supportée pour {out_path} : '{suffix}'. "
-            f"Attendu : .parquet ou .csv."
-        )
+        raise ValueError(f"Extension non supportée pour {out_path} : '{suffix}'.")
     elapsed = time.time() - t0
     size_mb = out_path.stat().st_size / (1024 * 1024)
-    print(f"  -> {out_path.name} : {len(df_15m):,} rows x {len(df_15m.columns)} cols, "
+    print(f"  -> {out_path.name} : {len(df_30m):,} rows x {len(df_30m.columns)} cols, "
           f"{size_mb:.1f} MB ({elapsed:.1f}s)")
 
-    return len(df_15m), len(df_15m.columns)
+    return len(df_30m), len(df_30m.columns)
 
 
 # ============================================================================
@@ -807,7 +777,7 @@ def build_master_15m(db_path: Path, out_path: Path) -> tuple[int, int]:
 def run(pair: str, days_back: int, db_path: Path) -> None:
     pair_norm = pair.lower()
 
-    print(f"=== modele_updown — pipeline data.py (Tier 0 + Tier 1 + Tier 2) ===")
+    print(f"=== modele_updown 30m — pipeline data.py (Tier 0 + Tier 1 + Tier 2) ===")
     print(f"Pair        : {pair_norm}")
     print(f"Période     : {days_back} jours en arrière")
     print(f"Timeframes  : {', '.join(TIMEFRAMES.keys())}  ({WORKERS_PER_TF} workers/TF)")
@@ -851,12 +821,12 @@ def run(pair: str, days_back: int, db_path: Path) -> None:
     elapsed_csv = time.time() - t2
     print(f"Export per-TF terminé en {elapsed_csv:.1f}s")
 
-    # ---- Phase 4 — master 15m parquet (= dataset d'entrée de train.py) ----
+    # ---- Phase 4 — master 30m parquet (= dataset d'entrée de train.py) ----
     # Parquet : ~5-10x plus petit que CSV + lecture plus rapide. features.py
     # auto-détecte l'extension via Path.suffix, donc DB_PATH dans config.py
     # peut pointer indifféremment sur .parquet ou .csv.
-    master_path = csv_dir / f"{db_stem}_15m.parquet"
-    n_rows, n_cols = build_master_15m(db_path, master_path)
+    master_path = csv_dir / f"{db_stem}_30m.parquet"
+    n_rows, n_cols = build_master_30m(db_path, master_path)
 
     # ---- Phase 5 — récap ----
     print(f"\n--- Phase 5/5 : récap ---")
@@ -864,8 +834,8 @@ def run(pair: str, days_back: int, db_path: Path) -> None:
     total_elapsed = elapsed_fetch + elapsed_feat + elapsed_csv
     print(f"Bougies brutes téléchargées : {sum(totals.values()):,}")
     print(f"DB                          : {db_path.resolve()} ({db_size_mb:.1f} MB)")
-    print(f"Master 15m (parquet)        : {master_path.resolve()}")
-    print(f"  {n_rows:,} rows x {n_cols} cols (= 2 metadata + 9 base + 9 5m + 25 MTF "
+    print(f"Master 30m (parquet)        : {master_path.resolve()}")
+    print(f"  {n_rows:,} rows x {n_cols} cols (= 2 metadata + 9 base + 9 15m + 18 MTF "
           f"+ 7 Tier1 + 9 Tier2 ; close/volume bruts gardes en SQLite uniquement)")
 
     conn = sqlite3.connect(db_path)
@@ -875,8 +845,8 @@ def run(pair: str, days_back: int, db_path: Path) -> None:
                MIN(timestamp) AS first_ts, MAX(timestamp) AS last_ts
         FROM candles GROUP BY timeframe
         ORDER BY CASE timeframe
-            WHEN '5m'  THEN 1 WHEN '15m' THEN 2 WHEN '30m' THEN 3
-            WHEN '1h'  THEN 4 WHEN '4h'  THEN 5 WHEN '1d'  THEN 6 END
+            WHEN '15m' THEN 1 WHEN '30m' THEN 2
+            WHEN '1h'  THEN 3 WHEN '4h'  THEN 4 WHEN '1d'  THEN 5 END
         """,
         conn,
     )
@@ -894,7 +864,7 @@ def run(pair: str, days_back: int, db_path: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="modele_updown — fetch + features (Tier 0 + 1 + 2) en un seul script."
+        description="modele_updown 30m — fetch + features (Tier 0 + 1 + 2) en un seul script."
     )
     p.add_argument("--pair", default=DEFAULT_PAIR,
                    help=f"Code paire Bitstamp en minuscules (défaut : {DEFAULT_PAIR}).")
