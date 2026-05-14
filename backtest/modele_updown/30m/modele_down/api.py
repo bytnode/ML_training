@@ -29,7 +29,7 @@ import xgboost as xgb
 NAME = "modele_updown"
 
 _MODEL_DIR = Path(__file__).resolve().parent
-_PARQUET_PATH = _MODEL_DIR / "DB" / "btc_multi_tf_15m.parquet"
+_PARQUET_PATH = _MODEL_DIR / "DB" / "btc_multi_tf_30m.parquet"
 _MODEL_PATH   = _MODEL_DIR / "btc_updown_model.json"
 _SIDECAR_JSON = _MODEL_DIR / "btc_updown_model.thresholds.json"
 
@@ -78,7 +78,7 @@ def _load_parquet() -> pd.DataFrame:
 
 def _hour_from_ts_ms(ts_ms) -> int:
     ts_ms = int(ts_ms)
-    return int(((ts_ms // (15 * 60 * 1000)) % 96) // 4)
+    return int(((ts_ms // (30 * 60 * 1000)) % 48) // 2)
 
 
 def _bucket_threshold(volatility_state: int, is_weekend: int, sidecar: dict,
