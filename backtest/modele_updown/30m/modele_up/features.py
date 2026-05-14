@@ -32,6 +32,14 @@ from config import WARMUP
 # automatiquement utilise comme feature par train.py.
 NON_FEATURE_COLS = {"timestamp_ms", "timestamp", "close", "volume"}
 
+# Features droppees apres analyse d'ablation (logs/feature_analysis.md, 2026-05-14).
+# Chaque entree a un dEV negatif clair (hors noise floor ~5 EV) :
+#   - close_ret    : dEV = -9.00, redondant avec close_ret_15m / high_ret / low_ret
+#   - macd_signal  : dEV = -7.50, r = 0.955 avec macd (quasi-doublon)
+# Le parquet n'est PAS regenere : les colonnes restent sur disque mais sont
+# masquees ici pour ne pas etre vues par train.py / analyze_features.py.
+DROPPED_FEATURES = {"close_ret", "macd_signal"}
+
 
 def build_training_dataframe(csv_path, verbose: bool = True) -> pd.DataFrame:
     """
@@ -98,6 +106,14 @@ def build_training_dataframe(csv_path, verbose: bool = True) -> pd.DataFrame:
     if "timestamp" in df.columns:
         df = df.drop(columns=["timestamp"])
     df = df.rename(columns={"timestamp_ms": "timestamp"})
+
+    # Drop les features ecartees par l'analyse d'ablation. On ne raise pas si
+    # une colonne est deja absente (parquet plus vieux / regenere autrement).
+    to_drop = [c for c in DROPPED_FEATURES if c in df.columns]
+    if to_drop:
+        df = df.drop(columns=to_drop)
+        if verbose:
+            print(f"  Dropped post-ablation features : {to_drop}")
 
     if verbose:
         print(f"\nWARMUP={WARMUP} : {n_total:,} -> {n_after_warmup:,} rows")

@@ -37,11 +37,15 @@ Cout :
   stopping, compter 4-7 minutes. Multi-seed multiplie le cout.
 
 Usage :
-    cd backtest/modele_updown/modele_up
-    python analyze_features.py                       # toutes les features
-    python analyze_features.py macd bb_position      # subset
-    python analyze_features.py --multi-seed 3        # moyenne sur 3 seeds
-    python analyze_features.py --no-ablation         # rapide (pas de retrain)
+    cd backtest/modele_updown/30m/modele_up
+    python analyse/analyze_features.py                       # toutes les features
+    python analyse/analyze_features.py macd bb_position      # subset
+    python analyse/analyze_features.py --multi-seed 3        # moyenne sur 3 seeds
+    python analyse/analyze_features.py --no-ablation         # rapide (pas de retrain)
+
+La calibration adaptative utilisee pour l'ablation suit `config.ADAPTIVE_STRATEGY`
+(V1 = `asym_wknd_excl` ou V2 = `asym_wknd_excl_hour_boost`) afin que les delta_EV
+mesures refletent la decision de production.
 """
 
 from __future__ import annotations
@@ -52,6 +56,13 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# Le fichier vit dans `modele_up/analyse/` mais importe `config`, `features`,
+# `train` depuis `modele_up/`. On ajoute le parent au sys.path pour que
+# `python analyse/analyze_features.py` fonctionne depuis `modele_up/`.
+_PKG_ROOT = Path(__file__).resolve().parent.parent
+if str(_PKG_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PKG_ROOT))
+
 import numpy as np
 import pandas as pd
 from sklearn.metrics import log_loss, mutual_info_score
@@ -59,6 +70,7 @@ from xgboost import XGBClassifier
 
 from config import (
     DB_PATH, TRAIN_DAYS, TEST_DAYS, VAL_FRACTION, XGB_RANDOM_STATE,
+    ADAPTIVE_STRATEGY,
 )
 from features import build_training_dataframe
 from train import (
@@ -66,15 +78,29 @@ from train import (
     _resolve_scale_pos_weight,
     compute_thresholds_asym_wknd_excl,
     apply_thresholds_asym_wknd_excl,
+    apply_thresholds_asym_hour_boost,
 )
 
 
 ROOT = Path(__file__).resolve().parent
-LOGS_DIR = ROOT / "logs"
+# Rapport ecrit dans `modele_up/logs/` (= meme dossier que runs.csv et
+# test_predictions.csv), pas dans `analyse/logs/`.
+LOGS_DIR = _PKG_ROOT / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 REPORT_PATH = LOGS_DIR / "feature_analysis.md"
 
 EXCLUDED = {"timestamp", "label", "volatility_state", "is_weekend"}
+
+
+def _apply_decision(test_df, p_test, thresholds_per_wknd):
+    """Dispatch sur ADAPTIVE_STRATEGY pour mirroir `train.train_and_evaluate`."""
+    if ADAPTIVE_STRATEGY == "asym_wknd_excl_hour_boost":
+        return apply_thresholds_asym_hour_boost(test_df, p_test, thresholds_per_wknd)
+    if ADAPTIVE_STRATEGY == "asym_wknd_excl":
+        return apply_thresholds_asym_wknd_excl(test_df, p_test, thresholds_per_wknd)
+    raise ValueError(
+        f"ADAPTIVE_STRATEGY={ADAPTIVE_STRATEGY!r} non supporte par analyze_features."
+    )
 
 
 # ============================================================================
@@ -179,7 +205,7 @@ def _train_and_measure(df, feature_cols, seed):
     test_ll = float(log_loss(y_test, p_test))
 
     thresholds_per_wknd, _ = compute_thresholds_asym_wknd_excl(val, p_val)
-    take = apply_thresholds_asym_wknd_excl(test, p_test, thresholds_per_wknd)
+    take = _apply_decision(test, p_test, thresholds_per_wknd)
     n_taken = int(take.sum())
     wr = float(y_test.to_numpy()[take].mean()) if n_taken > 0 else 0.0
     ev = n_taken * (wr - 0.5)
@@ -380,10 +406,11 @@ def _write_markdown(metrics_list, baseline, args, n_features_total, t_total):
         key=lambda x: -(abs(x.delta_ev) if not np.isnan(x.delta_ev) else -1),
     )
     lines = []
-    lines.append(f"# Feature analysis - modele_up\n")
+    lines.append(f"# Feature analysis - modele_up (30m)\n")
     lines.append(f"**Date :** {pd.Timestamp.utcnow().isoformat(timespec='seconds')}  ")
     lines.append(f"**Multi-seed :** {args.multi_seed}  ")
     lines.append(f"**Ablation :** {'enabled' if not args.no_ablation else 'disabled'}  ")
+    lines.append(f"**Calibration :** `{ADAPTIVE_STRATEGY}`  ")
     lines.append(f"**Duration :** {t_total:.1f}s  ")
     lines.append(f"**Features evaluated :** {len(metrics_list)} / {n_features_total}\n")
 
@@ -496,7 +523,8 @@ def main() -> int:
 
     print(f"\nMode : {'ABLATION FULL' if not args.no_ablation else 'PERMUTATION ONLY'} "
           f"({args.multi_seed} seed{'s' if args.multi_seed > 1 else ''})")
-    print(f"Hyperparams : 1000 trees + early stopping + asym_wknd_excl V1 calibration")
+    strat_label = "asym_wknd_excl_hour_boost V2" if ADAPTIVE_STRATEGY == "asym_wknd_excl_hour_boost" else "asym_wknd_excl V1"
+    print(f"Hyperparams : 1000 trees + early stopping + {strat_label} calibration")
     train, val, test = _split(df)
     print(f"Split : train={len(train):,}  val={len(val):,}  test={len(test):,}")
 
