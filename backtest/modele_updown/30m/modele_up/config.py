@@ -74,23 +74,21 @@ ADAPTIVE_STRATEGY = "asym_wknd_excl_hour_boost"
 # trouve sur TEST_DAYS=365 (V1=1761 paris @ 59.23%):
 #   - weekday : T_wd=0.594 = val_weekday_pool quantile_98.7 (275/21706 = 1.27%)
 #   - weekend : T_we=0.555 = val_weekend_pool quantile_83.3 (1499/8960 = 16.72%)
-ASYM_VOL_FRAC_WEEKDAY = 0.033       # top 3.3% du val weekday non-skip
+ASYM_VOL_FRAC_WEEKDAY = 0.018       # top 1.8% du val weekday non-skip
 ASYM_VOL_FRAC_WEEKEND = 0.20        # top 20% du val weekend non-skip
-# Tune par sweep_calib_days_fine.py : cd=90 wd=0.033 we=0.200 d=0.025 gh=(20,21)
-# donne 759 paris @ 60.74% WR (max WR sous contrainte paris>=750).
-ASYM_SKIP_CELLS = ()                # plus de skip : modele auto-selectionne
-ASYM_USE_FULL_VAL = False           # True = full val, False = derniers ASYM_CALIB_DAYS de val
-ASYM_CALIB_DAYS   = 90              # 90j de val pour calibration = recent + stable
+# Tune au modele 53-feat. Config : cd=20 wd=0.018 we=0.200 d=0.060
+# gh=(19,20,21) -> 752 paris @ 63.43% WR.
+ASYM_SKIP_CELLS = ()
+ASYM_USE_FULL_VAL = False
+ASYM_CALIB_DAYS   = 20              # 20j de val pour calibration
 
 # Parametres specifiques V2 ("asym_wknd_excl_hour_boost") :
 # Pour les bougies ouvertes a une heure UTC dans ASYM_HOUR_BOOST_GOOD_HOURS,
 # le seuil de la bougie est abaisse de ASYM_HOUR_BOOST_DELTA. Les cellules
 # skippees (ASYM_SKIP_CELLS) ne sont jamais boostees.
-ASYM_HOUR_BOOST_GOOD_HOURS = (20, 21)
-ASYM_HOUR_BOOST_DELTA = 0.025
-# Tune par sweep_spw_skip.py (combine spw, skip, hour_boost). Avec spw=auto
-# + skip=() + WD=0.035 / WE=0.180, donne 755 paris @ 60.26% WR — max WR
-# trouve sous contrainte paris >= 750.
+ASYM_HOUR_BOOST_GOOD_HOURS = (19, 20, 21)
+ASYM_HOUR_BOOST_DELTA = 0.060
+# h19/20/21 + delta 0.060 : extension du boost a 7pm UTC.
 
 # --- Hyperparamètres XGBoost ---
 # Tunes par sweep_hyperparams.py (60 random configs, multi-seed=2,

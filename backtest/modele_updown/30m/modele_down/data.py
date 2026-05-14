@@ -103,6 +103,10 @@ EMA_PERIOD_FAST  = 12   # MACD fast
 EMA_PERIOD_SLOW  = 26   # MACD slow
 EMA_PERIOD_SIG   = 9    # MACD signal
 EMA_PERIOD_DIST  = 20   # dist_ema_20 (kept)
+EMA_PERIOD_DIST_M = 50   # dist_ema_50  (NEW)
+EMA_PERIOD_DIST_L = 100  # dist_ema_100 (NEW)
+RSI_PERIOD       = 14    # RSI_14 (NEW)
+PRICE_RANGE_PERIOD = 20  # price_in_range_20 (NEW)
 RETURN_PERIODS_KEPT = (3, 96)  # return_3 (3h sur 1h), return_96 (96h = 4j) — heritage 15m
 
 # Périodes Tier 2 (1h base)
@@ -575,10 +579,74 @@ def _add_tier1_derived(df: pd.DataFrame) -> int:
     n_added = 0
     n = len(df)
     close = df["close"].to_numpy(dtype=float)
+    volume = df["volume"].to_numpy(dtype=float)
+    # high/low reconstruits depuis high_ret/low_ret + close_prev pour les
+    # features qui en ont besoin (stoch, ATR ratio).
+    high = (df["high_ret"].to_numpy(dtype=float) + 1.0) * np.roll(close, 1)
+    low = (df["low_ret"].to_numpy(dtype=float) + 1.0) * np.roll(close, 1)
+    high[0] = np.nan
+    low[0] = np.nan
 
-    # dist_ema_20 = (close - EMA20) / close
+    # dist_ema_20 / 50 / 100 = (close - EMA_p) / close
     ema_20 = _ema(close, EMA_PERIOD_DIST)
     df["dist_ema_20"] = (close - ema_20) / close
+    n_added += 1
+
+    ema_50 = _ema(close, EMA_PERIOD_DIST_M)
+    df["dist_ema_50"] = (close - ema_50) / close
+    n_added += 1
+
+    ema_100 = _ema(close, EMA_PERIOD_DIST_L)
+    df["dist_ema_100"] = (close - ema_100) / close
+    n_added += 1
+
+    # RSI_14 normalise sur [-1, +1] : (RSI - 50) / 50
+    diffs = np.concatenate([[0.0], np.diff(close)])
+    gains = np.where(diffs > 0, diffs, 0.0)
+    losses = np.where(diffs < 0, -diffs, 0.0)
+    avg_gain = pd.Series(gains).ewm(alpha=1.0 / RSI_PERIOD, adjust=False).mean().to_numpy()
+    avg_loss = pd.Series(losses).ewm(alpha=1.0 / RSI_PERIOD, adjust=False).mean().to_numpy()
+    rs = np.where(avg_loss > 0, avg_gain / avg_loss, np.inf)
+    rsi = 100.0 - 100.0 / (1.0 + rs)
+    rsi = np.where(np.isinf(rs), 100.0, rsi)
+    df["rsi_14"] = (rsi - 50.0) / 50.0
+    n_added += 1
+
+    # price_in_range_20/50 : position du close dans le range [min, max] des N derniers bars
+    s = pd.Series(close)
+    for pr in (20, 50):
+        rolling_max = s.rolling(pr, min_periods=pr).max()
+        rolling_min = s.rolling(pr, min_periods=pr).min()
+        rng = rolling_max - rolling_min
+        pir = (s - rolling_min) / rng.where(rng > 0, np.nan)
+        df[f"price_in_range_{pr}"] = pir.to_numpy()
+        n_added += 1
+
+    # Distance au plus haut / plus bas recent (ratio, scale-invariant)
+    for pr in (20, 50):
+        rolling_max = s.rolling(pr, min_periods=pr).max()
+        rolling_min = s.rolling(pr, min_periods=pr).min()
+        df[f"dist_high_{pr}"] = (s / rolling_max - 1.0).to_numpy()  # < 0
+        df[f"dist_low_{pr}"]  = (s / rolling_min - 1.0).to_numpy()  # > 0
+        n_added += 2
+
+    # ROC : (close - close_N) / close_N
+    for pr in (5, 10, 20):
+        col = f"roc_{pr}"
+        roc = np.full(n, np.nan, dtype=float)
+        if n > pr:
+            roc[pr:] = close[pr:] / close[:-pr] - 1.0
+        df[col] = roc
+        n_added += 1
+
+    # Stochastic %K (period 14) normalise sur [-1, +1] : (K - 50) / 50
+    s_high = pd.Series(high)
+    s_low = pd.Series(low)
+    rolling_h = s_high.rolling(14, min_periods=14).max()
+    rolling_l = s_low.rolling(14, min_periods=14).min()
+    range_hl = rolling_h - rolling_l
+    stoch_k = 100.0 * (s - rolling_l) / range_hl.where(range_hl > 0, np.nan)
+    df["stoch_k_14"] = ((stoch_k - 50.0) / 50.0).to_numpy()
     n_added += 1
 
     # Multi-bar returns (close ratio)
