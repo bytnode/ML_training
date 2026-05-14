@@ -37,7 +37,7 @@ Cout :
   stopping, compter 4-7 minutes. Multi-seed multiplie le cout.
 
 Usage :
-    cd backtest/modele_updown/30m/modele_up
+    cd backtest/modele_updown/1h/modele_up
     python analyse/analyze_features.py                       # toutes les features
     python analyse/analyze_features.py macd bb_position      # subset
     python analyse/analyze_features.py --multi-seed 3        # moyenne sur 3 seeds

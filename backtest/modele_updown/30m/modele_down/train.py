@@ -132,10 +132,10 @@ def save_thresholds_sidecar_asym_hour_boost(model_path, thresholds_per_wknd: dic
 # ============================================================
 def hour_of_day_from_ms(ts_ms: np.ndarray) -> np.ndarray:
     """Renvoie l'heure UTC (0..23) pour chaque timestamp ms.
-    Compatible avec les bougies 15m (timestamp = open time, aligne sur 15m).
+    Compatible avec les bougies 1h (timestamp = open time, aligne sur 1h).
     """
     ts_ms = np.asarray(ts_ms, dtype=np.int64)
-    return ((ts_ms // (15 * 60 * 1000)) % 96 // 4).astype(int)
+    return ((ts_ms // (60 * 60 * 1000)) % 24).astype(int)
 
 
 # ============================================================

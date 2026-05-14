@@ -40,8 +40,8 @@ Sorties :
     - logs/feature_analysis.csv       : tableau complet pour spreadsheet
 
 Usage :
-    cd backtest/modele_updown/modele_down
-    python analyze_features.py
+    cd backtest/modele_updown/1h/modele_down
+    python analyse/analyze_features.py
 """
 
 from __future__ import annotations
@@ -529,7 +529,7 @@ def save_outputs(synth: pd.DataFrame, corr_pairs: pd.DataFrame) -> None:
 
     lines.append("\n## Comment dropper une feature\n")
     lines.append("Édite `data.py` :")
-    lines.append("- **MTF (suffixée `_30m`/`_1h`/`_4h`/`_1d`/`_5m`)** -> retire la colonne "
+    lines.append("- **MTF (suffixée `_30m`/`_4h`/`_1d`)** -> retire la colonne "
                  "de `MTF_KEPT_COLS[<tf>]`. Le calcul + l'écriture sont skippés "
                  "automatiquement.")
     lines.append("- **Tier 1 dérivée** (`dist_ema_20`, `return_3`, `return_96`, "

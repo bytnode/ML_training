@@ -2,15 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-This file is package-scoped: see the repo-root `CLAUDE.md` (`../../../CLAUDE.md`) for repo-wide conventions and for `modele_15m`. The sister package `modele_down/` predicts the opposite direction with the same pipeline.
+This file is package-scoped: see the repo-root `CLAUDE.md` (`../../../CLAUDE.md`) for repo-wide conventions. The sister package `modele_down/` predicts the opposite direction with the same pipeline.
 
 ## What this package is
 
-`modele_up` is an **UP-only** XGBoost binary classifier. On the close of each 30m BTC/USD bar it predicts:
+`modele_up` is an **UP-only** XGBoost binary classifier. On the close of each 1h BTC/USD bar it predicts:
 
 ```
-label = 1  if the NEXT 30m candle is green (close[i+1] > open[i+1])
-label = 0  if the NEXT 30m candle is red
+label = 1  if the NEXT 1h candle is green (close[i+1] > open[i+1])
+label = 0  if the NEXT 1h candle is red
 ```
 
 The model output is `P(next is up)` and is treated as a single confidence axis. All bets the model emits are UP bets — there is no DOWN head and no two-sided arbitration. Up-bias is by construction, not a feature of the data.
@@ -21,11 +21,11 @@ take UP bet  iff  P(up) >= ADAPTIVE_TARGET_WR + delta(volatility_state, is_weeke
 ```
 6 buckets total (vol ∈ {0,1,2} × wknd ∈ {0,1}), one delta per bucket, written to `btc_updown_model.thresholds.json`. Sidecar shape : `{"deltas": {"v_w": float, ...}, "metadata": {...}}` and `predict.decide()` / `api.evaluate_on_slice()` assume that shape.
 
-## Working-directory contract — `cd backtest/modele_updown/30m/modele_up/` first
+## Working-directory contract — `cd backtest/modele_updown/1h/modele_up/` first
 
-`config.py` uses **relative paths**: `DB_PATH = "DB/btc_multi_tf_30m.parquet"` and `MODEL_OUTPUT = "btc_updown_model.json"`. The patch scripts also do `Path(__file__).resolve().parent / "DB" / ...`, so running from the package root is fine, but launching `python backtest/modele_updown/30m/modele_up/train.py` from the repo root will read/write into the wrong place. Always `cd` first.
+`config.py` uses **relative paths**: `DB_PATH = "DB/btc_multi_tf_1h.parquet"` and `MODEL_OUTPUT = "btc_updown_model.json"`. The patch scripts also do `Path(__file__).resolve().parent / "DB" / ...`, so running from the package root is fine, but launching `python backtest/modele_updown/1h/modele_up/train.py` from the repo root will read/write into the wrong place. Always `cd` first.
 
-`logs/` is anchored by `Path(__file__)` (in `train.py`), so it lives under `backtest/modele_updown/30m/modele_up/logs/` regardless. The artifacts (`runs.csv`, `test_predictions.csv`) are gitignored CSVs.
+`logs/` is anchored by `Path(__file__)` (in `train.py`), so it lives under `backtest/modele_updown/1h/modele_up/logs/` regardless. The artifacts (`runs.csv`, `test_predictions.csv`) are gitignored CSVs.
 
 ## Build pipeline
 
@@ -33,14 +33,14 @@ take UP bet  iff  P(up) >= ADAPTIVE_TARGET_WR + delta(volatility_state, is_weeke
 
 ```powershell
 # 1. Construire le parquet via modele_down
-cd backtest\modele_updown\30m\modele_down
-python data.py            # produit DB/btc_multi_tf_30m.parquet
+cd backtest\modele_updown\1h\modele_down
+python data.py            # produit DB/btc_multi_tf_1h.parquet
 
 # 2. Copier vers modele_up/DB/ et inverser le label
 cd ..\modele_up
 New-Item -ItemType Directory -Force -Path DB | Out-Null
-Copy-Item ..\modele_down\DB\btc_multi_tf_30m.parquet .\DB\
-python -c "import pandas as pd; p='DB/btc_multi_tf_30m.parquet'; df=pd.read_parquet(p); df['label']=1-df['label']; df.to_parquet(p, index=False)"
+Copy-Item ..\modele_down\DB\btc_multi_tf_1h.parquet .\DB\
+python -c "import pandas as pd; p='DB/btc_multi_tf_1h.parquet'; df=pd.read_parquet(p); df['label']=1-df['label']; df.to_parquet(p, index=False)"
 
 # 3. Train + evaluate
 python train.py
@@ -75,18 +75,18 @@ def evaluate_on_slice(start_ms: int, end_ms: int) -> pd.DataFrame:
 
 ## Naming traps
 
-- **`config.DB_PATH`** points to the **parquet** `DB/btc_multi_tf_30m.parquet`, not the SQLite (`DB/btc_multi_tf.db`). The SQLite is only used by `modele_down/data.py`.
+- **`config.DB_PATH`** points to the **parquet** `DB/btc_multi_tf_1h.parquet`, not the SQLite (`DB/btc_multi_tf.db`). The SQLite is only used by `modele_down/data.py`.
 - **"up" in this package = "green candle next"**, defined as `close[i+1] > open[i+1]`. This is the *direction of the next candle*, not "price went up by some threshold". Do not redefine the label without retraining.
 - **"confidence" in `test_predictions.csv` is an alias of `p_up`**, not a calibrated score. Threshold comparisons are always against `ADAPTIVE_TARGET_WR + delta(bucket)`, never against 0.5.
 - **Le label inversé sur le parquet** : si tu copies un parquet de `modele_down`, n'oublie pas d'inverser la colonne `label` (`df["label"] = 1 - df["label"]`) sinon le modèle apprend la mauvaise direction. Le step 2 du build pipeline ci-dessus fait cette inversion.
 
 ## Data conventions (same as the root CLAUDE.md)
 
-- **No-lookahead joins**: every MTF lookup uses `searchsorted` to find the latest higher-TF bar provably closed at decision time `T = open_30m + 30m`.
+- **No-lookahead joins**: every MTF lookup uses `searchsorted` to find the latest higher-TF (or fine-context 30m) bar provably closed at decision time `T = open_1h + 1h`.
 - **Bitstamp seconds vs internal milliseconds**: only `data.fetch_klines_window` and timeframe windowing see seconds. Everything else is ms.
 - **All features are scale-invariant** by design — relative quantities (returns, ratios, normalized OBV, ATR%).
 - **Rows are not independent**: temporal split (TRAIN_DAYS window before the last TEST_DAYS, val = last VAL_FRACTION of train+val).
-- **WARMUP** in config is calibrated for the longest indicator on 30m. Don't add features with longer lookbacks without bumping warmup.
+- **WARMUP** in config is calibrated for the longest indicator on 1h. Don't add features with longer lookbacks without bumping warmup.
 
 ## Hyperparameter conventions
 

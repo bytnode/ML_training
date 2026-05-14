@@ -10,7 +10,7 @@ team and keep only **coherent** bets :
     both bet                      -> CANCEL (one says UP, the other DOWN)
 
 Working-directory contract :
-    cd backtest/modele_updown/30m
+    cd backtest/modele_updown/1h
     python main.py
 """
 from __future__ import annotations
@@ -35,8 +35,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-# 30m/ is where this main lives. modele_up and modele_down are direct children.
-# But "30m" starts with a digit so we always import as top-level via sys.path.
+# 1h/ is where this main lives. modele_up and modele_down are direct children.
+# But "1h" starts with a digit so we always import as top-level via sys.path.
 _PKG_DIR = str(Path(__file__).resolve().parent)
 if _PKG_DIR not in sys.path:
     sys.path.insert(0, _PKG_DIR)
@@ -164,7 +164,7 @@ def _render_report(stats: dict, team_wr: float, up_wr: float, down_wr: float) ->
 
     header = Text.assemble(
         ("TEAM ", "bold cyan"),
-        ("modele_updown 30m", "bold magenta"),
+        ("modele_updown 1h", "bold magenta"),
         ("  -  backtest report", "dim"),
     )
     window = Text.assemble(

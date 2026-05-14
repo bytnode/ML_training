@@ -2,7 +2,7 @@
 features.py
 ===========
 
-Lit le master 15m (parquet ou CSV) produit par data.py et renvoie le DataFrame
+Lit le master 1h (parquet ou CSV) produit par data.py et renvoie le DataFrame
 d'entrainement pret pour train.py.
 
 Toutes les colonnes derivees (label, volatility_state, is_weekend) sont
@@ -35,7 +35,7 @@ NON_FEATURE_COLS = {"timestamp_ms", "timestamp", "close", "volume"}
 
 def build_training_dataframe(csv_path, verbose: bool = True) -> pd.DataFrame:
     """
-    Lit le master 15m (parquet ou CSV selon l'extension) et renvoie le
+    Lit le master 1h (parquet ou CSV selon l'extension) et renvoie le
     DataFrame d'entrainement pret a passer a train.py.
 
     Le master DOIT contenir les colonnes pre-calculees par data.py :
@@ -55,7 +55,7 @@ def build_training_dataframe(csv_path, verbose: bool = True) -> pd.DataFrame:
     if not csv_path.exists():
         raise FileNotFoundError(
             f"{csv_path.resolve()} introuvable. Lance d'abord 'python data.py' "
-            f"pour generer le master 15m."
+            f"pour generer le master 1h."
         )
 
     suffix = csv_path.suffix.lower()

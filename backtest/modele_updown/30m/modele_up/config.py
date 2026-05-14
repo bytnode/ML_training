@@ -4,17 +4,16 @@
 
 # --- Source de données ---
 SYMBOL = "btcusd"
-INTERVAL = "30m"
+INTERVAL = "1h"
 DAYS_BACK = 5000
-DB_PATH = "DB/btc_multi_tf_30m.parquet"
+DB_PATH = "DB/btc_multi_tf_1h.parquet"
 
 # --- Higher timeframes ajoutés à chaque ligne du dataset (no-lookahead via
 # last_closed_index : OHLCV de la dernière bougie closed avant le timestamp
-# de décision T = times[i] + 30m).
-MTF_INTERVALS = ["1h", "4h", "1d"]
+# de décision T = times[i] + 1h).
+MTF_INTERVALS = ["4h", "1d"]
 
 INTERVAL_MS = {
-    "15m": 15 * 60 * 1000,
     "30m": 30 * 60 * 1000,
     "1h":  60 * 60 * 1000,
     "4h":  4 * 60 * 60 * 1000,
@@ -22,10 +21,10 @@ INTERVAL_MS = {
 }
 
 # --- Extraction des features ---
-WARMUP = 500            # bars 30m ignorées en début (warmup ATR long)
+WARMUP = 500            # bars 1h ignorées en début (warmup ATR long)
 
 # --- Volatility state (seul calcul dérivé en plus des colonnes DB) ---
-# ratio = atr_30m / rolling_mean(atr_30m, ATR_LONG_PERIOD)
+# ratio = atr_1h / rolling_mean(atr_1h, ATR_LONG_PERIOD)
 # bucket : 0 = low (< VOLATILITY_LOW), 1 = mid, 2 = high (> VOLATILITY_HIGH)
 ATR_LONG_PERIOD = 100
 VOLATILITY_HIGH = 1.5
@@ -87,7 +86,7 @@ ASYM_USE_FULL_VAL = True            # True = full val, False = derniers 55j
 ASYM_HOUR_BOOST_GOOD_HOURS = (20, 21, 22)
 ASYM_HOUR_BOOST_DELTA = 0.020
 
-# --- Hyperparamètres XGBoost (identiques à modele_15m) ---
+# --- Hyperparamètres XGBoost ---
 XGB_N_ESTIMATORS = 1000
 XGB_MAX_DEPTH = 5
 XGB_LEARNING_RATE = 0.05

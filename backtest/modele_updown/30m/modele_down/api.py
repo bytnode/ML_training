@@ -29,7 +29,7 @@ import xgboost as xgb
 NAME = "modele_updown"
 
 _MODEL_DIR = Path(__file__).resolve().parent
-_PARQUET_PATH = _MODEL_DIR / "DB" / "btc_multi_tf_30m.parquet"
+_PARQUET_PATH = _MODEL_DIR / "DB" / "btc_multi_tf_1h.parquet"
 _MODEL_PATH   = _MODEL_DIR / "btc_updown_model.json"
 _SIDECAR_JSON = _MODEL_DIR / "btc_updown_model.thresholds.json"
 
@@ -44,7 +44,7 @@ def _load_model() -> xgb.XGBClassifier:
     if _model is None:
         if not _MODEL_PATH.exists():
             raise FileNotFoundError(
-                f"{_MODEL_PATH} introuvable. Lance 'cd 15min/modele_down && python train.py'."
+                f"{_MODEL_PATH} introuvable. Lance 'cd 1h/modele_down && python train.py'."
             )
         m = xgb.XGBClassifier()
         m.load_model(str(_MODEL_PATH))
@@ -57,7 +57,7 @@ def _load_sidecar() -> dict:
     if _sidecar is None:
         if not _SIDECAR_JSON.exists():
             raise FileNotFoundError(
-                f"{_SIDECAR_JSON} introuvable. Lance 'cd 15min/modele_down && python train.py'."
+                f"{_SIDECAR_JSON} introuvable. Lance 'cd 1h/modele_down && python train.py'."
             )
         with open(_SIDECAR_JSON) as f:
             _sidecar = json.load(f)
@@ -69,7 +69,7 @@ def _load_parquet() -> pd.DataFrame:
     if _parquet is None:
         if not _PARQUET_PATH.exists():
             raise FileNotFoundError(
-                f"{_PARQUET_PATH} introuvable. Lance 'cd 15min/modele_down && python data.py' "
+                f"{_PARQUET_PATH} introuvable. Lance 'cd 1h/modele_down && python data.py' "
                 f"puis les patch scripts."
             )
         _parquet = pd.read_parquet(_PARQUET_PATH).sort_values("timestamp_ms").reset_index(drop=True)
@@ -78,7 +78,7 @@ def _load_parquet() -> pd.DataFrame:
 
 def _hour_from_ts_ms(ts_ms) -> int:
     ts_ms = int(ts_ms)
-    return int(((ts_ms // (30 * 60 * 1000)) % 48) // 2)
+    return int((ts_ms // (60 * 60 * 1000)) % 24)
 
 
 def _bucket_threshold(volatility_state: int, is_weekend: int, sidecar: dict,

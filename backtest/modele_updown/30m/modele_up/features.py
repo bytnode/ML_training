@@ -2,7 +2,7 @@
 features.py
 ===========
 
-Lit le master 15m (parquet ou CSV) produit par data.py et renvoie le DataFrame
+Lit le master 1h (parquet ou CSV) produit par data.py et renvoie le DataFrame
 d'entrainement pret pour train.py.
 
 Toutes les colonnes derivees (label, volatility_state, is_weekend) sont
@@ -34,7 +34,7 @@ NON_FEATURE_COLS = {"timestamp_ms", "timestamp", "close", "volume"}
 
 # Features droppees apres analyse d'ablation (logs/feature_analysis.md, 2026-05-14).
 # Chaque entree a un dEV negatif clair (hors noise floor ~5 EV) :
-#   - close_ret    : dEV = -9.00, redondant avec close_ret_15m / high_ret / low_ret
+#   - close_ret    : dEV = -9.00, redondant avec close_ret_30m / high_ret / low_ret
 #   - macd_signal  : dEV = -7.50, r = 0.955 avec macd (quasi-doublon)
 # Le parquet n'est PAS regenere : les colonnes restent sur disque mais sont
 # masquees ici pour ne pas etre vues par train.py / analyze_features.py.
@@ -43,7 +43,7 @@ DROPPED_FEATURES = {"close_ret", "macd_signal"}
 
 def build_training_dataframe(csv_path, verbose: bool = True) -> pd.DataFrame:
     """
-    Lit le master 15m (parquet ou CSV selon l'extension) et renvoie le
+    Lit le master 1h (parquet ou CSV selon l'extension) et renvoie le
     DataFrame d'entrainement pret a passer a train.py.
 
     Le master DOIT contenir les colonnes pre-calculees par data.py :
@@ -63,7 +63,7 @@ def build_training_dataframe(csv_path, verbose: bool = True) -> pd.DataFrame:
     if not csv_path.exists():
         raise FileNotFoundError(
             f"{csv_path.resolve()} introuvable. Lance d'abord 'python data.py' "
-            f"pour generer le master 15m."
+            f"pour generer le master 1h."
         )
 
     suffix = csv_path.suffix.lower()

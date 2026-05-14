@@ -2,12 +2,13 @@
 data.py — pipeline complet pour modele_updown.
 
 Un seul fichier qui :
-  1. Fetch OHLCV BTC/USD depuis Bitstamp sur 5 timeframes (15m, 30m, 1h, 4h, 1d)
+  1. Fetch OHLCV BTC/USD depuis Bitstamp sur 4 timeframes (30m, 1h, 4h, 1d)
   2. Calcule les 9 features normalisées par TF + persiste close & volume bruts
-  3. Construit le master 30m (.parquet) avec UNIQUEMENT des features normalisées :
-       - 9  features de base 30m
-       - 9  features 15m (lookup no-lookahead, 15m close-aligned uniquement)
-       - 18 features MTF (1h/4h/1d, déjà filtrées : on n'écrit que les colonnes
+  3. Construit le master 1h (.parquet) avec UNIQUEMENT des features normalisées :
+       - 9  features de base 1h
+       - 9  features 30m (lookup no-lookahead, 30m close-aligned uniquement,
+            fine context : la 30m qui ferme exactement à T = open_1h + 1h)
+       - 13 features MTF (4h/1d, déjà filtrées : on n'écrit que les colonnes
             qui survivent au drop — pas de calcul inutile)
        -  7 features Tier 1 dérivées : dist_ema_20, return_3, return_96,
             hour_sin, hour_cos, upper_wick, lower_wick
@@ -17,7 +18,7 @@ Un seul fichier qui :
   Les valeurs BRUTES close/volume sont persistées dans la SQLite (table candles)
   mais ne sont JAMAIS écrites dans les sorties (parquet ou CSV). Phase 4 les
   charge depuis SQLite, les utilise pour calculer MACD/BB/MFI, puis les drop
-  avant l'écriture du master 30m.
+  avant l'écriture du master 1h.
 
 Ce fichier remplace l'ancienne chaîne :
   data.py + fetch_and_add_5m.py + add_tier1_features.py + drop_redundant_features.py
@@ -25,8 +26,8 @@ Ce fichier remplace l'ancienne chaîne :
 Les anciens scripts sont laissés sur disque mais ne sont plus utiles.
 
 Usage :
-    cd backtest/modele_updown/30m/modele_down
-    python data.py                 # ~3-5 min : 5 TFs en parallèle + agrégation
+    cd backtest/modele_updown/1h/modele_down
+    python data.py                 # ~3-5 min : 4 TFs en parallèle + agrégation
     python train.py                # entraîne sur le master parquet produit
 
 Schéma SQLite (table `candles`) :
@@ -79,7 +80,6 @@ DEFAULT_DB_PATH = "DB/btc_multi_tf.db"
 
 # (step_ms, step_sec)
 TIMEFRAMES: dict[str, tuple[int, int]] = {
-    "15m": (15 * 60 * 1000,          15 * 60),
     "30m": (30 * 60 * 1000,          30 * 60),
     "1h":  (60 * 60 * 1000,          60 * 60),
     "4h":  ( 4 * 60 * 60 * 1000,  4 * 60 * 60),
@@ -98,22 +98,22 @@ BODY_RATIO_AVG_WINDOW = 14
 VOLUME_AVG_WINDOW     = 20
 OBV_PRESSURE_WINDOW   = 10
 
-# Périodes Tier 1 (15m) — RSI / EMA / Returns dropped sont ignorés
+# Périodes Tier 1 (1h base) — RSI / EMA / Returns dropped sont ignorés
 EMA_PERIOD_FAST  = 12   # MACD fast
 EMA_PERIOD_SLOW  = 26   # MACD slow
 EMA_PERIOD_SIG   = 9    # MACD signal
 EMA_PERIOD_DIST  = 20   # dist_ema_20 (kept)
-RETURN_PERIODS_KEPT = (3, 96)  # return_3 (45min), return_96 (24h) — return_12 dropped
+RETURN_PERIODS_KEPT = (3, 96)  # return_3 (3h sur 1h), return_96 (96h = 4j) — heritage 15m
 
-# Périodes Tier 2 (15m)
+# Périodes Tier 2 (1h base)
 BB_PERIOD     = 20
 BB_NSIGMA     = 2
 MFI_PERIOD    = 14
 RV_SHORT_WINDOW = 20
 RV_LONG_WINDOW  = 100
 
-INTERVAL_15M_MS = 15 * 60 * 1000
 INTERVAL_30M_MS = 30 * 60 * 1000
+INTERVAL_1H_MS  = 60 * 60 * 1000
 
 DB_WRITE_LOCK = threading.Lock()
 
@@ -129,15 +129,14 @@ DB_WRITE_LOCK = threading.Lock()
 #          body_ratio_close_4h, low_ret_4h, high_ret_4h, close_ret_1d,
 #          body_ratio_avg_1h
 #
-# Pour chaque MTF on liste explicitement les colonnes À CALCULER (post-drop).
+# Pour chaque TF non-base on liste explicitement les colonnes À CALCULER (post-drop).
+# 1h est la base : pas d'entree ici, ses features apparaissent sans suffixe.
 MTF_KEPT_COLS: dict[str, list[str]] = {
-    # 15m : 9 features (contexte fin, full set — analogue au rôle du 5m côté 15min)
-    "15m": ["open_ret", "high_ret", "low_ret", "close_ret",
+    # 30m : 9 features (contexte fin, full set — analogue au role du 15m cote 30m).
+    # Lookup no-lookahead : la 30m qui ferme exactement a T = open_1h + 1h.
+    "30m": ["open_ret", "high_ret", "low_ret", "close_ret",
             "volume_ratio", "body_ratio_close", "body_ratio_avg",
             "obv_pressure", "atr_pct"],
-    # 1h : 5 (body_signed PURE, atr_pct STRONG, obv_pressure/high_ret/body_ratio_avg WEAK)
-    "1h":  ["open_ret", "low_ret", "close_ret",
-            "volume_ratio", "body_ratio_close"],
     # 4h : 5 (body_signed PURE, open_ret/body_ratio_close/low_ret/high_ret WEAK)
     "4h":  ["close_ret", "volume_ratio",
             "body_ratio_avg", "obv_pressure", "atr_pct"],
@@ -387,11 +386,12 @@ def compute_normalized_features(df: pd.DataFrame) -> pd.DataFrame:
 def process_timeframe_to_candles(db_path: Path, timeframe: str) -> int:
     """Lit candles_raw du TF, calcule features, INSERT dans candles.
 
-    Cas spécial 15m : on calcule les features sur la série COMPLÈTE (les rolling
-    SMA20/EWMA14/etc. ont besoin de toutes les bougies contiguës), puis on FILTRE
-    pour ne garder que la 15m close-aligned avec chaque 30m (open_time = T + 15min).
-    On passe ainsi de ~2x rows à ~1x rows en DB & CSV, sans dégrader les
-    features (qui ont vu la série complète au moment du calcul).
+    Cas special 30m : on calcule les features sur la serie COMPLETE (les rolling
+    SMA20/EWMA14/etc. ont besoin de toutes les bougies contigues), puis on FILTRE
+    pour ne garder que la 30m close-aligned avec chaque 1h (open_time = T + 30min,
+    soit la 30m qui ferme a T + 1h = close du 1h). On passe ainsi de ~2x rows
+    a ~1x rows en DB & CSV, sans degrader les features (qui ont vu la serie
+    complete au moment du calcul).
     """
     conn = sqlite3.connect(db_path)
     try:
@@ -408,15 +408,15 @@ def process_timeframe_to_candles(db_path: Path, timeframe: str) -> int:
 
     feat = compute_normalized_features(df)
 
-    if timeframe == "15m":
-        # Garde les 15m dont open_time tombe à T + 15min pour un T multiple de 30min.
-        # Ce sont exactement les 15m qui ferment à T + 30min = close du 30m.
-        offset_ms = feat["timestamp_ms"].to_numpy(dtype=np.int64) % INTERVAL_30M_MS
-        keep_mask = offset_ms == (15 * 60 * 1000)
+    if timeframe == "30m":
+        # Garde les 30m dont open_time tombe a T + 30min pour un T multiple de 1h.
+        # Ce sont exactement les 30m qui ferment a T + 1h = close du 1h.
+        offset_ms = feat["timestamp_ms"].to_numpy(dtype=np.int64) % INTERVAL_1H_MS
+        keep_mask = offset_ms == (30 * 60 * 1000)
         n_before = len(feat)
         feat = feat.loc[keep_mask].reset_index(drop=True)
-        print(f"    [15m] filtre close-align : {n_before:,} -> {len(feat):,} rows "
-              f"(garde 1/2, les autres ne sont pas utilisées par le 30m)")
+        print(f"    [30m] filtre close-align : {n_before:,} -> {len(feat):,} rows "
+              f"(garde 1/2, les autres ne sont pas utilisees par le 1h)")
 
     def _f(v):
         return None if pd.isna(v) else float(v)
@@ -496,7 +496,7 @@ def export_timeframe_csv(db_path: Path, timeframe: str, csv_path: Path) -> int:
 
 
 # ============================================================================
-# Phase 4 — Master 30m feature DataFrame (Tier 0 + 15m + MTF + Tier 1 + Tier 2)
+# Phase 4 — Master 1h feature DataFrame (Tier 0 + 30m fine + MTF + Tier 1 + Tier 2)
 # ============================================================================
 
 def _load_tf(db_path: Path, timeframe: str) -> pd.DataFrame:
@@ -518,25 +518,26 @@ def _load_tf(db_path: Path, timeframe: str) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def _add_lookup_features(df_30m: pd.DataFrame, df_other: pd.DataFrame,
+def _add_lookup_features(df_base: pd.DataFrame, df_other: pd.DataFrame,
                          tf_label: str, tf_step_ms: int,
                          kept_cols: list[str]) -> int:
     """
-    Pour chaque row 30m, ajoute les colonnes `kept_cols` du TF supérieur
-    (ou inférieur 15m), suffixées par tf_label. Lookup no-lookahead :
-    on prend la dernière bougie `df_other` *fermée* à T = open_30m + 30m.
+    Pour chaque row de la base 1h, ajoute les colonnes `kept_cols` du TF
+    (inferieur 30m ou superieur 4h/1d), suffixees par tf_label. Lookup
+    no-lookahead : on prend la derniere bougie `df_other` *fermee* a
+    T = open_1h + 1h.
 
-    Pour 15m : T - 15m est l'open de la dernière 15m fermée à T.
-    Pour 1h+ : T - tf_step est l'open de la dernière bougie supérieure fermée à T.
+    Pour 30m : T - 30m est l'open de la derniere 30m fermee a T.
+    Pour 4h+ : T - tf_step est l'open de la derniere bougie superieure fermee a T.
     """
-    times_30m = df_30m["timestamp_ms"].to_numpy(dtype=np.int64)
+    times_base = df_base["timestamp_ms"].to_numpy(dtype=np.int64)
     times_oth = df_other["timestamp_ms"].to_numpy(dtype=np.int64)
-    decision_times = times_30m + INTERVAL_30M_MS
+    decision_times = times_base + INTERVAL_1H_MS
     target = decision_times - tf_step_ms
     indices = np.searchsorted(times_oth, target, side="right") - 1
     valid = indices >= 0
 
-    n = len(df_30m)
+    n = len(df_base)
     n_added = 0
     for col in kept_cols:
         new_col = f"{col}_{tf_label}"
@@ -544,7 +545,7 @@ def _add_lookup_features(df_30m: pd.DataFrame, df_other: pd.DataFrame,
         if valid.any():
             src = df_other[col].to_numpy(dtype=float)
             values[valid] = src[indices[valid]]
-        df_30m[new_col] = values
+        df_base[new_col] = values
         n_added += 1
     return n_added
 
@@ -613,7 +614,7 @@ def _add_tier1_derived(df: pd.DataFrame) -> int:
 
 def _add_tier2(df: pd.DataFrame) -> int:
     """
-    Ajoute les 9 features Tier 2 (15m only) :
+    Ajoute les 9 features Tier 2 (base 1h only) :
         macd, macd_signal, macd_hist
         bb_position, bb_width
         mfi_norm
@@ -693,81 +694,81 @@ def _add_tier2(df: pd.DataFrame) -> int:
     return n_added
 
 
-def build_master_30m(db_path: Path, out_path: Path) -> tuple[int, int]:
-    """Construit le DataFrame final 30m (Tier 0 + 15m + MTF + Tier 1 + Tier 2)."""
-    print("\n--- Phase 4/5 : construction du master 30m DataFrame ---")
+def build_master_1h(db_path: Path, out_path: Path) -> tuple[int, int]:
+    """Construit le DataFrame final 1h (Tier 0 + 30m fine + MTF + Tier 1 + Tier 2)."""
+    print("\n--- Phase 4/5 : construction du master 1h DataFrame ---")
     t0 = time.time()
 
-    # 4.1 — base 30m
+    # 4.1 — base 1h
+    df_1h = _load_tf(db_path, "1h")
+    print(f"  [base 1h] {len(df_1h):,} rows x {len(df_1h.columns)} cols (avec close+volume)")
+
+    # 4.2 — 30m lookups (no-lookahead, fine context)
     df_30m = _load_tf(db_path, "30m")
-    print(f"  [base 30m] {len(df_30m):,} rows × {len(df_30m.columns)} cols (avec close+volume)")
-
-    # 4.2 — 15m lookups (no-lookahead, fine context)
-    df_15m = _load_tf(db_path, "15m")
-    if not df_15m.empty:
-        n_15m = _add_lookup_features(df_30m, df_15m, "15m",
-                                     INTERVAL_15M_MS, MTF_KEPT_COLS["15m"])
-        print(f"  [15m lookup] +{n_15m} cols")
+    if not df_30m.empty:
+        n_30m = _add_lookup_features(df_1h, df_30m, "30m",
+                                     INTERVAL_30M_MS, MTF_KEPT_COLS["30m"])
+        print(f"  [30m lookup] +{n_30m} cols (fine context)")
     else:
-        print(f"  [15m lookup] skip (table 15m vide)")
+        print(f"  [30m lookup] skip (table 30m vide)")
 
-    # 4.3 — MTF lookups (1h, 4h, 1d)
-    for tf in ["1h", "4h", "1d"]:
+    # 4.3 — MTF lookups (4h, 1d)
+    for tf in ["4h", "1d"]:
         df_oth = _load_tf(db_path, tf)
         if df_oth.empty:
             print(f"  [{tf} lookup] skip (table vide)")
             continue
         step_ms, _ = TIMEFRAMES[tf]
-        n = _add_lookup_features(df_30m, df_oth, tf, step_ms, MTF_KEPT_COLS[tf])
+        n = _add_lookup_features(df_1h, df_oth, tf, step_ms, MTF_KEPT_COLS[tf])
         print(f"  [{tf} lookup] +{n} cols (post-drop)")
 
     # 4.4 — Tier 1 derived (7 cols)
-    n_t1 = _add_tier1_derived(df_30m)
+    n_t1 = _add_tier1_derived(df_1h)
     print(f"  [Tier 1 derived] +{n_t1} cols (dist_ema_20, return_3/96, hour_sin/cos, wicks)")
 
     # 4.5 — Tier 2 (9 cols)
-    n_t2 = _add_tier2(df_30m)
-    print(f"  [Tier 2] +{n_t2} cols (MACD ×3, BB ×2, MFI ×1, rv ×3)")
+    n_t2 = _add_tier2(df_1h)
+    print(f"  [Tier 2] +{n_t2} cols (MACD x3, BB x2, MFI x1, rv x3)")
 
     # 4.6 — derived columns
-    ts_dt = pd.to_datetime(df_30m["timestamp_ms"], unit="ms", utc=True)
-    df_30m["is_weekend"] = (ts_dt.dt.dayofweek >= 5).astype(int)
+    ts_dt = pd.to_datetime(df_1h["timestamp_ms"], unit="ms", utc=True)
+    df_1h["is_weekend"] = (ts_dt.dt.dayofweek >= 5).astype(int)
 
-    atr_long = df_30m["atr_pct"].rolling(window=ATR_LONG_PERIOD, min_periods=20).mean()
-    atr_ratio = df_30m["atr_pct"] / atr_long
+    atr_long = df_1h["atr_pct"].rolling(window=ATR_LONG_PERIOD, min_periods=20).mean()
+    atr_ratio = df_1h["atr_pct"] / atr_long
     vol_state = np.where(atr_ratio > VOLATILITY_HIGH, 2,
                 np.where(atr_ratio < VOLATILITY_LOW, 0, 1))
     vol_state = np.where(np.isnan(atr_ratio.to_numpy()), 1, vol_state)
-    df_30m["volatility_state"] = vol_state.astype(int)
+    df_1h["volatility_state"] = vol_state.astype(int)
 
-    cr = df_30m["close_ret"].to_numpy()
-    or_ = df_30m["open_ret"].to_numpy()
+    cr = df_1h["close_ret"].to_numpy()
+    or_ = df_1h["open_ret"].to_numpy()
     cr_next = np.concatenate([cr[1:], [np.nan]])
     or_next = np.concatenate([or_[1:], [np.nan]])
     invalid = ((cr == or_) | (cr_next == or_next)
                | np.isnan(cr) | np.isnan(or_)
                | np.isnan(cr_next) | np.isnan(or_next))
     label = np.where(invalid, np.nan, (cr_next < or_next).astype(float))
-    df_30m["label"] = label
+    df_1h["label"] = label
     n_valid_label = int(np.sum(~np.isnan(label)))
     print(f"  [derived] +3 cols : is_weekend, volatility_state, label "
-          f"({n_valid_label:,} labels valides / {len(df_30m):,})")
+          f"({n_valid_label:,} labels valides / {len(df_1h):,})")
 
-    df_30m = df_30m.drop(columns=["close", "volume", "atr_pct", "open_ret"])
+    df_1h = df_1h.drop(columns=["close", "volume", "atr_pct", "open_ret"])
 
     suffix = out_path.suffix.lower()
     if suffix == ".parquet":
-        df_30m.to_parquet(out_path, index=False)
+        df_1h.to_parquet(out_path, index=False)
     elif suffix == ".csv":
-        df_30m.to_csv(out_path, index=False)
+        df_1h.to_csv(out_path, index=False)
     else:
-        raise ValueError(f"Extension non supportée pour {out_path} : '{suffix}'.")
+        raise ValueError(f"Extension non supportee pour {out_path} : '{suffix}'.")
     elapsed = time.time() - t0
     size_mb = out_path.stat().st_size / (1024 * 1024)
-    print(f"  -> {out_path.name} : {len(df_30m):,} rows x {len(df_30m.columns)} cols, "
+    print(f"  -> {out_path.name} : {len(df_1h):,} rows x {len(df_1h.columns)} cols, "
           f"{size_mb:.1f} MB ({elapsed:.1f}s)")
 
-    return len(df_30m), len(df_30m.columns)
+    return len(df_1h), len(df_1h.columns)
 
 
 # ============================================================================
@@ -777,7 +778,7 @@ def build_master_30m(db_path: Path, out_path: Path) -> tuple[int, int]:
 def run(pair: str, days_back: int, db_path: Path) -> None:
     pair_norm = pair.lower()
 
-    print(f"=== modele_updown 30m — pipeline data.py (Tier 0 + Tier 1 + Tier 2) ===")
+    print(f"=== modele_updown 1h — pipeline data.py (Tier 0 + Tier 1 + Tier 2) ===")
     print(f"Pair        : {pair_norm}")
     print(f"Période     : {days_back} jours en arrière")
     print(f"Timeframes  : {', '.join(TIMEFRAMES.keys())}  ({WORKERS_PER_TF} workers/TF)")
@@ -821,21 +822,21 @@ def run(pair: str, days_back: int, db_path: Path) -> None:
     elapsed_csv = time.time() - t2
     print(f"Export per-TF terminé en {elapsed_csv:.1f}s")
 
-    # ---- Phase 4 — master 30m parquet (= dataset d'entrée de train.py) ----
+    # ---- Phase 4 — master 1h parquet (= dataset d'entree de train.py) ----
     # Parquet : ~5-10x plus petit que CSV + lecture plus rapide. features.py
-    # auto-détecte l'extension via Path.suffix, donc DB_PATH dans config.py
-    # peut pointer indifféremment sur .parquet ou .csv.
-    master_path = csv_dir / f"{db_stem}_30m.parquet"
-    n_rows, n_cols = build_master_30m(db_path, master_path)
+    # auto-detecte l'extension via Path.suffix, donc DB_PATH dans config.py
+    # peut pointer indifferemment sur .parquet ou .csv.
+    master_path = csv_dir / f"{db_stem}_1h.parquet"
+    n_rows, n_cols = build_master_1h(db_path, master_path)
 
-    # ---- Phase 5 — récap ----
-    print(f"\n--- Phase 5/5 : récap ---")
+    # ---- Phase 5 — recap ----
+    print(f"\n--- Phase 5/5 : recap ---")
     db_size_mb = db_path.stat().st_size / (1024 * 1024)
     total_elapsed = elapsed_fetch + elapsed_feat + elapsed_csv
-    print(f"Bougies brutes téléchargées : {sum(totals.values()):,}")
+    print(f"Bougies brutes telechargees : {sum(totals.values()):,}")
     print(f"DB                          : {db_path.resolve()} ({db_size_mb:.1f} MB)")
-    print(f"Master 30m (parquet)        : {master_path.resolve()}")
-    print(f"  {n_rows:,} rows x {n_cols} cols (= 2 metadata + 9 base + 9 15m + 18 MTF "
+    print(f"Master 1h (parquet)         : {master_path.resolve()}")
+    print(f"  {n_rows:,} rows x {n_cols} cols (= 2 metadata + 7 base + 9 30m + 13 MTF "
           f"+ 7 Tier1 + 9 Tier2 ; close/volume bruts gardes en SQLite uniquement)")
 
     conn = sqlite3.connect(db_path)
@@ -845,8 +846,8 @@ def run(pair: str, days_back: int, db_path: Path) -> None:
                MIN(timestamp) AS first_ts, MAX(timestamp) AS last_ts
         FROM candles GROUP BY timeframe
         ORDER BY CASE timeframe
-            WHEN '15m' THEN 1 WHEN '30m' THEN 2
-            WHEN '1h'  THEN 3 WHEN '4h'  THEN 4 WHEN '1d'  THEN 5 END
+            WHEN '30m' THEN 1 WHEN '1h' THEN 2
+            WHEN '4h'  THEN 3 WHEN '1d' THEN 4 END
         """,
         conn,
     )
@@ -864,7 +865,7 @@ def run(pair: str, days_back: int, db_path: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="modele_updown 30m — fetch + features (Tier 0 + 1 + 2) en un seul script."
+        description="modele_updown 1h — fetch + features (Tier 0 + 1 + 2) en un seul script."
     )
     p.add_argument("--pair", default=DEFAULT_PAIR,
                    help=f"Code paire Bitstamp en minuscules (défaut : {DEFAULT_PAIR}).")
