@@ -356,5 +356,5 @@ def validate_against_parquet(parquet_path, n_test_bars: int = 10, tol: float = 1
 
 if __name__ == "__main__":
     from pathlib import Path
-    PARQUET = Path(__file__).resolve().parent.parent / "15min" / "modele_up" / "DB" / "btc_multi_tf_15m.parquet"
+    PARQUET = Path(__file__).resolve().parents[2] / "modele_up" / "DB" / "btc_multi_tf_15m.parquet"
     validate_against_parquet(PARQUET, n_test_bars=10, tol=1e-6)

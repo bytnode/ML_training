@@ -20,8 +20,11 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 
-# sys.path injection so we can import modele_down/data.py helpers
-_MODELE_DOWN_DIR = str(Path(__file__).resolve().parent.parent / "15min" / "modele_down")
+# sys.path injection so we can import modele_down/data.py helpers.
+# __file__ = backtest/modele_updown/15min/live/live_helpers/features_down.py
+# parents: [0] live_helpers/, [1] live/, [2] 15min/. modele_down/ is a sibling
+# of live/ under 15min/, so parents[2] / "modele_down" is the right join.
+_MODELE_DOWN_DIR = str(Path(__file__).resolve().parents[2] / "modele_down")
 if _MODELE_DOWN_DIR not in sys.path:
     sys.path.insert(0, _MODELE_DOWN_DIR)
 
@@ -248,5 +251,5 @@ def validate_against_parquet(parquet_path, n_test_bars: int = 5, tol: float = 1e
 
 
 if __name__ == "__main__":
-    PARQUET = Path(__file__).resolve().parent.parent / "15min" / "modele_down" / "DB" / "btc_multi_tf_15m.parquet"
+    PARQUET = Path(__file__).resolve().parents[2] / "modele_down" / "DB" / "btc_multi_tf_15m.parquet"
     validate_against_parquet(PARQUET, n_test_bars=5, tol=1e-5)

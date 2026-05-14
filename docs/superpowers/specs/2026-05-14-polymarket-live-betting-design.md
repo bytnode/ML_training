@@ -5,7 +5,9 @@
 
 ## Problème
 
-`backtest/modele_updown/live/live.py` tourne en mode **paper-trading** : à chaque frontière UTC 15min il prédit `UP` / `DOWN` / `PASS` / `CANCEL` via l'équipe `modele_up` + `modele_down`, log la décision dans `logs/live_predictions.csv`, et envoie une notification Telegram à la résolution. Aucun ordre n'est placé.
+`backtest/modele_updown/15min/live/live.py` tourne en mode **paper-trading** : à chaque frontière UTC 15min il prédit `UP` / `DOWN` / `PASS` / `CANCEL` via l'équipe `modele_up` + `modele_down`, log la décision dans `logs/live_predictions.csv`, et envoie une notification Telegram à la résolution. Aucun ordre n'est placé.
+
+*Note layout 2026-05-14 (post-spec)*: après la rédaction initiale, `main.py` et le dossier `live/` ont été déplacés à l'intérieur de `backtest/modele_updown/15min/` pour pouvoir cohabiter avec d'autres timeframes (e.g. `5min/`, `30min/`) sans collision. Tous les chemins ci-dessous sont à lire en gardant ce préfixe en tête.
 
 L'objectif : un mode `LIVE_MODE=true` qui place un vrai ordre USDC sur Polymarket à chaque décision `UP` ou `DOWN`, sur le marché binaire 15-min correspondant. Tout le reste (modèle, décision, log, Telegram) reste identique.
 
@@ -31,22 +33,26 @@ Ce design réutilise l'architecture déjà éprouvée dans `docs/superpowers/spe
 ## Layout
 
 ```
-backtest/modele_updown/live/
-├── live.py                 # MODIF : read LIVE_MODE from env + add --dry-run flag + hooks Polymarket
-├── polymarket.py           # NEW : seul fichier qui touche Polymarket / Polygon
-├── live_helpers/
-│   ├── fetch.py            # inchange
-│   ├── features_up.py      # inchange
-│   ├── features_down.py    # inchange
-│   └── notify.py           # MODIF : add send_bet_placed() / send_bet_failed() / send_stuck()
-├── logs/
-│   ├── live_predictions.csv    # inchange — 1 row par cycle, paper-equivalent forever
-│   └── bets.csv                # NEW — 1 row par tentative d'ordre reel
-├── Dockerfile              # MODIF : add py-clob-client, web3, eth-account
-├── Dockerfile.dockerignore # inchange
-├── docker-compose.yml      # inchange (env_file + volume identiques)
-├── .env                    # MODIF : add 5 vars Polymarket / Polygon
-└── .env.example            # NEW — template gitignored-safe
+backtest/modele_updown/15min/
+├── modele_up/               # paquet entrainement UP-only (inchange)
+├── modele_down/             # paquet entrainement DOWN-only (inchange)
+├── main.py                  # team backtest orchestrator (deplace ici depuis modele_updown/)
+└── live/
+    ├── live.py              # MODIF : read LIVE_MODE from env + add --dry-run flag + hooks Polymarket
+    ├── polymarket.py        # NEW : seul fichier qui touche Polymarket / Polygon
+    ├── live_helpers/
+    │   ├── fetch.py         # inchange
+    │   ├── features_up.py   # MODIF : parents[2] hop adapté au nesting 15min/
+    │   ├── features_down.py # MODIF : parents[2] hop adapté au nesting 15min/
+    │   └── notify.py        # MODIF : add send_bet_placed/resolved_real/stuck + error-bot
+    ├── logs/
+    │   ├── live_predictions.csv  # inchange — 1 row par cycle, paper-equivalent forever
+    │   └── bets.csv              # NEW — 1 row par tentative d'ordre reel
+    ├── Dockerfile           # MODIF : add py-clob-client/web3/eth-account ; chemins COPY repointés
+    ├── Dockerfile.dockerignore # inchange
+    ├── docker-compose.yml   # MODIF : volume mount /app/15min/live/logs (au lieu de /app/live/logs)
+    ├── .env                 # MODIF : add 5 vars Polymarket + 2 vars error bot + tunables
+    └── .env.example         # NEW — template gitignored-safe
 ```
 
 ## Cycle loop (mode `LIVE_MODE=true`)
@@ -317,6 +323,42 @@ TELEGRAM_CHAT_ID=...
   - Catch-up des pending bets dans `bets.csv` (voir `Comportement de récupération`).
 - **Si `LIVE_MODE=false`** : aucune des vars Polymarket n'est lue. Le `PolymarketClient` n'est même pas importé (lazy import sous le `if`), donc `py-clob-client` et `web3` peuvent être absents de l'environnement Python sans rien casser. Utile pour le développement local sans les deps lourdes.
 
+## Telegram — deux bots
+
+### Bot opérationnel (existant — TELEGRAM_BOT_TOKEN)
+Reçoit : startup, bet placé, bet résolu, stuck, low MATIC.
+
+### Bot d'erreurs dédié (NEW — TELEGRAM_ERROR_BOT_TOKEN)
+
+Variables `.env` :
+
+```
+TELEGRAM_ERROR_BOT_TOKEN=<token du deuxieme bot, optionnel>
+TELEGRAM_ERROR_CHAT_ID=<chat id ou les erreurs vont>
+```
+
+Quand les deux sont set, `notify.install_error_handler()` (appelé tout en haut de `main()` avant tout autre code susceptible d'échouer) attache un `logging.Handler` sur le root logger. Tout `logger.error(...)` ou `logger.exception(...)` n'importe où dans `live.py`, `polymarket.py`, `live_helpers/*` est automatiquement envoyé à ce bot. Pas besoin d'ajouter `notify.send_error()` manuellement à chaque site d'erreur — Python le fait.
+
+**Filtrage** : niveau ERROR par défaut. Les `logger.warning(...)` (retries Bitstamp, retries `find_btc_15m_market`, etc.) restent dans stdout. Si un retry échoue après son budget et propage, l'`except` qui l'attrape log à ERROR et le bot fire.
+
+**Recursion safety** : si l'envoi à l'error bot lui-même échoue (Telegram down, mauvais token), la trace est imprimée sur stderr, **pas** rejouée dans le logger (pour éviter une boucle infinie).
+
+**Ping vivant** : `install_error_handler()` envoie un "🟢 Error bot online" au démarrage si configuré. Si le container crash et redémarre, l'utilisateur voit ce ping plusieurs fois — c'est le signal qu'un crash s'est produit hors du périmètre du logger (segfault, OOM, etc.).
+
+**Endpoints couverts (audit)** :
+
+| Site | Niveau actuel | Va au bot ? |
+|---|---|---|
+| `live.py` `except Exception as e: logging.exception("Cycle failed: %s", e)` | ERROR | ✓ |
+| `live.py` PolymarketClient init failure (RuntimeError ou autre) | ERROR (logging.error / .exception avant `sys.exit`) | ✓ |
+| `live.py` `place_real_bet` — `get_usdc_balance` / `find_btc_15m_market` / `place_fak_order` exceptions | ERROR (logging.exception) | ✓ |
+| `polymarket.py` `redeem()` exception + on-chain revert + bad condition_id | ERROR (logger.exception / logger.error) | ✓ |
+| `polymarket.py` `place_fak_order` HTTP failure après retry | ERROR (logger.error) | ✓ |
+| `polymarket.py` `read_settlement` transient | WARNING (caller retries) | non |
+| `polymarket.py` `find_btc_15m_market` transient retry | WARNING | non |
+| `live.py` "Market not found" | WARNING (déjà notifié via send_bet_placed status=skipped_market_not_found) | non |
+| `notify.py` `_send_raw` Telegram échec | WARNING | non (éviter récursion) |
+
 ## Telegram — nouveaux événements
 
 `notify.py` ajoute trois fonctions :
@@ -400,7 +442,7 @@ Pas de catch-up sur les signaux ratés : si le daemon était down pendant des fr
 À exécuter sur la VPS, dans cet ordre :
 
 1. **Module load** :
-   `cd backtest/modele_updown/live && python -c "from polymarket import PolymarketClient; PolymarketClient.from_env()"`
+   `cd backtest/modele_updown/15min/live && python -c "from polymarket import PolymarketClient; PolymarketClient.from_env()"`
    Doit instancier, lire les balances, et logger `wallet_eoa=... proxy=... usdc=... matic=...`.
 
 2. **Market discovery smoke** :

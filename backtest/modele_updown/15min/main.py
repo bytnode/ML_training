@@ -10,7 +10,7 @@ team and keep only **coherent** bets :
     both bet                      -> CANCEL (one says UP, the other DOWN)
 
 Working-directory contract :
-    cd backtest/modele_updown
+    cd backtest/modele_updown/15min
     python main.py
 """
 from __future__ import annotations
@@ -35,10 +35,12 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-# 15min/ contains modele_up and modele_down. The directory name starts with a
-# digit so we can't write `from 15min.modele_up import ...` directly -- inject
-# 15min/ into sys.path and import the packages as top-level instead.
-_15MIN_DIR = str(Path(__file__).resolve().parent / "15min")
+# main.py lives at backtest/modele_updown/15min/main.py — its parent dir IS the
+# 15min/ folder. Inject parent on sys.path so the sibling packages modele_up /
+# modele_down can be imported as top-level (their directory names start with
+# letters; only their parent `15min/` starts with a digit and would block dotted
+# imports if we kept them nested).
+_15MIN_DIR = str(Path(__file__).resolve().parent)
 if _15MIN_DIR not in sys.path:
     sys.path.insert(0, _15MIN_DIR)
 
@@ -50,7 +52,7 @@ LOGS_DIR = ROOT / "logs"
 TEAM_BETS_CSV = LOGS_DIR / "team_bets.csv"
 TEAM_RUNS_CSV = LOGS_DIR / "team_runs.csv"
 
-TEAM_TEST_DAYS = 365
+TEAM_TEST_DAYS = 1
 DAY_MS = 24 * 3600 * 1000
 
 

@@ -1,25 +1,46 @@
-"""Team paper-trading on real Bitstamp feed (no orders placed).
+"""Team trading daemon on the real Bitstamp feed.
+
+Two modes, switched via the LIVE_MODE env var in .env :
+
+  LIVE_MODE=false (or absent)  -> paper trading. No Polymarket calls. No deps on
+                                  py-clob-client / web3 / eth-account. This is
+                                  the default and was the original behavior.
+
+  LIVE_MODE=true               -> real-money mode. The same model/decision flow
+                                  runs, AND every UP/DOWN team decision triggers
+                                  a real FAK BUY on the matching Polymarket
+                                  15min market. Winning bets are auto-redeemed
+                                  on-chain immediately after resolution. Pending
+                                  bets are reconciled at startup and at the top
+                                  of every cycle. Requires Polymarket env vars.
 
 Every 15min UTC boundary:
-  1. Resolve the prediction made last cycle (the bar that just closed).
+  0. (LIVE_MODE=true only) Reconcile any pending real bets in bets.csv
+     (Polymarket first, Bitstamp fallback after 1 cycle, stuck after 6).
+  1. Resolve the paper prediction made last cycle.
   2. Fetch fresh OHLCV (15m + 5m + 30m + 1h).
-  3. Build features for the bar that just closed (= modele_up + modele_down).
+  3. Build features for the bar that just closed.
   4. Predict next bar's direction with both models.
-  5. Apply team coherence rule (same as main.py):
-        up fires + down abstains  -> bet UP
-        down fires + up abstains  -> bet DOWN
-        both fire                 -> CANCEL  (very rare per main.py analysis)
-        both abstain              -> PASS
+  5. Apply team coherence rule (UP / DOWN / PASS / CANCEL).
   6. Log + display Rich panel.
+  7. (LIVE_MODE=true only) If team is UP or DOWN, place a real FAK BUY on
+     Polymarket and append one row to bets.csv.
 
-cd backtest/modele_updown && python live.py
+CLI:
+  python live.py                # mode from LIVE_MODE in .env
+  python live.py --dry-run      # if LIVE_MODE=true: skip the POST /order step
+
+cd backtest/modele_updown/15min/live && python live.py
 """
 from __future__ import annotations
 
+import argparse
 import json
 import logging
+import os
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -44,14 +65,16 @@ from live_helpers import features_up as feat_up_mod
 from live_helpers import features_down as feat_dn_mod
 from live_helpers import notify
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent       # backtest/modele_updown/15min/live/
+PKG_ROOT = ROOT.parent                       # backtest/modele_updown/15min/  (sibling of modele_up + modele_down)
 LOGS_DIR = ROOT / "logs"
 LIVE_CSV = LOGS_DIR / "live_predictions.csv"
+BETS_CSV = LOGS_DIR / "bets.csv"
 
-UP_MODEL_PATH = ROOT / "15min" / "modele_up" / "btc_updown_model.json"
-UP_SIDECAR    = ROOT / "15min" / "modele_up" / "btc_updown_model.thresholds.json"
-DN_MODEL_PATH = ROOT / "15min" / "modele_down" / "btc_updown_model.json"
-DN_SIDECAR    = ROOT / "15min" / "modele_down" / "btc_updown_model.thresholds.json"
+UP_MODEL_PATH = PKG_ROOT / "modele_up" / "btc_updown_model.json"
+UP_SIDECAR    = PKG_ROOT / "modele_up" / "btc_updown_model.thresholds.json"
+DN_MODEL_PATH = PKG_ROOT / "modele_down" / "btc_updown_model.json"
+DN_SIDECAR    = PKG_ROOT / "modele_down" / "btc_updown_model.thresholds.json"
 
 PAIR = "btcusd"
 WARMUP_15M = 3200   # >= 2880 (volume_rel_30d) + margin
@@ -62,6 +85,34 @@ WARMUP_1H  = 200
 FRESHNESS_RETRY_MAX = 12
 FRESHNESS_RETRY_DELAY_S = 1
 INTERVAL_15M_MS = 15 * 60 * 1000
+
+# Defaults (env vars override; see polymarket.py.from_env).
+DEFAULT_BET_FRACTION = 0.10
+DEFAULT_BET_MIN_USDC = 2.50
+DEFAULT_BET_MAX_FRACTION = 0.95
+SETTLEMENT_STUCK_AFTER_CYCLES = 6   # 6 * 15min = 90min past close before we mark "stuck"
+MATIC_LOW_THRESHOLD = 0.5
+
+# Schema for bets.csv. Centralized so the writer + the catch-up logic agree.
+BETS_COLUMNS = [
+    "bet_id", "cycle_at",
+    "target_open_ms", "target_close_ms",
+    "direction", "confidence",
+    "polymarket_slug", "polymarket_condition_id", "polymarket_token_id",
+    "bet_size_usdc", "polymarket_order_id", "order_status",
+    "fill_price_avg", "shares_filled", "usdc_spent", "fee_usdc",
+    "outcome", "outcome_source", "outcome_resolved_at_iso",
+    "realized_pnl_usdc", "redeem_tx_hash",
+    "wallet_usdc_pre", "wallet_usdc_post",
+]
+
+
+def _parse_live_mode(raw: str | None) -> bool:
+    """Tolerant parse: 'true' / 'True' / '1' / 'yes' -> True; everything else -> False.
+    Absent or unparseable defaults to False (paper mode = safer default)."""
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("true", "1", "yes", "y", "on")
 
 
 # ============================================================
@@ -301,22 +352,398 @@ def render_cycle(cycle_n: int, just_closed_ts: int, resolution: dict | None,
 
 
 # ============================================================
+#  bets.csv helpers (only used when LIVE_MODE=true)
+# ============================================================
+def _append_bet_row(row: dict) -> None:
+    """Append one row to bets.csv with the canonical column order."""
+    LOGS_DIR.mkdir(exist_ok=True)
+    full_row = {k: row.get(k) for k in BETS_COLUMNS}
+    df_row = pd.DataFrame([full_row], columns=BETS_COLUMNS)
+    write_header = not BETS_CSV.exists()
+    df_row.to_csv(BETS_CSV, mode="a", header=write_header, index=False)
+
+
+def _load_bets() -> pd.DataFrame:
+    """Read bets.csv. Returns empty DataFrame with the right schema if missing."""
+    if not BETS_CSV.exists():
+        return pd.DataFrame(columns=BETS_COLUMNS)
+    return pd.read_csv(BETS_CSV)
+
+
+def _save_bets(df: pd.DataFrame) -> None:
+    """Overwrite bets.csv with the given frame (after in-place outcome updates)."""
+    LOGS_DIR.mkdir(exist_ok=True)
+    # Keep column order canonical even if updates added/reordered things.
+    df = df.reindex(columns=BETS_COLUMNS)
+    df.to_csv(BETS_CSV, index=False)
+
+
+def _running_pnl_stats(df: pd.DataFrame) -> tuple[int, float]:
+    """Count + PnL sum of all resolved (non-pending, non-stuck) real bets."""
+    resolved_mask = df["outcome"].isin(["win", "loss", "bitstamp_win", "bitstamp_loss"])
+    sub = df[resolved_mask]
+    if sub.empty:
+        return 0, 0.0
+    return int(len(sub)), float(sub["realized_pnl_usdc"].sum())
+
+
+# ============================================================
+#  Pending-bet reconciliation
+# ============================================================
+def resolve_pending_bets(client, buf_15m: list[list], stats: dict) -> list[dict]:
+    """For every row in bets.csv with outcome='pending' whose window has closed,
+    try to determine the outcome (Polymarket -> Bitstamp fallback -> stuck).
+
+    Returns a list of "newly resolved" dicts (for Telegram + Rich), one per row
+    updated this cycle. Does NOT call Telegram itself - the caller does, so the
+    main loop keeps a single notify call site.
+
+    Side effects:
+        - bets.csv is rewritten in place if any row changed.
+        - Winning bets trigger client.redeem(condition_id) immediately and
+          redeem_tx_hash is recorded on the row.
+    """
+    if client is None:
+        return []
+    df = _load_bets()
+    if df.empty:
+        return []
+    if "outcome" not in df.columns:
+        return []
+
+    now_ms = int(time.time() * 1000)
+    pending_mask = (df["outcome"] == "pending") & (df["target_close_ms"].astype("int64") <= now_ms)
+    if not pending_mask.any():
+        return []
+
+    newly_resolved: list[dict] = []
+    changed = False
+
+    for idx in df.index[pending_mask]:
+        row = df.loc[idx]
+        slug = str(row["polymarket_slug"])
+        target_close_ms = int(row["target_close_ms"])
+        cycles_since_close = (now_ms - target_close_ms) // INTERVAL_15M_MS
+        direction = str(row["direction"])
+        condition_id = str(row["polymarket_condition_id"])
+
+        # 1. Try Polymarket first.
+        settlement = client.read_settlement(slug)
+        if settlement is not None and settlement.get("resolved"):
+            winner = settlement["winning_outcome"]
+            outcome = "win" if winner == direction else "loss"
+            source = "polymarket"
+            redeem_tx = client.redeem(condition_id) if outcome == "win" else None
+            _write_outcome(df, idx, outcome, source, redeem_tx)
+            newly_resolved.append(_resolution_event(df.loc[idx], stats, df))
+            changed = True
+            continue
+
+        # 2. Polymarket not resolved yet. Fall back to Bitstamp if at least one
+        #    full cycle has passed since close.
+        if cycles_since_close >= 1:
+            target_open_ms = int(row["target_open_ms"])
+            target_bar = find_bar(buf_15m, target_open_ms)
+            if target_bar is not None:
+                o, c = float(target_bar[1]), float(target_bar[4])
+                if c > o:
+                    actual = "UP"
+                elif c < o:
+                    actual = "DOWN"
+                else:
+                    # Polymarket convention: '>=' rounds to "Up" on a flat tick.
+                    actual = "UP"
+                outcome = "bitstamp_win" if actual == direction else "bitstamp_loss"
+                source = "bitstamp_fallback"
+                # We still try redeem in case Polymarket later confirms the same.
+                redeem_tx = client.redeem(condition_id) if outcome == "bitstamp_win" else None
+                _write_outcome(df, idx, outcome, source, redeem_tx)
+                newly_resolved.append(_resolution_event(df.loc[idx], stats, df))
+                changed = True
+                continue
+
+        # 3. Still nothing. If too many cycles have passed, mark stuck.
+        if cycles_since_close > SETTLEMENT_STUCK_AFTER_CYCLES:
+            df.at[idx, "outcome"] = "stuck"
+            df.at[idx, "outcome_resolved_at_iso"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            changed = True
+            newly_resolved.append({
+                "_stuck": True,
+                "slug": slug,
+                "target_close_iso": pd.Timestamp(target_close_ms, unit="ms", tz="UTC").strftime("%Y-%m-%d %H:%M UTC"),
+                "cycles_pending": int(cycles_since_close),
+            })
+
+    if changed:
+        _save_bets(df)
+    return newly_resolved
+
+
+def _write_outcome(df: pd.DataFrame, idx, outcome: str, source: str,
+                    redeem_tx_hash: str | None) -> None:
+    """Update one row of bets.csv in place: outcome + source + resolved_at + PnL + redeem_tx."""
+    row = df.loc[idx]
+    is_win = outcome.endswith("win")
+    shares = float(row.get("shares_filled") or 0.0)
+    spent = float(row.get("usdc_spent") or 0.0)
+    if is_win:
+        # On a binary, each winning share pays $1; pnl = shares - what we spent.
+        pnl = shares - spent
+    else:
+        pnl = -spent
+    df.at[idx, "outcome"] = outcome
+    df.at[idx, "outcome_source"] = source
+    df.at[idx, "outcome_resolved_at_iso"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    df.at[idx, "realized_pnl_usdc"] = pnl
+    if redeem_tx_hash is not None:
+        df.at[idx, "redeem_tx_hash"] = redeem_tx_hash
+
+
+def _resolution_event(row: pd.Series, stats: dict, df_after_write: pd.DataFrame) -> dict:
+    """Build the dict the main loop hands to notify.send_bet_resolved_real."""
+    running_bets, running_pnl = _running_pnl_stats(df_after_write)
+    return {
+        "_stuck": False,
+        "direction": str(row["direction"]),
+        "outcome": str(row["outcome"]),
+        "source": str(row["outcome_source"]),
+        "realized_pnl_usdc": float(row["realized_pnl_usdc"]) if pd.notna(row["realized_pnl_usdc"]) else None,
+        "fill_price": float(row["fill_price_avg"]) if pd.notna(row["fill_price_avg"]) else None,
+        "target_close_iso": pd.Timestamp(int(row["target_close_ms"]), unit="ms", tz="UTC").strftime("%Y-%m-%d %H:%M UTC"),
+        "running_bets": running_bets,
+        "running_pnl": running_pnl,
+    }
+
+
+# ============================================================
+#  Place a real bet (LIVE_MODE=true)
+# ============================================================
+def place_real_bet(client, team: str, p_up: float, p_dn: float,
+                    target_open_ms: int, dry_run: bool) -> dict:
+    """Place a real Polymarket FAK BUY for this cycle's UP/DOWN signal.
+    Appends one row to bets.csv. Returns the row that was written (for the
+    cycle's Telegram message).
+
+    `client` must be non-None and ready. Caller already checked LIVE_MODE.
+    """
+    cycle_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    target_close_ms = target_open_ms + INTERVAL_15M_MS
+    window_start_unix_s = target_open_ms // 1000
+    confidence = p_up if team == "UP" else p_dn
+
+    bet_fraction = float(os.environ.get("BET_FRACTION", DEFAULT_BET_FRACTION))
+    bet_min = float(os.environ.get("BET_MIN_USDC", DEFAULT_BET_MIN_USDC))
+    bet_max_frac = DEFAULT_BET_MAX_FRACTION
+
+    # 1. Read balance + size.
+    try:
+        usdc_pre = client.get_usdc_balance()
+    except Exception as e:
+        logging.exception("get_usdc_balance failed: %s", e)
+        usdc_pre = 0.0
+    bet_usdc = round(usdc_pre * bet_fraction, 2)
+
+    # Base row written regardless of outcome (so we can audit skips too).
+    base = {
+        "bet_id": str(uuid.uuid4()),
+        "cycle_at": cycle_at,
+        "target_open_ms": int(target_open_ms),
+        "target_close_ms": int(target_close_ms),
+        "direction": team,
+        "confidence": round(float(confidence), 6),
+        "polymarket_slug": f"btc-updown-15m-{window_start_unix_s}",
+        "polymarket_condition_id": None,
+        "polymarket_token_id": None,
+        "bet_size_usdc": bet_usdc,
+        "polymarket_order_id": None,
+        "order_status": None,
+        "fill_price_avg": None,
+        "shares_filled": 0.0,
+        "usdc_spent": 0.0,
+        "fee_usdc": None,
+        "outcome": "pending",
+        "outcome_source": None,
+        "outcome_resolved_at_iso": None,
+        "realized_pnl_usdc": None,
+        "redeem_tx_hash": None,
+        "wallet_usdc_pre": usdc_pre,
+        "wallet_usdc_post": usdc_pre,
+    }
+
+    if bet_usdc < bet_min:
+        base["order_status"] = "skipped_balance_low"
+        # No bet placed -> not pending, and we don't need to wait for resolution.
+        base["outcome"] = "skipped"
+        _append_bet_row(base)
+        return base
+    if bet_usdc > usdc_pre * bet_max_frac:
+        # Sanity guard - should never fire because bet_fraction is way below max_frac.
+        base["order_status"] = "skipped_sizing_anomaly"
+        base["outcome"] = "skipped"
+        _append_bet_row(base)
+        return base
+
+    # 2. Look up the Polymarket market.
+    try:
+        from polymarket import MarketNotFoundError
+        market = client.find_btc_15m_market(window_start_unix_s)
+    except MarketNotFoundError as e:
+        logging.warning("Market not found for window_start=%s: %s", window_start_unix_s, e)
+        base["order_status"] = "skipped_market_not_found"
+        base["outcome"] = "skipped"
+        _append_bet_row(base)
+        return base
+    except Exception as e:
+        logging.exception("find_btc_15m_market failed: %s", e)
+        base["order_status"] = "failed"
+        base["outcome"] = "skipped"
+        _append_bet_row(base)
+        return base
+
+    token_id = market["up_token_id"] if team == "UP" else market["down_token_id"]
+    base["polymarket_condition_id"] = market["condition_id"]
+    base["polymarket_token_id"] = token_id
+
+    # 3. Place (or simulate) the order.
+    if dry_run:
+        base["order_status"] = "dry_run"
+        base["outcome"] = "skipped"   # never gets reconciled
+        _append_bet_row(base)
+        logging.info("DRY-RUN order: token=%s usdc=%.2f team=%s", token_id, bet_usdc, team)
+        return base
+
+    try:
+        result = client.place_fak_order(token_id, bet_usdc)
+    except Exception as e:
+        logging.exception("place_fak_order failed: %s", e)
+        base["order_status"] = "failed"
+        base["outcome"] = "skipped"
+        _append_bet_row(base)
+        return base
+
+    base["order_status"] = result["status"]
+    base["polymarket_order_id"] = result.get("order_id")
+    base["fill_price_avg"] = result.get("fill_price_avg")
+    base["shares_filled"] = float(result.get("shares_filled") or 0.0)
+    base["usdc_spent"] = float(result.get("usdc_spent") or 0.0)
+    base["fee_usdc"] = result.get("fee_usdc")
+
+    if result["status"] == "filled":
+        # Read balance again for audit.
+        try:
+            base["wallet_usdc_post"] = client.get_usdc_balance()
+        except Exception:
+            pass
+        # outcome stays "pending" - we'll resolve at the next cycle.
+    elif result["status"] == "rejected":
+        # 0 shares filled -> there's no real bet. Mark loss = 0 PnL.
+        base["outcome"] = "loss"
+        base["outcome_source"] = "rejected"
+        base["outcome_resolved_at_iso"] = cycle_at
+        base["realized_pnl_usdc"] = 0.0
+    elif result["status"] == "failed":
+        base["outcome"] = "skipped"
+    base["error_msg"] = result.get("error_msg")  # ignored by writer (not in BETS_COLUMNS)
+
+    _append_bet_row(base)
+    return base
+
+
+def _emit_resolution_telegrams(events: list[dict]) -> None:
+    """Send one Telegram message per newly-resolved (or newly-stuck) bet."""
+    for ev in events:
+        if ev.get("_stuck"):
+            notify.send_stuck(
+                slug=ev["slug"],
+                target_close_iso=ev["target_close_iso"],
+                cycles_pending=ev["cycles_pending"],
+            )
+        else:
+            notify.send_bet_resolved_real(
+                direction=ev["direction"],
+                outcome=ev["outcome"],
+                source=ev["source"],
+                realized_pnl_usdc=ev["realized_pnl_usdc"],
+                fill_price=ev["fill_price"],
+                target_close_iso=ev["target_close_iso"],
+                running_bets=ev["running_bets"],
+                running_pnl=ev["running_pnl"],
+            )
+
+
+# ============================================================
 #  Main loop
 # ============================================================
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    console.print(Panel(Text("Starting LIVE TEAM (paper trading, no orders)\n"
-                              "Press Ctrl+C to stop.",
-                              style="bold cyan"),
-                          border_style="cyan"))
 
-    # Load models + sidecars once
+    # Wire the dedicated error-bot BEFORE anything else can fail. Errors raised
+    # while we're still bootstrapping (model load, env parse, polymarket creds)
+    # will still flow to the error bot if it's configured.
+    notify.install_error_handler()
+
+    # --- CLI + env ---
+    parser = argparse.ArgumentParser(description="LIVE TEAM modele_updown daemon")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Only honored if LIVE_MODE=true. Builds + signs the order but "
+                             "skips the POST /order. Writes a 'dry_run' row to bets.csv.")
+    args = parser.parse_args()
+
+    live_mode = _parse_live_mode(os.environ.get("LIVE_MODE"))
+    dry_run = bool(args.dry_run)
+    logging.info("LIVE_MODE=%s  dry_run=%s", live_mode, dry_run)
+
+    # --- Bootstrap Polymarket client only when needed ---
+    polymarket_client = None
+    if live_mode:
+        # Lazy import: paper-mode users don't need py-clob-client / web3 installed.
+        from polymarket import PolymarketClient
+        try:
+            polymarket_client = PolymarketClient.from_env()
+        except RuntimeError as e:
+            # Missing env vars -> hard fail. We refuse to fall back to paper silently
+            # because the user explicitly set LIVE_MODE=true.
+            # logging.error first so the dedicated error bot fires, THEN print + exit.
+            logging.error("LIVE_MODE=true but config is incomplete: %s", e)
+            console.print(f"[bold red]LIVE_MODE=true but config is incomplete:[/bold red]\n{e}")
+            sys.exit(2)
+        except Exception as e:
+            logging.exception("PolymarketClient.from_env() unexpectedly failed: %s", e)
+            console.print(f"[bold red]Polymarket client init failed:[/bold red] {e}")
+            sys.exit(3)
+        usdc_balance_boot = polymarket_client.get_usdc_balance()
+        matic_balance_boot = polymarket_client.get_matic_balance()
+        console.print(f"[dim]Polymarket client OK. usdc={usdc_balance_boot:.2f} matic={matic_balance_boot:.4f}[/dim]")
+        if matic_balance_boot < MATIC_LOW_THRESHOLD:
+            notify.send_low_matic(matic_balance_boot, MATIC_LOW_THRESHOLD)
+    else:
+        usdc_balance_boot = None
+        matic_balance_boot = None
+
+    banner_text = (f"Starting LIVE TEAM (LIVE_MODE={'true' if live_mode else 'false'}"
+                    f"{', DRY-RUN' if dry_run else ''})\n"
+                    f"Press Ctrl+C to stop.")
+    console.print(Panel(Text(banner_text, style="bold cyan"), border_style="cyan"))
+
+    # --- Load models + sidecars ---
     model_up = _load_model(UP_MODEL_PATH)
     sidecar_up = _load_sidecar(UP_SIDECAR)
     model_dn = _load_model(DN_MODEL_PATH)
     sidecar_dn = _load_sidecar(DN_SIDECAR)
     console.print("[dim]Models + sidecars loaded.[/dim]")
-    notify.send_startup()
+    notify.send_startup(live_mode=live_mode,
+                         usdc_balance=usdc_balance_boot,
+                         matic_balance=matic_balance_boot)
+
+    # --- Startup catch-up on stale pending bets ---
+    # We don't have a 15m buffer yet, so the Bitstamp fallback won't fire here.
+    # Polymarket settlement check still runs - typically catches anything older
+    # than ~5 minutes. Anything still pending is reconciled on the next cycle.
+    if polymarket_client is not None:
+        boot_resolved = resolve_pending_bets(polymarket_client, buf_15m=[], stats={})
+        if boot_resolved:
+            logging.info("startup catch-up resolved %d pending bet(s)", len(boot_resolved))
+            _emit_resolution_telegrams(boot_resolved)
 
     pending: dict | None = None
     stats = {"cycles": 0, "bets": 0, "correct": 0, "pass": 0, "cancel": 0}
@@ -337,6 +764,13 @@ def main():
 
             # The bar that JUST CLOSED has open_time = next_boundary - 15min
             just_closed_open = next_boundary_ms - INTERVAL_15M_MS
+
+            # === 0. Resolve pending REAL bets (LIVE_MODE=true only) ===
+            # Runs before paper resolution so the Telegram order is:
+            #   real-bet result(s) -> paper resolution -> new prediction -> new real bet (if any).
+            if polymarket_client is not None:
+                resolved_events = resolve_pending_bets(polymarket_client, buf_15m, stats)
+                _emit_resolution_telegrams(resolved_events)
 
             # === 1. Resolve previous cycle ===
             resolution = None
@@ -408,6 +842,30 @@ def main():
                                              else (0 if resolution["correct"] is False else None))),
             }
             append_live_log(row)
+
+            # === 4.5. Place real bet (LIVE_MODE=true only) ===
+            # After live_predictions.csv is written so the paper log always has the
+            # decision for this cycle, regardless of order success.
+            bet_row = None
+            if polymarket_client is not None and team in ("UP", "DOWN"):
+                bet_row = place_real_bet(
+                    polymarket_client, team, p_up, p_dn,
+                    target_open_ms=next_boundary_ms, dry_run=dry_run,
+                )
+                target_open_iso = pd.Timestamp(int(bet_row["target_open_ms"]), unit="ms", tz="UTC").strftime("%H:%M")
+                target_close_iso = pd.Timestamp(int(bet_row["target_close_ms"]), unit="ms", tz="UTC").strftime("%H:%M UTC")
+                notify.send_bet_placed(
+                    direction=str(bet_row["direction"]),
+                    usdc_amount=float(bet_row["bet_size_usdc"]),
+                    fill_price=bet_row.get("fill_price_avg"),
+                    confidence=float(bet_row["confidence"]),
+                    target_open_iso=target_open_iso,
+                    target_close_iso=target_close_iso,
+                    order_id=bet_row.get("polymarket_order_id"),
+                    status=str(bet_row["order_status"]) if bet_row.get("order_status") else "unknown",
+                    shares_filled=float(bet_row["shares_filled"]) if bet_row.get("shares_filled") else None,
+                    error_msg=str(bet_row.get("error_msg") or ""),
+                )
 
             # === 5. Render ===
             cycle_n = stats["cycles"] + 1
