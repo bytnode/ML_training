@@ -4,14 +4,14 @@
 
 # --- Source de données ---
 SYMBOL = "btcusd"
-INTERVAL = "15m"
+INTERVAL = "30m"
 DAYS_BACK = 5000
-DB_PATH = "db/btc_multi_tf_15m.parquet"  # CSV 15m lu par features.py + train.py
+DB_PATH = "DB/btc_multi_tf_30m.parquet"
 
 # --- Higher timeframes ajoutés à chaque ligne du dataset (no-lookahead via
 # last_closed_index : OHLCV de la dernière bougie closed avant le timestamp
-# de décision T = times[i] + 15m).
-MTF_INTERVALS = ["30m", "1h", "4h", "1d"]
+# de décision T = times[i] + 30m).
+MTF_INTERVALS = ["1h", "4h", "1d"]
 
 INTERVAL_MS = {
     "15m": 15 * 60 * 1000,
@@ -22,10 +22,10 @@ INTERVAL_MS = {
 }
 
 # --- Extraction des features ---
-WARMUP = 500            # bars 15m ignorées en début (warmup ATR long)
+WARMUP = 500            # bars 30m ignorées en début (warmup ATR long)
 
 # --- Volatility state (seul calcul dérivé en plus des colonnes DB) ---
-# ratio = atr_15m / rolling_mean(atr_15m, ATR_LONG_PERIOD)
+# ratio = atr_30m / rolling_mean(atr_30m, ATR_LONG_PERIOD)
 # bucket : 0 = low (< VOLATILITY_LOW), 1 = mid, 2 = high (> VOLATILITY_HIGH)
 ATR_LONG_PERIOD = 100
 VOLATILITY_HIGH = 1.5
