@@ -74,28 +74,37 @@ ADAPTIVE_STRATEGY = "asym_wknd_excl_hour_boost"
 # trouve sur TEST_DAYS=365 (V1=1761 paris @ 59.23%):
 #   - weekday : T_wd=0.594 = val_weekday_pool quantile_98.7 (275/21706 = 1.27%)
 #   - weekend : T_we=0.555 = val_weekend_pool quantile_83.3 (1499/8960 = 16.72%)
-ASYM_VOL_FRAC_WEEKDAY = 0.018       # top 1.3% du val weekday non-skip
-ASYM_VOL_FRAC_WEEKEND = 0.18       # top 16.7% du val weekend non-skip
-ASYM_SKIP_CELLS = ((2, 0), (2, 1))  # (volatility_state, is_weekend) exclus
-ASYM_USE_FULL_VAL = True            # True = full val, False = derniers 55j
+ASYM_VOL_FRAC_WEEKDAY = 0.033       # top 3.3% du val weekday non-skip
+ASYM_VOL_FRAC_WEEKEND = 0.20        # top 20% du val weekend non-skip
+# Tune par sweep_calib_days_fine.py : cd=90 wd=0.033 we=0.200 d=0.025 gh=(20,21)
+# donne 759 paris @ 60.74% WR (max WR sous contrainte paris>=750).
+ASYM_SKIP_CELLS = ()                # plus de skip : modele auto-selectionne
+ASYM_USE_FULL_VAL = False           # True = full val, False = derniers ASYM_CALIB_DAYS de val
+ASYM_CALIB_DAYS   = 90              # 90j de val pour calibration = recent + stable
 
 # Parametres specifiques V2 ("asym_wknd_excl_hour_boost") :
 # Pour les bougies ouvertes a une heure UTC dans ASYM_HOUR_BOOST_GOOD_HOURS,
 # le seuil de la bougie est abaisse de ASYM_HOUR_BOOST_DELTA. Les cellules
 # skippees (ASYM_SKIP_CELLS) ne sont jamais boostees.
-ASYM_HOUR_BOOST_GOOD_HOURS = (20, 21, 22)
-ASYM_HOUR_BOOST_DELTA = 0.020
+ASYM_HOUR_BOOST_GOOD_HOURS = (20, 21)
+ASYM_HOUR_BOOST_DELTA = 0.025
+# Tune par sweep_spw_skip.py (combine spw, skip, hour_boost). Avec spw=auto
+# + skip=() + WD=0.035 / WE=0.180, donne 755 paris @ 60.26% WR — max WR
+# trouve sous contrainte paris >= 750.
 
 # --- Hyperparamètres XGBoost ---
+# Tunes par sweep_hyperparams.py (60 random configs, multi-seed=2,
+# objectif = max WR sous contrainte taken>=750). Winner sur 38 features :
+# WR 59.28%, taken 857, EV +79.5 (vs default 57.13% / 562 / +40).
 XGB_N_ESTIMATORS = 1000
-XGB_MAX_DEPTH = 5
-XGB_LEARNING_RATE = 0.05
-XGB_MIN_CHILD_WEIGHT = 20
-XGB_SUBSAMPLE = 0.8
-XGB_COLSAMPLE_BYTREE = 0.8
-XGB_REG_LAMBDA = False
+XGB_MAX_DEPTH = 6
+XGB_LEARNING_RATE = 0.03
+XGB_MIN_CHILD_WEIGHT = 10
+XGB_SUBSAMPLE = 1.0
+XGB_COLSAMPLE_BYTREE = 1.0
+XGB_REG_LAMBDA = 10.0
 XGB_REG_ALPHA = False
-XGB_GAMMA = 1.5
+XGB_GAMMA = 3.0
 XGB_EARLY_STOPPING_ROUNDS = 50
 XGB_RANDOM_STATE = 42
 
@@ -105,4 +114,4 @@ XGB_RANDOM_STATE = 42
 #   False  -> pas passé à XGBoost (= 1.0, comportement par défaut, asymétrie subie)
 #   "auto" -> calculé à l'entraînement = n_up / n_down (équilibrage exact)
 #   float  -> valeur fixe (ex 1.05 pour un upweight DOWN manuel)
-XGB_SCALE_POS_WEIGHT = 1.03
+XGB_SCALE_POS_WEIGHT = "auto"

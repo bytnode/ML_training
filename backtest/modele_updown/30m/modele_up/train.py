@@ -24,7 +24,7 @@ from config import (
     TRAIN_DAYS, TEST_DAYS, VAL_FRACTION,
     ADAPTIVE_STRATEGY,
     ASYM_VOL_FRAC_WEEKDAY, ASYM_VOL_FRAC_WEEKEND, ASYM_SKIP_CELLS,
-    ASYM_USE_FULL_VAL,
+    ASYM_USE_FULL_VAL, ASYM_CALIB_DAYS,
     ASYM_HOUR_BOOST_GOOD_HOURS, ASYM_HOUR_BOOST_DELTA,
     XGB_N_ESTIMATORS, XGB_MAX_DEPTH, XGB_LEARNING_RATE,
     XGB_MIN_CHILD_WEIGHT, XGB_SUBSAMPLE, XGB_COLSAMPLE_BYTREE,
@@ -202,7 +202,7 @@ def compute_thresholds_asym_wknd_excl(
     vol_frac_we: float = ASYM_VOL_FRAC_WEEKEND,
     skip_cells=ASYM_SKIP_CELLS,
     use_full_val: bool = ASYM_USE_FULL_VAL,
-    calib_days: int = 55,
+    calib_days: int = ASYM_CALIB_DAYS,
 ):
     """Calibration par quantile :
       T_axis = val_pool_quantile(1 - vol_frac_axis)

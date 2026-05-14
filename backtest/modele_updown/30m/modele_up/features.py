@@ -32,13 +32,31 @@ from config import WARMUP
 # automatiquement utilise comme feature par train.py.
 NON_FEATURE_COLS = {"timestamp_ms", "timestamp", "close", "volume"}
 
-# Features droppees apres analyse d'ablation (logs/feature_analysis.md, 2026-05-14).
-# Chaque entree a un dEV negatif clair (hors noise floor ~5 EV) :
-#   - close_ret    : dEV = -9.00, redondant avec close_ret_30m / high_ret / low_ret
-#   - macd_signal  : dEV = -7.50, r = 0.955 avec macd (quasi-doublon)
-# Le parquet n'est PAS regenere : les colonnes restent sur disque mais sont
-# masquees ici pour ne pas etre vues par train.py / analyze_features.py.
-DROPPED_FEATURES = {"close_ret", "macd_signal"}
+# Features droppees apres analyse d'ablation. Le parquet n'est PAS regenere :
+# les colonnes restent sur disque mais sont masquees ici pour ne pas etre vues
+# par train.py / analyze_features.py.
+#
+# Drops historiques (decides sur baseline 30m, 2026-05-14) :
+#   - close_ret    : dEV = -9.00 sur 30m, redondant avec close_ret_*/high_ret/low_ret
+#   - macd_signal  : dEV = -7.50 sur 30m, r = 0.955 avec macd (quasi-doublon)
+#
+# Drops batch 1 sur baseline 1h 43 feat (multi-seed 3, 2026-05-14) :
+#   - macd                  : dEV = -7.00, dWR = -1.30 pt
+#                             hypothese : periodes MACD (12/26/9) fixees en bars
+#                             ne matchent pas l'echelle de temps 1h
+#   - bb_width              : dEV = -5.00, dWR = -1.18 pt, r=0.844 avec rv_20
+#   - body_ratio_close_30m  : dEV = -6.67, dWR = -1.16 pt
+# Effet batch 1 : EV +35.50 -> +39.17 (+3.67), WR 56.37% -> 57.14%.
+#
+# Drops batch 2 sur baseline 1h 40 feat (multi-seed 3, 2026-05-14) :
+#   - obv_pressure_30m      : dEV = -8.33, dWR = -1.20 pt
+#                             gain_rank 4 (top importance) mais consistant negatif
+#   - rv_20                 : dEV = -4.17, dWR = -0.65 pt, r=0.912 redondance
+DROPPED_FEATURES = {
+    "close_ret", "macd_signal",
+    "macd", "bb_width", "body_ratio_close_30m",
+    "obv_pressure_30m", "rv_20",
+}
 
 
 def build_training_dataframe(csv_path, verbose: bool = True) -> pd.DataFrame:
