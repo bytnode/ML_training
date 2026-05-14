@@ -377,12 +377,14 @@ git -C C:\Users\fremo\Desktop\ML_agent_poly commit -m "feat(30m/modele_up): adap
 - Create: `backtest/modele_updown/30m/main.py`
 - Modify: `C:\Users\fremo\Desktop\ML_agent_poly\CLAUDE.md`
 
-- [ ] **Step 1: Copy parent `main.py` to 30m/**
+- [ ] **Step 1: Copy `15min/main.py` to `30m/main.py`**
 
 ```powershell
-Copy-Item C:\Users\fremo\Desktop\ML_agent_poly\backtest\modele_updown\main.py `
+Copy-Item C:\Users\fremo\Desktop\ML_agent_poly\backtest\modele_updown\15min\main.py `
           C:\Users\fremo\Desktop\ML_agent_poly\backtest\modele_updown\30m\main.py
 ```
+
+(Note : récemment `main.py` et `live/` ont été déplacés sous `15min/` pour rendre la structure symétrique. Le 30m miroitera cette structure exactement.)
 
 - [ ] **Step 2: Adapter le `sys.path` trick (lignes 38-46) et le header Rich (ligne ~167)**
 
