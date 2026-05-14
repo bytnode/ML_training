@@ -52,58 +52,38 @@ de volatilité, les patches `add_*.py` : tout est identique mot pour mot.
 
 ## Composants à cloner — liste exhaustive
 
-### `30m/modele_up/` — clone intégral de `15min/modele_up/`
+> **État réel du repo (working tree)** : les patches `add_*.py`, `patch_body_signed.py`, `fetch_and_add_5m.py`, `add_tier1_features.py`, `drop_redundant_features.py`, `asymmetry_diagnostic.py` mentionnés dans les CLAUDE.md package-scoped **n'existent pas dans le repo**. Ils ont été consolidés dans `15min/modele_down/data.py` (docstring : "Ce fichier remplace l'ancienne chaîne…"). De plus, `15min/modele_up/` n'a **pas de `data.py`** : son parquet est une copie de celui de `modele_down` avec le label flippé (mécanisme documenté dans le trap section de `15min/modele_up/CLAUDE.md`).
 
-- `config.py` — substitutions de la table ci-dessus.
-- `data.py` — cold fetch + features. Affecté : `INTERVAL`, `MTF_INTERVALS`, le set
-  de TFs téléchargées de Bitstamp (passe de [5m, 15m, 30m, 1h, 4h, 1d] à
-  [15m, 30m, 1h, 4h, 1d]), la TF de contexte fin (5m → 15m), le nom du parquet
-  final.
-- `features.py` — runtime feature builder, lit le parquet. Aucune logique métier
-  ne change, juste le nom du parquet.
+### `30m/modele_up/` — clone intégral de `15min/modele_up/` (8 fichiers)
+
+- `CLAUDE.md` — adapté : substitution textuelle "15m"/"15min" → "30m" dans le texte.
+- `config.py` — substitutions de la table ci-dessus (INTERVAL, DB_PATH, MTF_INTERVALS).
+- `features.py` — runtime feature builder, lit le parquet. Aucune logique métier ne change, juste le nom du parquet.
 - `train.py` — strictement copié, lit `config.py`.
 - `predict.py` — strictement copié.
-- `api.py` — strictement copié, expose le même contrat `NAME` +
-  `evaluate_on_slice(start_ms, end_ms)`.
-- `analyse/` — strictement copié (`check_new_features.py`, `analyze_features.py`,
-  `compare_runs.py`).
-- `CLAUDE.md` — adapté : substitution textuelle "15m"/"15min" → "30m" dans le
-  texte, garde la structure exacte.
-- Les `add_*.py` patches strictement copiés :
-  `add_acceleration.py`, `add_adx.py`, `add_autocorr.py`, `add_range_expansion.py`,
-  `add_structural_pressure.py`, `add_upside_velocity.py`, `add_up_down_ratio.py`,
-  `add_downside_velocity.py`.
+- `api.py` — strictement copié, expose le même contrat `NAME` + `evaluate_on_slice(start_ms, end_ms)`. Les messages d'erreur qui mentionnent `python data.py` deviennent `python ../modele_down/data.py` (puisque modele_up n'a pas son propre `data.py`).
+- `analyse/analyze_features.py` — strictement copié.
+- `analyse/check_new_features.py` — strictement copié.
 
-### `30m/modele_down/` — clone intégral de `15min/modele_down/`
+**Modèle de remplissage du parquet de `30m/modele_up/`** : exactement comme côté 15min, après que `30m/modele_down/data.py` ait produit son parquet, on le copie dans `30m/modele_up/DB/` et on inverse le label (`df["label"] = 1 - df["label"]`). Pas de `data.py` à créer dans `30m/modele_up/`.
 
-Pipeline CSV-based (pas parquet) avec les patches en chaîne :
+### `30m/modele_down/` — clone intégral de `15min/modele_down/` (24 fichiers)
 
-- `data.py` — cold fetch + CSVs (un par TF) + SQLite. Côté 15min il fetch
-  5 TFs `[15m, 30m, 1h, 4h, 1d]` (le 5m est ajouté plus tard par
-  `fetch_and_add_5m.py`). Côté 30m, il fetch 4 TFs `[30m, 1h, 4h, 1d]` (le
-  15m sera ajouté plus tard par `fetch_and_add_15m.py`). INTERVAL passe à
-  `"30m"`, le CSV de base devient `db/btc_multi_tf_30m.csv`, et le MTF passe
-  à `[1h, 4h, 1d]`.
-- `patch_body_signed.py` — strictement copié.
-- `fetch_and_add_5m.py` → renommé en `fetch_and_add_15m.py`. Toutes les
-  occurrences `"5m"` → `"15m"` dans le code et dans les noms de colonnes
-  suffixées (`_5m` → `_15m`).
-- `add_tier1_features.py` — strictement copié, mais les colonnes MTF jointes
-  changent (passent de `[30m, 1h, 4h, 1d]` à `[1h, 4h, 1d]`).
-- `drop_redundant_features.py` — strictement copié. À auditer après le premier
-  `train.py` 30m parce que la liste de features droppées (5 dups, 6 corrélations
-  fortes, 9 weak) a été établie sur le set 15m — certaines décisions peuvent
-  différer sur 30m. **Note d'implémentation** : copier tel quel d'abord, ne pas
-  ajuster la liste avant d'avoir un premier run et un `analyze_features.py`
-  exécuté sur le parquet 30m.
-- `train.py`, `predict.py`, `api.py`, `features.py`, `config.py` — strictement
-  copiés (avec les substitutions de la table).
-- `analyse/` (les 8 fichiers d'audit `01_*` à `08_*` + `00_synthese_finale.md`) —
-  copiés tels quels. Leurs conclusions sont sur le 15m, on les garde comme
-  référence historique mais ils ne devront PAS être consultés comme vérité
-  pour le 30m tant qu'on ne les a pas re-runnés.
-- `asymmetry_diagnostic.py`, `analyze_features.py` — strictement copiés.
-- `CLAUDE.md` — adapté avec substitutions textuelles.
+- `CLAUDE.md` — adapté avec substitutions textuelles. Supprimer la section "Build pipeline — order matters" qui décrit la chaîne legacy de patches obsolètes, et la remplacer par la pipeline mono-script actuelle (`python data.py` puis `python train.py`).
+- `config.py` — substitutions de la table.
+- `data.py` — **le seul fichier du pipeline data, consolidé**. Changements :
+  - TIMEFRAMES dict : passe de `[5m, 15m, 30m, 1h, 4h, 1d]` (6 TFs) à `[15m, 30m, 1h, 4h, 1d]` (5 TFs) — on drop le 5m.
+  - Base TF dans la construction du master : `15m` → `30m`. Toutes les références à "master 15m", "5m close-aligned", etc. dans le docstring et le code sont mises à jour.
+  - Suffixes de colonnes : `_5m` → `_15m` (fine context), `_30m` disparaît (devient la base, pas de suffixe), MTF reste `[1h, 4h, 1d]`.
+  - Sortie : `DB/btc_multi_tf_30m.parquet` (au lieu de `_15m.parquet`).
+  - Le label cible passe à la prochaine bougie 30m au lieu de 15m.
+- `features.py` — strictement copié, lit le parquet 30m.
+- `train.py` — strictement copié, lit `config.py`.
+- `predict.py` — strictement copié.
+- `api.py` — strictement copié.
+- `analyse/00_synthese_finale.md` — copié tel quel (référence historique 15m).
+- `analyse/01..08_*.{py,md}` (8 paires) — copiés tels quels. Leurs conclusions sont sur le 15m, à re-runner sur 30m une fois entraîné si on veut une re-validation.
+- `analyse/analyze_features.py`, `analyse/check_new_features.py`, `analyse/compare_runs.py` — strictement copiés.
 
 ### `30m/main.py` — clone de `modele_updown/main.py`
 
@@ -136,18 +116,16 @@ garder en tête. **Ne pas pré-importer les deux dans un même processus.**
 ## Flux de données
 
 ```
-30m/modele_up/
-  python data.py        → DB/btc_multi_tf_30m.parquet (cold fetch ~3-5 min)
-  python add_*.py × 8   → enrichit le parquet avec les features patches
+30m/modele_down/
+  python data.py        → DB/btc_multi_tf.db + DB/btc_multi_tf_30m.parquet
+                          (cold fetch 5 TFs ~3-5 min, tout consolidé en un script)
   python train.py       → btc_updown_model.json + .thresholds.json
                           + logs/runs.csv + logs/test_predictions.csv
 
-30m/modele_down/
-  python data.py        → DB/btc_multi_tf.db + 5 CSVs (un par TF)
-  python patch_body_signed.py
-  python fetch_and_add_15m.py    (≡ fetch_and_add_5m.py côté 15min)
-  python add_tier1_features.py
-  python drop_redundant_features.py
+30m/modele_up/
+  (pas de data.py — on copie le parquet du frère et on inverse le label)
+  copy 30m/modele_down/DB/btc_multi_tf_30m.parquet → 30m/modele_up/DB/
+  flip label : df["label"] = 1 - df["label"]
   python train.py       → btc_updown_model.json + sidecar + logs/
 
 30m/
@@ -159,12 +137,12 @@ garder en tête. **Ne pas pré-importer les deux dans un même processus.**
 
 ## Points de friction prévus
 
-1. **Bitstamp 15m fetch dans modele_down** : aujourd'hui `fetch_and_add_5m.py`
-   ajoute 5m comme TF de contexte plus fine. Pour le 30m, ce sera
-   `fetch_and_add_15m.py` ajoutant 15m. C'est un rename mécanique de
-   variables + chaîne `"5m"` → `"15m"`. Vérifier que les colonnes suffixées
-   `_5m` deviennent bien `_15m` partout et que `add_tier1_features.py`
-   (qui consomme ces colonnes) est mis à jour en cohérence.
+1. **Substitution des suffixes de colonnes dans `data.py`** : c'est le seul
+   travail "non-trivial" du clone. Tous les `_5m` deviennent `_15m`. Toutes
+   les références à `_30m` disparaissent (le 30m est maintenant la base, pas
+   suffixé). Le set MTF passe de 4 TFs à 3 TFs (`[1h, 4h, 1d]`). Vérifier
+   que tous les sites où `"5m"`, `"15m"`, `"30m"` apparaissent comme chaînes
+   ou clés dans `TIMEFRAMES` / boucles sont bien mis à jour.
 
 2. **WARMUP** : reste à 500 bars. Sur 30m c'est 10.4 jours au lieu de 5.2 —
    toujours raisonnable pour calibrer un `ATR_LONG_PERIOD=100`. Pas de
@@ -179,11 +157,12 @@ garder en tête. **Ne pas pré-importer les deux dans un même processus.**
 4. **`logs/runs.csv` legacy columns** : les nouveaux fichiers sont vierges, pas
    de cohabitation V1/V2 à gérer. C'est plus simple que le 15min sur ce point.
 
-5. **`drop_redundant_features.py` côté modele_down** : sa liste de features à
-   dropper a été calibrée sur le set 15m. La copier telle quelle, mais marquer
-   un TODO dans le `CLAUDE.md` du paquet : "la liste de features droppées a
-   été héritée du 15m, à re-auditer après le premier `train.py` 30m via
-   `analyze_features.py`".
+5. **CLAUDE.md package-scoped legacy** : les CLAUDE.md de `15min/modele_up/`
+   et `15min/modele_down/` mentionnent des scripts (`add_*.py`,
+   `patch_body_signed.py`, `fetch_and_add_5m.py`, etc.) qui n'existent plus
+   dans le repo. Quand on copie ces CLAUDE.md vers `30m/`, on profite de
+   l'occasion pour nettoyer ces références obsolètes — sans toucher au
+   contenu du `15min/` lui-même.
 
 6. **Fichiers gitignored** : `.gitignore` racine couvre déjà `*.csv`,
    `*.parquet`, `*.db`, `btc_updown_model.json`, `btc_updown_model.thresholds.json`
@@ -207,9 +186,9 @@ Après le premier run end-to-end (data.py + train.py × 2 paquets + main.py) :
 - Pas d'optimisation des hyperparamètres XGBoost pour le 30m — on garde les
   mêmes valeurs que le 15m comme baseline, à tuner ensuite si les WR sont
   décevants.
-- Pas de re-calibration de la liste de features droppées dans
-  `drop_redundant_features.py` côté modele_down — héritée du 15m, à auditer
-  plus tard.
+- Pas de re-audit des features sur 30m via `analyse/check_new_features.py` —
+  on garde le set issu du 15m comme baseline, à auditer plus tard si les WR
+  sont décevants.
 - Pas de refactor symétrique (déplacer `modele_updown/main.py` dans
   `15min/main.py`). Le 15min reste à l'emplacement actuel, l'asymétrie est
   assumée.
