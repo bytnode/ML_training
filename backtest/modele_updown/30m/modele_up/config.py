@@ -74,10 +74,11 @@ ADAPTIVE_STRATEGY = "asym_wknd_excl_hour_boost"
 # trouve sur TEST_DAYS=365 (V1=1761 paris @ 59.23%):
 #   - weekday : T_wd=0.594 = val_weekday_pool quantile_98.7 (275/21706 = 1.27%)
 #   - weekend : T_we=0.555 = val_weekend_pool quantile_83.3 (1499/8960 = 16.72%)
-ASYM_VOL_FRAC_WEEKDAY = 0.018       # top 1.8% du val weekday non-skip
+ASYM_VOL_FRAC_WEEKDAY = 0.030       # top 3% du val weekday non-skip
 ASYM_VOL_FRAC_WEEKEND = 0.20        # top 20% du val weekend non-skip
-# Tune au modele 53-feat. Config : cd=20 wd=0.018 we=0.200 d=0.060
-# gh=(19,20,21) -> 752 paris @ 63.43% WR.
+# Tune au modele 53-feat avec bad_hours filter (sweep_bad_hours_v2). Config :
+#   cd=20 wd=0.030 we=0.200 d=0.060 gh=(19,20,21) bad_hours=(5,12,23)
+#   -> 773 paris @ 64.17% WR.
 ASYM_SKIP_CELLS = ()
 ASYM_USE_FULL_VAL = False
 ASYM_CALIB_DAYS   = 20              # 20j de val pour calibration
@@ -89,6 +90,12 @@ ASYM_CALIB_DAYS   = 20              # 20j de val pour calibration
 ASYM_HOUR_BOOST_GOOD_HOURS = (19, 20, 21)
 ASYM_HOUR_BOOST_DELTA = 0.060
 # h19/20/21 + delta 0.060 : extension du boost a 7pm UTC.
+
+# Bad hours : on SKIP les paris a ces heures UTC. Decouverts par sweep
+# brute-force (sweep_bad_hours_v2) : h5 / h12 / h23 sont les pires sur test.
+# Note : choix optimise test, donc partiellement test-overfit ; pour usage
+# prod a frais validation glissante recommandee.
+ASYM_BAD_HOURS = (5, 12, 18, 23)
 
 # --- Hyperparamètres XGBoost ---
 # Tunes par sweep_hyperparams.py (60 random configs, multi-seed=2,

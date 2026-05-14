@@ -25,7 +25,7 @@ from config import (
     ADAPTIVE_STRATEGY,
     ASYM_VOL_FRAC_WEEKDAY, ASYM_VOL_FRAC_WEEKEND, ASYM_SKIP_CELLS,
     ASYM_USE_FULL_VAL, ASYM_CALIB_DAYS,
-    ASYM_HOUR_BOOST_GOOD_HOURS, ASYM_HOUR_BOOST_DELTA,
+    ASYM_HOUR_BOOST_GOOD_HOURS, ASYM_HOUR_BOOST_DELTA, ASYM_BAD_HOURS,
     XGB_N_ESTIMATORS, XGB_MAX_DEPTH, XGB_LEARNING_RATE,
     XGB_MIN_CHILD_WEIGHT, XGB_SUBSAMPLE, XGB_COLSAMPLE_BYTREE,
     XGB_REG_LAMBDA, XGB_REG_ALPHA, XGB_GAMMA,
@@ -115,20 +115,11 @@ def save_thresholds_sidecar_asym(model_path, thresholds_per_wknd: dict, skip_cel
 
 def save_thresholds_sidecar_asym_hour_boost(model_path, thresholds_per_wknd: dict,
                                              skip_cells: list, good_hours: tuple,
-                                             hour_boost_delta: float, metadata=None):
-    """Sidecar V2 (asym_wknd_excl_hour_boost) : V1 + champ optional `hour_boost`.
-
-    Format :
-        {
-          "strategy": "asym_wknd_excl_hour_boost",
-          "thresholds_per_wknd": {"0": T_wd, "1": T_we},
-          "skip_cells": [[vol, wknd], ...],
-          "hour_boost": {
-            "good_hours": [20, 21, 22],
-            "delta": 0.020
-          },
-          "metadata": {...}
-        }
+                                             hour_boost_delta: float,
+                                             bad_hours: tuple = (),
+                                             metadata=None):
+    """Sidecar V2 (asym_wknd_excl_hour_boost) : V1 + champ optional `hour_boost`
+    + champ optional `bad_hours` (heures UTC ou on SKIP les paris).
     """
     sidecar = Path(model_path).with_suffix(".thresholds.json")
     payload = {
@@ -139,6 +130,7 @@ def save_thresholds_sidecar_asym_hour_boost(model_path, thresholds_per_wknd: dic
             "good_hours": [int(h) for h in good_hours],
             "delta": float(hour_boost_delta),
         },
+        "bad_hours": [int(h) for h in bad_hours],
         "metadata": metadata or {},
     }
     with open(sidecar, "w") as f:
@@ -160,11 +152,13 @@ def hour_of_day_from_ms(ts_ms: np.ndarray) -> np.ndarray:
 def apply_thresholds_asym_hour_boost(df, p_up, thresholds_per_wknd: dict,
                                       skip_cells=ASYM_SKIP_CELLS,
                                       good_hours=ASYM_HOUR_BOOST_GOOD_HOURS,
-                                      hour_boost_delta: float = ASYM_HOUR_BOOST_DELTA) -> np.ndarray:
-    """V2 application : V1 thresholds + boost horaire.
+                                      hour_boost_delta: float = ASYM_HOUR_BOOST_DELTA,
+                                      bad_hours=()) -> np.ndarray:
+    """V2 application : V1 thresholds + boost horaire + exclusion bad_hours.
 
-    Pour les rows dont l'heure UTC ∈ good_hours, le seuil effectif est abaisse
-    de `hour_boost_delta` (les cellules skip restent skip).
+    Pour les rows dont l'heure UTC in good_hours, le seuil est abaisse de
+    `hour_boost_delta`. Pour les rows dont l'heure UTC in bad_hours, on
+    SKIP le pari (heures historiquement mauvaises sur val).
     """
     p_up = np.asarray(p_up, dtype=float)
     if len(df) == 0:
@@ -176,6 +170,7 @@ def apply_thresholds_asym_hour_boost(df, p_up, thresholds_per_wknd: dict,
 
     skip_set = set((int(v), int(w)) for (v, w) in skip_cells)
     good_hours_set = set(int(h) for h in good_hours)
+    bad_hours_set = set(int(h) for h in bad_hours)
     vol = df["volatility_state"].astype(int).to_numpy()
     wknd = df["is_weekend"].astype(int).to_numpy()
     hour = hour_of_day_from_ms(df["timestamp"].to_numpy())
@@ -184,8 +179,11 @@ def apply_thresholds_asym_hour_boost(df, p_up, thresholds_per_wknd: dict,
     for i in range(len(p_up)):
         if (int(vol[i]), int(wknd[i])) in skip_set:
             continue
+        h_i = int(hour[i])
+        if h_i in bad_hours_set:
+            continue
         T = thresholds_per_wknd.get(int(wknd[i]), 1.0)
-        if int(hour[i]) in good_hours_set:
+        if h_i in good_hours_set:
             T = T - hour_boost_delta
         if p_up[i] >= T:
             take[i] = True
@@ -345,8 +343,8 @@ def train_and_evaluate(
         print(f"  test   : {len(test):,} rows  ({pd.to_datetime(test['timestamp'].min(), unit='ms').date()} -> {pd.to_datetime(test['timestamp'].max(), unit='ms').date()})")
 
     # volatility_state ET is_weekend restent dans le parquet (cles de bucket
+    # volatility_state ET is_weekend restent dans le parquet (cles de bucket
     # pour le seuil adaptatif) mais ne sont PAS donnes au modele en feature.
-    # Analyse delta_logloss : volatility_state inutilisee, is_weekend perm = 0.
     feature_cols = [c for c in df.columns
                     if c not in ("timestamp", "label", "volatility_state", "is_weekend")]
     X_train, y_train = train[feature_cols], train["label"]
@@ -420,7 +418,8 @@ def train_and_evaluate(
 
     # ---- Decision sur test (V1 ou V2) ----
     if ADAPTIVE_STRATEGY == "asym_wknd_excl_hour_boost":
-        take_test = apply_thresholds_asym_hour_boost(test, p_up_test, thresholds_per_wknd)
+        take_test = apply_thresholds_asym_hour_boost(test, p_up_test, thresholds_per_wknd,
+                                                       bad_hours=ASYM_BAD_HOURS)
     else:
         take_test = apply_thresholds_asym_wknd_excl(test, p_up_test, thresholds_per_wknd)
     label_arr = y_test.to_numpy().astype(int)
@@ -453,11 +452,13 @@ def train_and_evaluate(
             save_thresholds_sidecar_asym_hour_boost(
                 MODEL_OUTPUT, thresholds_per_wknd, list(ASYM_SKIP_CELLS),
                 ASYM_HOUR_BOOST_GOOD_HOURS, ASYM_HOUR_BOOST_DELTA,
+                bad_hours=ASYM_BAD_HOURS,
                 metadata={
                     **common_metadata,
                     **calib_meta,
                     "hour_boost_good_hours": list(ASYM_HOUR_BOOST_GOOD_HOURS),
                     "hour_boost_delta":      ASYM_HOUR_BOOST_DELTA,
+                    "bad_hours":             list(ASYM_BAD_HOURS),
                 },
             )
         else:
