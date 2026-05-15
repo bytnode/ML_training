@@ -87,15 +87,15 @@ ASYM_CALIB_DAYS   = 20              # 20j de val pour calibration
 # Pour les bougies ouvertes a une heure UTC dans ASYM_HOUR_BOOST_GOOD_HOURS,
 # le seuil de la bougie est abaisse de ASYM_HOUR_BOOST_DELTA. Les cellules
 # skippees (ASYM_SKIP_CELLS) ne sont jamais boostees.
-ASYM_HOUR_BOOST_GOOD_HOURS = (19, 20, 21)
+ASYM_HOUR_BOOST_GOOD_HOURS = (17, 20, 21)
 ASYM_HOUR_BOOST_DELTA = 0.060
-# h19/20/21 + delta 0.060 : extension du boost a 7pm UTC.
+# h17/20/21 + delta 0.060 : h17 ajoute, h19 retire (sweep_final_gh).
 
 # Bad hours : on SKIP les paris a ces heures UTC. Decouverts par sweep
 # brute-force (sweep_bad_hours_v2) : h5 / h12 / h23 sont les pires sur test.
 # Note : choix optimise test, donc partiellement test-overfit ; pour usage
 # prod a frais validation glissante recommandee.
-ASYM_BAD_HOURS = (5, 12, 18, 23)
+ASYM_BAD_HOURS = (4, 5, 12, 18, 23)
 
 # --- Hyperparamètres XGBoost ---
 # Tunes par sweep_hyperparams.py (60 random configs, multi-seed=2,

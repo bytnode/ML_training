@@ -14,7 +14,7 @@ from train import (
 CD_GRID = (20, 30)
 WD_GRID = (0.025, 0.030, 0.035, 0.040)
 WE_GRID = (0.20, 0.25)
-GH = (19, 20, 21)
+GH = (17, 20, 21)
 DELTA_GRID = (0.060,)
 MIN_PARIS = 750
 
@@ -28,12 +28,12 @@ def main():
     test_hours = hour_of_day_from_ms(run["test"]["timestamp"].to_numpy())
     y_test = run["y_test"]
 
-    # Combos of size 5, 6 (size 4 and below already explored)
+    # Combos of size 5
     bh_sets = []
-    for k in (5, 6):
+    for k in (5,):
         for combo in itertools.combinations(BAD_HOUR_CANDIDATES, k):
             bh_sets.append(combo)
-    print(f"Combos: {len(bh_sets)} (size 5-6)")
+    print(f"Combos: {len(bh_sets)} (size 5)")
 
     results = []
     for cd in CD_GRID:
