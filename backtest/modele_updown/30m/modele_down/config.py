@@ -38,8 +38,8 @@ VOLATILITY_LOW = 0.7
 # --- Fichiers ---
 MODEL_OUTPUT = "btc_updown_model.json"
 
-TRAIN_DAYS = 4000
-TEST_DAYS = 365
+TRAIN_DAYS = 3600
+TEST_DAYS = 366
 VAL_FRACTION = 0.1
 
 # ============================================================
@@ -68,32 +68,70 @@ VAL_FRACTION = 0.1
 ADAPTIVE_STRATEGY = "asym_wknd_excl_hour_boost"
 
 # Parametres asym (V1 + V2 partagent le meme bloc) :
-# Fraction de val non-skip a garder par axe. Valeurs initiales heritees du
-# modele_up. A retuner par audit cross-window si besoin pour DOWN.
-ASYM_VOL_FRAC_WEEKDAY = 0.025      # top 1.3% du val weekday non-skip
-ASYM_VOL_FRAC_WEEKEND = 0.1       # top 16.7% du val weekend non-skip
-ASYM_SKIP_CELLS = ((2, 0), (2, 1))  # (volatility_state, is_weekend) exclus
-ASYM_USE_FULL_VAL = True            # True = full val, False = derniers 55j
+# Fraction de val non-skip a garder par axe (= top X% du val pool).
+# Point de depart heritee du modele_up qui atteint 64.54% / 753 bets. A retuner
+# par sweep specifique DOWN (microstructure & directionalite differente).
+ASYM_VOL_FRAC_WEEKDAY = 0.100       # top 10% du val weekday non-skip
+ASYM_VOL_FRAC_WEEKEND = 0.20        # top 20% du val weekend non-skip
+ASYM_SKIP_CELLS = ()                # pas de skip cell (perd trop de volume)
+ASYM_USE_FULL_VAL = False           # False = derniers ASYM_CALIB_DAYS de val
+ASYM_CALIB_DAYS   = 180             # fenetre de calibration recente (jours)
 
 # Parametres specifiques V2 ("asym_wknd_excl_hour_boost") :
 # Pour les bougies ouvertes a une heure UTC dans ASYM_HOUR_BOOST_GOOD_HOURS,
 # le seuil de la bougie est abaisse de ASYM_HOUR_BOOST_DELTA. Les cellules
 # skippees (ASYM_SKIP_CELLS) ne sont jamais boostees.
-# Note : les heures 20-22 sont l'effet identifie pour UP (US close).
-# Pour DOWN, l'effet microstructure pourrait differer - a auditer.
-ASYM_HOUR_BOOST_GOOD_HOURS = (20, 21, 22)
-ASYM_HOUR_BOOST_DELTA = 0.020
+# Note : les heures UP (US close 19-21) pourraient etre les pires pour DOWN.
+# Point de depart copie du UP, a re-sweeper specifiquement pour DOWN.
+ASYM_HOUR_BOOST_GOOD_HOURS = (2, 9, 20, 22)
+ASYM_HOUR_BOOST_DELTA = 0.030
+
+# Bad hours : heures UTC ou on SKIP les paris (heures historiquement mauvaises
+# pour DOWN). Découvertes par sweep_extreme : h1, h8, h10, h13, h14, h17, h21.
+ASYM_BAD_HOURS = (1, 8, 13, 14, 17, 21)
+
+# Filtres d'inférence : on SKIP les paris quand une feature dépasse un cutoff.
+# Format : {feature_name: (cutoff, "<" | ">")}
+# "<" = on garde si feature < cutoff ; ">" = on garde si feature >= cutoff.
+# Découverts par analyze_mistakes.py + sweep_aggressive : volume_ratio_30m et
+# return_3 sont les meilleurs discriminateurs win/loss parmi les top P(down).
+# BASE_FILTERS sont appliqués A LA FOIS pendant la calibration du seuil ET
+# pendant l'inference. Ces filtres definissent le sous-espace de marche
+# tradable du modele (low/mid volume, momentum non extreme).
+BASE_INFERENCE_FILTERS = {
+    "volume_ratio_30m": (1.5, "<"),
+    "return_3":         (0.030, "<"),
+}
+
+# EXTRA_FILTERS sont appliqués UNIQUEMENT a l'inference (pas pendant la
+# calibration). Ils servent a affiner la selection des paris parmi ceux qui
+# passent BASE_FILTERS + le seuil. Decouverts par greedy filter sweep.
+EXTRA_INFERENCE_FILTERS = {
+    "lower_wick":       (0.003795, ">"),    # skip si bougie sans lower wick
+    "mfi_norm":         (-0.523159, ">"),   # skip oversold extreme
+    "body_ratio_avg":   (0.287662, ">"),    # skip si bougies recentes ont peu de body
+    "close_ret":        (-0.003506, ">"),   # skip si bougie courante deja tres rouge
+}
+
+# Aggrege des deux dicts pour le code legacy.
+INFERENCE_FILTERS = {**BASE_INFERENCE_FILTERS, **EXTRA_INFERENCE_FILTERS}
+
+# Calibration filter-aware : si True, applique BASE_INFERENCE_FILTERS (PAS
+# les EXTRA) au pool de val AVANT le calcul du seuil quantile.
+CALIB_USE_FILTERS = True
 
 # --- Hyperparamètres XGBoost ---
+# Point de depart : config du modele_up apres sweep (depth=6, lr=0.03, mcw=10,
+# subsample/colsample=1.0, lambda=10, gamma=3). A re-sweeper pour DOWN.
 XGB_N_ESTIMATORS = 1000
-XGB_MAX_DEPTH = 5
-XGB_LEARNING_RATE = 0.05
-XGB_MIN_CHILD_WEIGHT = 20
-XGB_SUBSAMPLE = 0.8
-XGB_COLSAMPLE_BYTREE = 0.8
-XGB_REG_LAMBDA = False
+XGB_MAX_DEPTH = 6
+XGB_LEARNING_RATE = 0.03
+XGB_MIN_CHILD_WEIGHT = 10
+XGB_SUBSAMPLE = 1.0
+XGB_COLSAMPLE_BYTREE = 1.0
+XGB_REG_LAMBDA = 10.0
 XGB_REG_ALPHA = False
-XGB_GAMMA = 1.5
+XGB_GAMMA = 3.0
 XGB_EARLY_STOPPING_ROUNDS = 50
 XGB_RANDOM_STATE = 42
 

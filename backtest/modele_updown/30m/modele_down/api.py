@@ -82,7 +82,10 @@ def _hour_from_ts_ms(ts_ms) -> int:
 
 
 def _bucket_threshold(volatility_state: int, is_weekend: int, sidecar: dict,
-                      ts_ms=None) -> float:
+                      ts_ms=None, row=None) -> float:
+    """Renvoie le seuil effectif pour la cellule (vol, wknd) eventuellement
+    boosted par hour_boost OU disqualifiee par bad_hours OU inference_filters
+    (renvoie 1.01 si skip pour garantir aucun pari)."""
     strategy = sidecar.get("strategy")
     if strategy not in ("asym_wknd_excl", "asym_wknd_excl_hour_boost"):
         raise ValueError(f"Sidecar strategy={strategy!r} non supporte. "
@@ -90,6 +93,32 @@ def _bucket_threshold(volatility_state: int, is_weekend: int, sidecar: dict,
     skip_cells = {(int(v), int(w)) for v, w in sidecar.get("skip_cells", [])}
     if (int(volatility_state), int(is_weekend)) in skip_cells:
         return 1.0
+    bad_hours = set(int(h) for h in sidecar.get("bad_hours", []))
+    if ts_ms is not None and _hour_from_ts_ms(ts_ms) in bad_hours:
+        return 1.01  # > 1.0 = jamais take
+    # Inference filters (e.g. volume_ratio_30m < 1.5 AND return_3 < 0.030)
+    inf_filters = sidecar.get("inference_filters", {}) or {}
+    if row is not None and inf_filters:
+        for col, (cutoff_str, mode) in inf_filters.items():
+            cutoff = float(cutoff_str) if not isinstance(cutoff_str, (int, float)) else cutoff_str
+            if col not in row:
+                continue
+            v = row[col]
+            if v is None:
+                continue
+            try:
+                vf = float(v)
+            except (ValueError, TypeError):
+                continue
+            import math
+            if math.isnan(vf):
+                continue
+            if mode == "<":
+                if not (vf < cutoff):
+                    return 1.01
+            elif mode == ">":
+                if not (vf >= cutoff):
+                    return 1.01
     th_map = sidecar.get("thresholds_per_wknd", {})
     T = float(th_map.get(str(int(is_weekend)), 1.0))
     if strategy == "asym_wknd_excl_hour_boost" and ts_ms is not None:
@@ -137,7 +166,7 @@ def evaluate_on_slice(start_ms: int, end_ms: int) -> pd.DataFrame:
     df["_eff_th"] = df.apply(
         lambda r: _bucket_threshold(
             int(r["volatility_state"]), int(r["is_weekend"]), sidecar,
-            ts_ms=int(r["timestamp_ms"]),
+            ts_ms=int(r["timestamp_ms"]), row=r,
         ),
         axis=1,
     )

@@ -9,6 +9,13 @@
 
 *Note layout 2026-05-14 (post-spec)*: après la rédaction initiale, `main.py` et le dossier `live/` ont été déplacés à l'intérieur de `backtest/modele_updown/15min/` pour pouvoir cohabiter avec d'autres timeframes (e.g. `5min/`, `30min/`) sans collision. Tous les chemins ci-dessous sont à lire en gardant ce préfixe en tête.
 
+> **⚠️ Correction 2026-05-20 (CLOB V2 migration).** Polymarket a migré vers **CLOB V2** le 2026-04-28. La v1 de `py-clob-client` renvoie `order_version_mismatch` sur chaque ordre en prod — morte. Découvert en testant un vrai ordre. Les corrections appliquées (le code dans `polymarket.py` fait foi, pas les snippets v1 ci-dessous) :
+> - **Library** : `py-clob-client-v2==1.0.*` (plus `py-clob-client` v1).
+> - **`signature_type=3`** (POLY_1271, "deposit wallet flow"), PAS `2`. Avec `signature_type=2` la CLOB V2 répond `maker address not allowed, please use the deposit wallet flow`. `signature_type=3 + funder=<proxy>` résout correctement vers le solde 50 pUSD.
+> - **Type d'ordre** : market FAK via `create_and_post_market_order(MarketOrderArgsV2(...))`. Plus de limit-order hand-rollé ; `amount` (USDC) borne la dépense, la CLOB V2 gère le matching.
+> - **Pas de géo-blocage** : un vrai ordre a été rempli depuis la France (1.923 shares Up pour $1.00). Le blocage géo redouté ne s'applique pas à `POST /order` ici.
+> - **Pas de minimum 5-shares strict** sur les market orders : un ordre `amount=$1` a rempli 1.923 shares.
+
 L'objectif : un mode `LIVE_MODE=true` qui place un vrai ordre USDC sur Polymarket à chaque décision `UP` ou `DOWN`, sur le marché binaire 15-min correspondant. Tout le reste (modèle, décision, log, Telegram) reste identique.
 
 Ce design réutilise l'architecture déjà éprouvée dans `docs/superpowers/specs/2026-05-08-polymarket-live-trader-design.md` (qui ciblait `modele_15m` et a été supprimée avec le reste de l'ancien `live/`), retargetée sur la team `modele_updown` et mise à jour suite à la recherche API documentée dans `backtest/docs/superpowers/research/polymarket-api-notes.md`.
@@ -24,8 +31,8 @@ Ce design réutilise l'architecture déjà éprouvée dans `docs/superpowers/spe
 | 5 | Recovery au démarrage | Catch-up : au boot, scan de `bets.csv` pour les rows `outcome=pending` dont la window est déjà fermée. Application du même cycle de résolution (Polymarket → fallback Bitstamp). |
 | 6 | Redemption des shares gagnantes | **Automatique, immédiate** : dès qu'une résolution `win` est écrite dans `bets.csv`, appel on-chain `redeemPositions(...)` la même seconde. Préserve l'exactitude du `usdc_balance` utilisé pour le sizing. |
 | 7 | Architecture | Un seul fichier `live/polymarket.py` encapsule tout (Polymarket CLOB, Gamma, Polygon RPC, redemption on-chain). Aucun autre module ne touche à ces APIs. |
-| 8 | Wallet | EOA Polygon (`POLYGON_PRIVATE_KEY` signe les ordres) + Polymarket proxy (`POLYMARKET_PROXY_ADDRESS` détient l'USDC). `signature_type=2` dans `py-clob-client`. |
-| 9 | Library Python | **`py-clob-client` v1** (v2 ne supporte pas `signature_type=2`). |
+| 8 | Wallet | EOA Polygon (`POLYGON_PRIVATE_KEY` signe les ordres) + deposit wallet Polymarket (`POLYMARKET_PROXY_ADDRESS` détient le pUSD). `signature_type=3` (POLY_1271) — voir correction 2026-05-20. |
+| 9 | Library Python | **`py-clob-client-v2==1.0.*`** (CLOB V2 ; la v1 est morte depuis le 2026-04-28). |
 | 10 | Runtime | VPS dans une région **non géo-bloquée** par Polymarket (Hetzner Helsinki / OVH Ireland / DigitalOcean US). La France est bloquée, le paper mode local reste utilisable. |
 | 11 | Telegram | Conservé. Nouvelle catégorie d'événement `bet_placed`, en plus du `bet_resolved` actuel. |
 | 12 | Hors scope v1 | Bankroll caps, circuit breakers, multi-pair, hot-reload modèle, UI web, dashboard. |
@@ -90,8 +97,7 @@ Chaque itération aux frontières UTC 15min, structure identique à `live.py` ac
      d. window_start_unix_s = (next_boundary_ms - INTERVAL_15M_MS) // 1000
         Note : la bougie qui vient de fermer ouvre la fenetre Polymarket. Le slug du marche
         Polymarket cible = btc-updown-15m-<window_start_unix_s>.
-        WARNING : verifier au smoke-test que c'est bien la convention. Si Polymarket
-        utilise window_END_unix_s, ajuster.
+        CONFIRMÉ smoke-test 2026-05-14 : convention = window_START_unix_s.
      e. market = polymarket.find_btc_15m_market(window_start_unix_s)
           404 -> bets.csv row order_status=skipped_market_not_found, Telegram, skip.
      f. token_id = market.up_token_id if team == "UP" else market.down_token_id
@@ -234,9 +240,9 @@ CHAIN_ID_POLYGON = 137
 SIGNATURE_TYPE_PROXY = 2                                              # py-clob-client constant
 ```
 
-**A vérifier au smoke test** :
-1. La convention slug : `btc-updown-15m-<window_START_unix_s>` ou `<window_END_unix_s>` ?
-2. Le balance USDC.e du proxy se met-il à jour automatiquement après `redeemPositions()` ? Si non, il faut lire pUSD aussi et faire `total = USDC.e + pUSD` pour le sizing.
+**Vérifié au smoke test 2026-05-14** :
+1. ✓ Slug = `btc-updown-15m-<window_START_unix_s>` (confirmé : `1778791500` → fenêtre 20:45-21:00 UTC).
+2. ✓ Le solde "buying power" est tenu en **pUSD** sur le proxy (pas USDC.e). Un compte funded affiche 0 USDC.e + N pUSD. `get_usdc_balance()` somme les deux pour couvrir les deux cas (deposit USDC.e en cours de wrap, ou unwrap manuel). Cible empirique : 50 pUSD sur le proxy `0x62a9...a87d`.
 
 ### Pourquoi web3 direct pour les balances
 
@@ -251,9 +257,13 @@ Plutôt que `GET /balance` côté Polymarket, on lit `USDC.balanceOf(proxy_addre
 
 Limit = `min(best_ask + slippage_bps / 10000, 0.99)`. Défaut 200 bps = 2 cents au-dessus du meilleur ask. Le tick size minimum sur Polymarket est 0.01, donc 200 bps ≈ 2 ticks. Override via `--slippage-bps <int>`.
 
-### Pourquoi `py-clob-client` v1 et pas v2
+### Library : `py-clob-client-v2` (corrigé 2026-05-20)
 
-La recherche a confirmé que `py-clob-client` v2 ne supporte pas `signature_type=2` (proxy wallet — c'est notre cas, puisque Polymarket utilise un smart-contract wallet pour le proxy). v2 ne supporte que `signature_type=0` (EOA classique) et `signature_type=3` (POLY_1271 deposit wallet). Tant qu'on garde le pattern EOA + proxy, on reste sur v1. Pin : `py-clob-client==0.21.*`.
+La recherche initiale (2026-05-14) recommandait la v1 en croyant que la v2 ne supportait pas le proxy wallet. **C'était faux** (et de toute façon obsolète) : Polymarket a migré vers CLOB V2 le 2026-04-28, la v1 ne fonctionne plus du tout en prod (`order_version_mismatch`).
+
+`py-clob-client-v2` supporte le proxy via `signature_type=3` (POLY_1271, "deposit wallet"). `signature_type=2` (Gnosis Safe) est refusé par la CLOB V2 (`maker address not allowed`). Pin : `py-clob-client-v2==1.0.*`.
+
+Le placement d'ordre en V2 se fait en un appel : `create_and_post_market_order(MarketOrderArgsV2(token_id, amount, side, order_type=FAK), order_type=FAK)`. `amount` est en USDC ; la CLOB V2 gère le matching + le slippage. Plus besoin du limit-order hand-rollé ni de la lecture du book.
 
 ## CLI
 

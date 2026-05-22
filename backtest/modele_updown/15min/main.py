@@ -46,13 +46,14 @@ if _15MIN_DIR not in sys.path:
 
 from modele_up import api as api_up
 from modele_down import api as api_down
+import detailed_log
+import full_logs
 
 ROOT = Path(__file__).resolve().parent
 LOGS_DIR = ROOT / "logs"
-TEAM_BETS_CSV = LOGS_DIR / "team_bets.csv"
 TEAM_RUNS_CSV = LOGS_DIR / "team_runs.csv"
 
-TEAM_TEST_DAYS = 1
+TEAM_TEST_DAYS = 365
 DAY_MS = 24 * 3600 * 1000
 
 
@@ -73,6 +74,20 @@ def compute_window() -> tuple[int, int]:
     common_end = int(min(up_ts.max(), down_ts.max()))
     start = common_end - TEAM_TEST_DAYS * DAY_MS
     return start, common_end
+
+
+def _taken_bets(full: pd.DataFrame, direction: str) -> pd.DataFrame:
+    """Derive the 4-column taken-bets frame (the evaluate_on_slice contract
+    shape) from a full per-bar frame returned by evaluate_full_on_slice. Lets
+    us predict once and reuse the result for both the team stats and the logs."""
+    cols = ["timestamp", "direction", "confidence", "label"]
+    if full.empty:
+        return pd.DataFrame(columns=cols)
+    taken = full[full["take"] == 1].copy()
+    if taken.empty:
+        return pd.DataFrame(columns=cols)
+    taken["direction"] = direction
+    return taken[cols].reset_index(drop=True)
 
 
 def build_team_bets(up_bets: pd.DataFrame, down_bets: pd.DataFrame) -> tuple[pd.DataFrame, int]:
@@ -115,13 +130,25 @@ def append_run(stats: dict) -> None:
 def main() -> None:
     start_ms, end_ms = compute_window()
 
-    up_bets = api_up.evaluate_on_slice(start_ms, end_ms)
-    down_bets = api_down.evaluate_on_slice(start_ms, end_ms)
+    # Full per-bar prediction frames (every bar in the window, taken or not).
+    up_full = api_up.evaluate_full_on_slice(start_ms, end_ms)
+    down_full = api_down.evaluate_full_on_slice(start_ms, end_ms)
+
+    # Taken-bets frames (the old evaluate_on_slice 4-col shape) derived from the
+    # full frames, so each model still predicts exactly once per run.
+    up_bets = _taken_bets(up_full, "up")
+    down_bets = _taken_bets(down_full, "down")
 
     team_bets, cancelled = build_team_bets(up_bets, down_bets)
 
     LOGS_DIR.mkdir(exist_ok=True)
-    team_bets.to_csv(TEAM_BETS_CSV, index=False)
+
+    # Detailed per-bar logs : team_all_bars.csv / team_skipped.csv / team_taken.csv
+    per_bar = detailed_log.build_per_bar_table(up_full, down_full)
+    log_counts = detailed_log.write_detailed_logs(per_bar, LOGS_DIR)
+
+    # Full per-bet logs : logs/full_logs/{lost,won,all}_bets.csv
+    full_counts = full_logs.write_full_logs(per_bar, api_up, api_down, LOGS_DIR)
 
     up_wr = _wr(up_bets)
     down_wr = _wr(down_bets)
@@ -146,7 +173,7 @@ def main() -> None:
     }
     append_run(stats)
 
-    _render_report(stats, team_wr, up_wr, down_wr)
+    _render_report(stats, team_wr, up_wr, down_wr, {**log_counts, **full_counts})
 
 
 def _wr_color(wr: float) -> str:
@@ -162,7 +189,8 @@ def _wr_color(wr: float) -> str:
     return "red"
 
 
-def _render_report(stats: dict, team_wr: float, up_wr: float, down_wr: float) -> None:
+def _render_report(stats: dict, team_wr: float, up_wr: float, down_wr: float,
+                   log_counts: dict) -> None:
     console = Console()
 
     header = Text.assemble(
@@ -248,13 +276,14 @@ def _render_report(stats: dict, team_wr: float, up_wr: float, down_wr: float) ->
     console.print(Panel(headline, border_style=_wr_color(team_wr), padding=(0, 2)))
 
     # --- Files written ---
-    console.print(
-        Text.assemble(
-            ("  written  ", "dim"),
-            (f"{TEAM_BETS_CSV.relative_to(ROOT)}", "white"),
-            (f"   ({stats['team_bets']} rows)", "dim"),
+    for fname, n_rows in log_counts.items():
+        console.print(
+            Text.assemble(
+                ("  written  ", "dim"),
+                (f"logs/{fname}", "white"),
+                (f"   ({n_rows} rows)", "dim"),
+            )
         )
-    )
     console.print(
         Text.assemble(
             ("  logged   ", "dim"),

@@ -27,8 +27,10 @@ from config import (
     TRAIN_DAYS, TEST_DAYS, VAL_FRACTION,
     ADAPTIVE_STRATEGY,
     ASYM_VOL_FRAC_WEEKDAY, ASYM_VOL_FRAC_WEEKEND, ASYM_SKIP_CELLS,
-    ASYM_USE_FULL_VAL,
-    ASYM_HOUR_BOOST_GOOD_HOURS, ASYM_HOUR_BOOST_DELTA,
+    ASYM_USE_FULL_VAL, ASYM_CALIB_DAYS,
+    ASYM_HOUR_BOOST_GOOD_HOURS, ASYM_HOUR_BOOST_DELTA, ASYM_BAD_HOURS,
+    INFERENCE_FILTERS, CALIB_USE_FILTERS,
+    BASE_INFERENCE_FILTERS, EXTRA_INFERENCE_FILTERS,
     XGB_N_ESTIMATORS, XGB_MAX_DEPTH, XGB_LEARNING_RATE,
     XGB_MIN_CHILD_WEIGHT, XGB_SUBSAMPLE, XGB_COLSAMPLE_BYTREE,
     XGB_REG_LAMBDA, XGB_REG_ALPHA, XGB_GAMMA,
@@ -109,8 +111,12 @@ def save_thresholds_sidecar_asym(model_path, thresholds_per_wknd: dict, skip_cel
 
 def save_thresholds_sidecar_asym_hour_boost(model_path, thresholds_per_wknd: dict,
                                              skip_cells: list, good_hours: tuple,
-                                             hour_boost_delta: float, metadata=None):
-    """Sidecar V2 (asym_wknd_excl_hour_boost) : V1 + champ optional `hour_boost`."""
+                                             hour_boost_delta: float,
+                                             bad_hours: tuple = (),
+                                             inference_filters: dict | None = None,
+                                             metadata=None):
+    """Sidecar V2 (asym_wknd_excl_hour_boost) : V1 + champ optional `hour_boost`
+    + champ optional `bad_hours` + champ optional `inference_filters`."""
     sidecar = Path(model_path).with_suffix(".thresholds.json")
     payload = {
         "strategy": "asym_wknd_excl_hour_boost",
@@ -119,6 +125,10 @@ def save_thresholds_sidecar_asym_hour_boost(model_path, thresholds_per_wknd: dic
         "hour_boost": {
             "good_hours": [int(h) for h in good_hours],
             "delta": float(hour_boost_delta),
+        },
+        "bad_hours": [int(h) for h in bad_hours],
+        "inference_filters": {
+            k: [float(v[0]), str(v[1])] for k, v in (inference_filters or {}).items()
         },
         "metadata": metadata or {},
     }
@@ -141,6 +151,23 @@ def hour_of_day_from_ms(ts_ms: np.ndarray) -> np.ndarray:
 # ============================================================
 #  Asymmetric weekday/weekend strategy with cell exclusions (V1)
 # ============================================================
+def _apply_inference_filters_mask(df, filters):
+    """Returns a bool mask of rows passing all inference filters.
+    filters: {col_name: (cutoff, "<" | ">")} -- "<" = keep if col < cutoff."""
+    if not filters:
+        return np.ones(len(df), dtype=bool)
+    mask = np.ones(len(df), dtype=bool)
+    for col, (cutoff, mode) in filters.items():
+        if col not in df.columns:
+            continue
+        arr = df[col].to_numpy(dtype=float)
+        if mode == "<":
+            mask &= (arr < cutoff) | np.isnan(arr)
+        elif mode == ">":
+            mask &= (arr >= cutoff) | np.isnan(arr)
+    return mask
+
+
 def compute_thresholds_asym_wknd_excl(
     val_df,
     p_down_val,
@@ -148,7 +175,9 @@ def compute_thresholds_asym_wknd_excl(
     vol_frac_we: float = ASYM_VOL_FRAC_WEEKEND,
     skip_cells=ASYM_SKIP_CELLS,
     use_full_val: bool = ASYM_USE_FULL_VAL,
-    calib_days: int = 55,
+    calib_days: int = ASYM_CALIB_DAYS,
+    inference_filters: dict | None = None,
+    bad_hours: tuple = (),
 ):
     """Calibration par quantile :
       T_axis = val_pool_quantile(1 - vol_frac_axis)
@@ -182,7 +211,18 @@ def compute_thresholds_asym_wknd_excl(
     not_skipped = np.ones(len(val_df), dtype=bool)
     for (v, w) in skip_set:
         not_skipped &= ~((vol_arr == v) & (wknd_arr == w))
-    cal_mask = mask & not_skipped
+    # Filter-aware calibration : on n'inclut dans le pool de calibration que
+    # les rows qui passent les filtres d'inference (cohérence val/test).
+    filt_mask = _apply_inference_filters_mask(val_df, inference_filters)
+    # bad_hours filtering : pour cohérence val/test, exclure aussi du val_pool
+    # les rows aux heures où on skip à l'inference.
+    if bad_hours and "timestamp" in val_df.columns:
+        bad_set = set(int(h) for h in bad_hours)
+        val_hours = hour_of_day_from_ms(val_df["timestamp"].to_numpy())
+        not_bad_hour = ~np.array([int(h) in bad_set for h in val_hours], dtype=bool)
+    else:
+        not_bad_hour = np.ones(len(val_df), dtype=bool)
+    cal_mask = mask & not_skipped & filt_mask & not_bad_hour
 
     thresholds_per_wknd = {}
     report = []
@@ -242,11 +282,15 @@ def apply_thresholds_asym_wknd_excl(df, p_down, thresholds_per_wknd: dict,
 def apply_thresholds_asym_hour_boost(df, p_down, thresholds_per_wknd: dict,
                                       skip_cells=ASYM_SKIP_CELLS,
                                       good_hours=ASYM_HOUR_BOOST_GOOD_HOURS,
-                                      hour_boost_delta: float = ASYM_HOUR_BOOST_DELTA) -> np.ndarray:
-    """V2 application : V1 thresholds + boost horaire.
+                                      hour_boost_delta: float = ASYM_HOUR_BOOST_DELTA,
+                                      bad_hours=(),
+                                      inference_filters: dict | None = None) -> np.ndarray:
+    """V2 application : V1 thresholds + boost horaire + exclusion bad_hours
+    + inference filters (skip si une feature dépasse un cutoff).
 
-    Pour les rows dont l'heure UTC ∈ good_hours, le seuil effectif est abaisse
-    de `hour_boost_delta` (skip cells non boostees).
+    Pour les rows dont l'heure UTC in good_hours, le seuil est abaisse de
+    `hour_boost_delta`. Pour les rows dont l'heure UTC in bad_hours, on SKIP.
+    Pour les rows ne passant pas inference_filters, on SKIP aussi.
     """
     p_down = np.asarray(p_down, dtype=float)
     if len(df) == 0:
@@ -258,16 +302,23 @@ def apply_thresholds_asym_hour_boost(df, p_down, thresholds_per_wknd: dict,
 
     skip_set = set((int(v), int(w)) for (v, w) in skip_cells)
     good_hours_set = set(int(h) for h in good_hours)
+    bad_hours_set = set(int(h) for h in bad_hours)
     vol = df["volatility_state"].astype(int).to_numpy()
     wknd = df["is_weekend"].astype(int).to_numpy()
     hour = hour_of_day_from_ms(df["timestamp"].to_numpy())
+    filt_mask = _apply_inference_filters_mask(df, inference_filters)
 
     take = np.zeros(len(p_down), dtype=bool)
     for i in range(len(p_down)):
         if (int(vol[i]), int(wknd[i])) in skip_set:
             continue
+        h_i = int(hour[i])
+        if h_i in bad_hours_set:
+            continue
+        if not filt_mask[i]:
+            continue
         T = thresholds_per_wknd.get(int(wknd[i]), 1.0)
-        if int(hour[i]) in good_hours_set:
+        if h_i in good_hours_set:
             T = T - hour_boost_delta
         if p_down[i] >= T:
             take[i] = True
@@ -322,10 +373,11 @@ def train_and_evaluate(
         print(f"  val    : {len(val):,} rows  ({pd.to_datetime(val['timestamp'].min(), unit='ms').date()} -> {pd.to_datetime(val['timestamp'].max(), unit='ms').date()})")
         print(f"  test   : {len(test):,} rows  ({pd.to_datetime(test['timestamp'].min(), unit='ms').date()} -> {pd.to_datetime(test['timestamp'].max(), unit='ms').date()})")
 
-    # volatility_state reste dans le parquet (cle de bucket pour le seuil
-    # adaptatif) mais n'est PAS donne au modele en feature : delta_logloss
-    # negatif lors de l'analyse, le modele s'en sert tres peu.
-    feature_cols = [c for c in df.columns if c not in ("timestamp", "label", "volatility_state")]
+    # volatility_state ET is_weekend restent dans le parquet (cles de bucket
+    # pour le seuil adaptatif) mais ne sont PAS donnes au modele en feature
+    # (delta_logloss negatif lors de l'analyse, le modele s'en sert tres peu).
+    feature_cols = [c for c in df.columns
+                    if c not in ("timestamp", "label", "volatility_state", "is_weekend")]
     X_train, y_train = train[feature_cols], train["label"]
     X_val, y_val = val[feature_cols], val["label"]
     X_test, y_test = test[feature_cols], test["label"]
@@ -385,11 +437,18 @@ def train_and_evaluate(
         )
 
     # ---- Calibration adaptative (asym pooled par quantile sur val) ----
+    # Calibration filter-aware : ne passer QUE les BASE filters (pas les EXTRA)
+    # au pool de val avant calcul du quantile. Les EXTRA filters s'appliquent
+    # uniquement a l'inference (apply_thresholds_asym_hour_boost).
     thresholds_per_wknd: dict = {}
     report: list[dict] = []
+    calib_filters = BASE_INFERENCE_FILTERS if CALIB_USE_FILTERS else None
     if len(val) > 0:
         p_down_val = model.predict_proba(X_val)[:, 1]
-        thresholds_per_wknd, report = compute_thresholds_asym_wknd_excl(val, p_down_val)
+        thresholds_per_wknd, report = compute_thresholds_asym_wknd_excl(
+            val, p_down_val, inference_filters=calib_filters,
+            bad_hours=ASYM_BAD_HOURS,
+        )
 
     # ---- Test predictions ----
     p_down_test = model.predict_proba(X_test)[:, 1]
@@ -397,7 +456,11 @@ def train_and_evaluate(
 
     # ---- Decision sur test (V1 ou V2) ----
     if ADAPTIVE_STRATEGY == "asym_wknd_excl_hour_boost":
-        take_test = apply_thresholds_asym_hour_boost(test, p_down_test, thresholds_per_wknd)
+        take_test = apply_thresholds_asym_hour_boost(
+            test, p_down_test, thresholds_per_wknd,
+            bad_hours=ASYM_BAD_HOURS,
+            inference_filters=INFERENCE_FILTERS,
+        )
     else:
         take_test = apply_thresholds_asym_wknd_excl(test, p_down_test, thresholds_per_wknd)
     label_arr = y_test.to_numpy().astype(int)
@@ -429,11 +492,16 @@ def train_and_evaluate(
             save_thresholds_sidecar_asym_hour_boost(
                 MODEL_OUTPUT, thresholds_per_wknd, list(ASYM_SKIP_CELLS),
                 ASYM_HOUR_BOOST_GOOD_HOURS, ASYM_HOUR_BOOST_DELTA,
+                bad_hours=ASYM_BAD_HOURS,
+                inference_filters=INFERENCE_FILTERS,
                 metadata={
                     **common_metadata,
                     **calib_meta,
                     "hour_boost_good_hours": list(ASYM_HOUR_BOOST_GOOD_HOURS),
                     "hour_boost_delta":      ASYM_HOUR_BOOST_DELTA,
+                    "bad_hours":             list(ASYM_BAD_HOURS),
+                    "inference_filters":     INFERENCE_FILTERS,
+                    "calib_use_filters":     CALIB_USE_FILTERS,
                 },
             )
         else:
@@ -471,9 +539,12 @@ def train_and_evaluate(
     metrics["asym_T_weekday"]  = round(thresholds_per_wknd.get(0, 1.0), 5) if thresholds_per_wknd else None
     metrics["asym_T_weekend"]  = round(thresholds_per_wknd.get(1, 1.0), 5) if thresholds_per_wknd else None
     metrics["asym_skip_cells"] = str(list(ASYM_SKIP_CELLS))
+    metrics["asym_use_full_val"] = ASYM_USE_FULL_VAL
+    metrics["asym_calib_days"]   = ASYM_CALIB_DAYS
     if ADAPTIVE_STRATEGY == "asym_wknd_excl_hour_boost":
         metrics["asym_hour_boost_good_hours"] = str(list(ASYM_HOUR_BOOST_GOOD_HOURS))
         metrics["asym_hour_boost_delta"]      = ASYM_HOUR_BOOST_DELTA
+        metrics["asym_bad_hours"]             = str(list(ASYM_BAD_HOURS))
 
     # ---- Print + log ----
     if verbose:

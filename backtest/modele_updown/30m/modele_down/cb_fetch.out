@@ -1,0 +1,25 @@
+Loading C:\Users\fremo\Desktop\ML_agent_poly\backtest\modele_updown\30m\modele_down\DB\btc_multi_tf_1h.parquet...
+  BTC: 120,000 rows
+
+Fetching Coinbase BTC-USD 1h...
+  CB: 20 windows, 6,012 bars, cur=2017-09-08T00:00:00+00:00
+  CB: 40 windows, 12,024 bars, cur=2018-05-16T00:00:00+00:00
+  CB: 60 windows, 18,026 bars, cur=2019-01-21T00:00:00+00:00
+  CB: 80 windows, 24,044 bars, cur=2019-09-28T00:00:00+00:00
+  CB: 100 windows, 30,062 bars, cur=2020-06-04T00:00:00+00:00
+  CB: 120 windows, 36,080 bars, cur=2021-02-09T00:00:00+00:00
+  CB: 140 windows, 42,100 bars, cur=2021-10-17T00:00:00+00:00
+  CB: 160 windows, 48,120 bars, cur=2022-06-24T00:00:00+00:00
+  CB: 180 windows, 54,140 bars, cur=2023-03-01T00:00:00+00:00
+  CB: 200 windows, 60,157 bars, cur=2023-11-06T00:00:00+00:00
+  CB: 220 windows, 66,177 bars, cur=2024-07-13T00:00:00+00:00
+  CB: 240 windows, 72,197 bars, cur=2025-03-20T00:00:00+00:00
+  CB: 260 windows, 78,212 bars, cur=2025-11-25T00:00:00+00:00
+  82,067 CB bars in 609.8s
+
+  Added 3 CB features. Valid rows: 82,048
+    cb_close_ret: n_valid=82,047 min=-0.16967 max=0.22039 mean=0.00008
+    cb_volume_ratio: n_valid=82,029 min=0.00000 max=13.44351 mean=1.04528
+    cb_btc_spread: n_valid=82,048 min=-0.03702 max=0.09396 mean=0.00055
+
+Wrote back C:\Users\fremo\Desktop\ML_agent_poly\backtest\modele_updown\30m\modele_down\DB\btc_multi_tf_1h.parquet

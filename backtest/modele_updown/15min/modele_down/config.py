@@ -69,11 +69,13 @@ VAL_FRACTION = 0.1
 ADAPTIVE_STRATEGY = "asym_wknd_excl_hour_boost"
 
 # Parametres asym (V1 + V2 partagent le meme bloc) :
-# Fraction de val non-skip a garder par axe. Valeurs initiales heritees du
-# modele_up. A retuner par audit cross-window si besoin pour DOWN.
-ASYM_VOL_FRAC_WEEKDAY = 0.025      # top 1.3% du val weekday non-skip
-ASYM_VOL_FRAC_WEEKEND = 0.1       # top 16.7% du val weekend non-skip
-ASYM_SKIP_CELLS = ((2, 0), (2, 1))  # (volatility_state, is_weekend) exclus
+# Fraction de val non-skip a garder par axe. Retunes par audit walk-forward
+# 6 fenetres sur le modele DOWN + features ETH (cf optimize/opt_calib.py).
+ASYM_VOL_FRAC_WEEKDAY = 0.0225     # top 2.25% du val weekday non-skip
+ASYM_VOL_FRAC_WEEKEND = 0.1        # top 10% du val weekend non-skip
+ASYM_SKIP_CELLS = ()                # aucune cellule exclue : avec les features
+                                    # ETH, inclure vol2 ameliore la WR honnete
+                                    # (walk-forward +0.34pt) -- skip vol2 retire
 ASYM_USE_FULL_VAL = True            # True = full val, False = derniers 55j
 
 # Parametres specifiques V2 ("asym_wknd_excl_hour_boost") :
@@ -89,7 +91,9 @@ ASYM_HOUR_BOOST_DELTA = 0.020
 XGB_N_ESTIMATORS = 1000
 XGB_MAX_DEPTH = 5
 XGB_LEARNING_RATE = 0.05
-XGB_MIN_CHILD_WEIGHT = 20
+XGB_MIN_CHILD_WEIGHT = 50   # 20 -> 50 : les 14 features ETH ajoutent de la
+                            # capacite ; +regularisation = +0.6pt WR honnete
+                            # (audit walk-forward, cf optimize/opt_model.py)
 XGB_SUBSAMPLE = 0.8
 XGB_COLSAMPLE_BYTREE = 0.8
 XGB_REG_LAMBDA = False

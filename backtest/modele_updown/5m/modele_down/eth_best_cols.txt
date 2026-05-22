@@ -1,0 +1,14 @@
+ef_ret1
+ef_ret2
+ef_ret4
+ef_ret8
+ef_ret16
+ef_ret48
+ef_ret96
+ef_streak
+ef_macd
+ef_macd_hist
+ef_vol_z
+ef_upwick
+ef_lowick
+ef_body
