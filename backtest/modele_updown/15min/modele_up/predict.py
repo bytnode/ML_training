@@ -85,6 +85,11 @@ def _bucket_threshold(volatility_state, is_weekend, sidecar, ts_ms=None) -> floa
     skip_cells = {(int(v), int(w)) for v, w in sidecar.get("skip_cells", [])}
     if (int(volatility_state), int(is_weekend)) in skip_cells:
         return 1.0
+    # Bad-hours exclusion (V2 extension) : force T=1.0 = never bet.
+    if ts_ms is not None:
+        bad_hours = set(int(h) for h in sidecar.get("bad_hours", []))
+        if bad_hours and _hour_from_ts_ms(ts_ms) in bad_hours:
+            return 1.0
     th_map = sidecar.get("thresholds_per_wknd", {})
     T = float(th_map.get(str(int(is_weekend)), 1.0))
     if strategy == "asym_wknd_excl_hour_boost" and ts_ms is not None:
@@ -126,11 +131,16 @@ def decide(features):
         for v, w in zip(vol, wknd)
     ], dtype=float)
     if strategy == "asym_wknd_excl_hour_boost" and "timestamp" in df.columns:
+        ts = df["timestamp"].to_numpy()
+        hour = ((ts // (15 * 60 * 1000)) % 96 // 4).astype(int)
+        # Bad-hours exclusion FIRST (force T=1.0 = never bet).
+        bad_hours = set(int(h) for h in sidecar.get("bad_hours", []))
+        if bad_hours:
+            bad_mask = np.array([int(h) in bad_hours for h in hour])
+            eff_th = np.where(bad_mask, 1.0, eff_th)
         hb = sidecar.get("hour_boost", {})
         good_hours = set(int(h) for h in hb.get("good_hours", []))
         delta_boost = float(hb.get("delta", 0.0))
-        ts = df["timestamp"].to_numpy()
-        hour = ((ts // (15 * 60 * 1000)) % 96 // 4).astype(int)
         boost_mask = np.array([int(h) in good_hours for h in hour]) & (eff_th < 1.0)
         eff_th[boost_mask] -= delta_boost
 

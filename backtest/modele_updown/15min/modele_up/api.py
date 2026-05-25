@@ -28,11 +28,15 @@ _MODEL_DIR = Path(__file__).resolve().parent
 _PARQUET_PATH = _MODEL_DIR / "DB" / "btc_multi_tf_15m.parquet"
 _MODEL_PATH   = _MODEL_DIR / "btc_updown_model.json"
 _SIDECAR_JSON = _MODEL_DIR / "btc_updown_model.thresholds.json"
+# Sister modele_down's test predictions (used for runtime cross-model filter
+# when sidecar.max_p_down_runtime < 1.0).
+_DN_PREDS_PATH = _MODEL_DIR.parent / "modele_down" / "logs" / "test_predictions.csv"
 
 # Module-level caches (loaded lazily, kept alive between calls).
 _model: xgb.XGBClassifier | None = None
 _sidecar: dict | None = None
 _parquet: pd.DataFrame | None = None
+_dn_preds: dict | None = None  # ts_ms -> p_down
 
 
 def _load_model() -> xgb.XGBClassifier:
@@ -60,6 +64,20 @@ def _load_sidecar() -> dict:
     return _sidecar
 
 
+def _load_dn_preds() -> dict:
+    """Lazy-load modele_down's test_predictions.csv as a {ts_ms: p_down} dict
+    for the runtime cross-model filter."""
+    global _dn_preds
+    if _dn_preds is None:
+        if not _DN_PREDS_PATH.exists():
+            _dn_preds = {}
+        else:
+            df = pd.read_csv(_DN_PREDS_PATH, usecols=["timestamp", "p_down"])
+            _dn_preds = dict(zip(df["timestamp"].astype("int64").to_numpy(),
+                                  df["p_down"].astype(float).to_numpy()))
+    return _dn_preds
+
+
 def _load_parquet() -> pd.DataFrame:
     global _parquet
     if _parquet is None:
@@ -78,7 +96,8 @@ def _hour_from_ts_ms(ts_ms) -> int:
 
 def _bucket_threshold(volatility_state: int, is_weekend: int, sidecar: dict,
                       ts_ms=None) -> float:
-    """Supporte 2 formats sidecar : V1 (asym_wknd_excl) et V2 (asym_wknd_excl_hour_boost)."""
+    """Supporte 2 formats sidecar : V1 (asym_wknd_excl) et V2 (asym_wknd_excl_hour_boost),
+    plus l'extension optionnelle V2 `bad_hours`."""
     strategy = sidecar.get("strategy")
     if strategy not in ("asym_wknd_excl", "asym_wknd_excl_hour_boost"):
         raise ValueError(f"Sidecar strategy={strategy!r} non supporte. "
@@ -86,6 +105,11 @@ def _bucket_threshold(volatility_state: int, is_weekend: int, sidecar: dict,
     skip_cells = {(int(v), int(w)) for v, w in sidecar.get("skip_cells", [])}
     if (int(volatility_state), int(is_weekend)) in skip_cells:
         return 1.0
+    # Bad-hours exclusion (V2 extension) : force T=1.0 = never bet.
+    if ts_ms is not None:
+        bad_hours = set(int(h) for h in sidecar.get("bad_hours", []))
+        if bad_hours and _hour_from_ts_ms(ts_ms) in bad_hours:
+            return 1.0
     th_map = sidecar.get("thresholds_per_wknd", {})
     T = float(th_map.get(str(int(is_weekend)), 1.0))
     if strategy == "asym_wknd_excl_hour_boost" and ts_ms is not None:
@@ -148,6 +172,18 @@ def _predict_all_bars(start_ms: int, end_ms: int) -> pd.DataFrame:
         axis=1,
     )
     df["take"] = (df["confidence"] >= df["threshold"]).astype(int)
+
+    # Cross-model runtime filter : reject UP take when modele_down's p_down
+    # exceeds max_p_down_runtime. Mirrors live.py runtime check.
+    max_p_dn_rt = float(sidecar.get("max_p_down_runtime", 1.0))
+    if max_p_dn_rt < 1.0:
+        dn_map = _load_dn_preds()
+        if dn_map:
+            ts_arr = df["timestamp_ms"].astype("int64").to_numpy()
+            p_dn_arr = pd.Series([dn_map.get(int(t), float("nan")) for t in ts_arr])
+            reject = (p_dn_arr.to_numpy() >= max_p_dn_rt) | pd.isna(p_dn_arr).to_numpy()
+            df.loc[reject, "take"] = 0
+
     df["timestamp"] = df["timestamp_ms"].astype("int64")
     df["label"] = df["label"].astype(int)
     df["volatility_state"] = df["volatility_state"].astype(int)

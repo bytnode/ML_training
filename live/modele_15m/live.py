@@ -47,6 +47,7 @@ import os
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -84,14 +85,31 @@ DN_MODEL_PATH = ROOT / "modele_down" / "btc_updown_model.json"
 DN_SIDECAR    = ROOT / "modele_down" / "btc_updown_model.thresholds.json"
 
 PAIR = "btcusd"
+ETH_PAIR = "ethusd"   # exogenous ETH/USD feed for modele_down's 14 ef_* features
 WARMUP_15M = 3200   # >= 2880 (volume_rel_30d) + margin
 WARMUP_5M  = 200
 WARMUP_30M = 200
 WARMUP_1H  = 200
+WARMUP_ETH_15M = 1000  # ef_ret96 + rolling-96 (ef_vol_z) + EMA convergence margin
 
 FRESHNESS_RETRY_MAX = 12
 FRESHNESS_RETRY_DELAY_S = 1
 INTERVAL_15M_MS = 15 * 60 * 1000
+
+# Per-cycle incremental refresh size : only the last N bars per TF are fetched
+# each cycle ; merged into the cached buffers. Enough to cover the gap
+# (typically just the 1-2 newest bars) + safety margin against any out-of-order
+# delivery from Bitstamp.
+INCREMENTAL_REFRESH_N_BARS = 20
+
+# Module-level cached buffers, shared between cycles. Cold start fills the full
+# warmup ; subsequent cycles only refresh the tail in parallel. Keyed by
+# (pair, tf). See refresh_buffers().
+_CACHED_BUFFERS: dict[tuple[str, str], list[list]] = {}
+
+# Background thread pool for I/O fire-and-forget (Telegram notifs, pre-fetch
+# Polymarket calls). One small pool shared across the daemon's lifetime.
+_BG_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="live-bg")
 
 # Defaults (env vars override; see polymarket.py.from_env).
 DEFAULT_BET_FRACTION = 0.10
@@ -155,19 +173,24 @@ def _load_sidecar(path: Path) -> dict:
 
 
 def _bucket_threshold(volatility_state: int, is_weekend: int, sidecar: dict, ts_ms: int) -> float:
-    """Reproduces predict.decide()'s threshold lookup (V1 + V2 hour_boost)."""
+    """Reproduces predict.decide()'s threshold lookup (V1 + V2 hour_boost
+    + optional V2 bad_hours)."""
     strategy = sidecar.get("strategy")
     if strategy not in ("asym_wknd_excl", "asym_wknd_excl_hour_boost"):
         raise ValueError(f"Unknown sidecar strategy: {strategy!r}")
     skip = {(int(v), int(w)) for v, w in sidecar.get("skip_cells", [])}
     if (int(volatility_state), int(is_weekend)) in skip:
         return 1.0
+    hour = int(((ts_ms // (15 * 60 * 1000)) % 96) // 4)
+    # Bad-hours exclusion (V2 extension) : force T=1.0 = never bet.
+    bad_hours = set(int(h) for h in sidecar.get("bad_hours", []))
+    if bad_hours and hour in bad_hours:
+        return 1.0
     T = float(sidecar.get("thresholds_per_wknd", {}).get(str(int(is_weekend)), 1.0))
     if strategy == "asym_wknd_excl_hour_boost":
         hb = sidecar.get("hour_boost", {})
         good = set(int(h) for h in hb.get("good_hours", []))
         delta = float(hb.get("delta", 0.0))
-        hour = int(((ts_ms // (15 * 60 * 1000)) % 96) // 4)
         if hour in good:
             T -= delta
     return T
@@ -205,9 +228,64 @@ def wait_until(ts_s: int) -> None:
         time.sleep(min(delta, 10))
 
 
+def refresh_buffers() -> dict[str, list[list]]:
+    """Multi-TF Bitstamp fetch with incremental cache.
+
+    First call (cold): fetches the FULL warmup for all 5 TFs in parallel
+    (~3-5s wall time, dominated by the 15m pagination of 3200 bars).
+
+    Subsequent calls (warm): fetches only the last INCREMENTAL_REFRESH_N_BARS
+    bars per TF in parallel (~0.3-0.5s wall time, single chunk per TF) and
+    merges into the cached buffers. Old bars are trimmed to keep cache bounded.
+
+    Returns a dict keyed by friendly names matching the previous main-loop
+    locals : {"15m", "5m", "30m", "1h", "eth_15m"}.
+    """
+    global _CACHED_BUFFERS
+    target_sizes = {
+        (PAIR, "15m"): WARMUP_15M,
+        (PAIR, "5m"):  WARMUP_5M,
+        (PAIR, "30m"): WARMUP_30M,
+        (PAIR, "1h"):  WARMUP_1H,
+        (ETH_PAIR, "15m"): WARMUP_ETH_15M,
+    }
+    if not _CACHED_BUFFERS:
+        # Cold start : parallel fetch of every warmup. Each TF runs in its own
+        # thread ; total wall time = max(per-TF), not sum.
+        specs = [(pair, tf, n) for (pair, tf), n in target_sizes.items()]
+        out = fetch.fetch_many_parallel(specs)
+        _CACHED_BUFFERS = dict(out)
+    else:
+        # Warm : only refresh the tail of each TF in parallel. The new bars
+        # are merged into the cached buffer (existing rows are updated, new
+        # ones appended), and the buffer is trimmed to the original warmup size.
+        specs = [(pair, tf, INCREMENTAL_REFRESH_N_BARS)
+                 for (pair, tf), _ in target_sizes.items()]
+        fresh = fetch.fetch_many_parallel(specs)
+        for key, new_bars in fresh.items():
+            merged = fetch.merge_klines(_CACHED_BUFFERS.get(key, []), new_bars)
+            _CACHED_BUFFERS[key] = merged[-target_sizes[key]:]
+
+    return {
+        "15m":     _CACHED_BUFFERS[(PAIR, "15m")],
+        "5m":      _CACHED_BUFFERS[(PAIR, "5m")],
+        "30m":     _CACHED_BUFFERS[(PAIR, "30m")],
+        "1h":      _CACHED_BUFFERS[(PAIR, "1h")],
+        "eth_15m": _CACHED_BUFFERS[(ETH_PAIR, "15m")],
+    }
+
+
 def freshness_retry(target_open_ms: int) -> list[list]:
-    """Refetch last 15m bars until the bar at open_time == target_open_ms is
-    actually present in Bitstamp's response (not just a more-recent bar).
+    """Refetch last 15m bars until BOTH the just-closed bar (at target_open_ms)
+    AND the currently-opening bar (at target_open_ms + 15m) are in Bitstamp's
+    response.
+
+    Why both? build_features picks `last_idx = len(df15) - 2`, assuming the
+    last entry is the currently-open bar so the second-to-last is the just-
+    closed target. If Bitstamp returns only `[..., bar(B-30m), bar(B-15m)]`
+    (just-closed at [-1], new bar not published yet), then last_idx=-2 lands
+    on bar(B-30m) -- features get computed on the bar from TWO cycles ago.
+    Requiring both bars eliminates this off-by-one race.
 
     Previously this passed as soon as kl[-1][0] >= target_open_ms, which is
     true the moment Bitstamp publishes the currently-forming bar - but the
@@ -215,14 +293,16 @@ def freshness_retry(target_open_ms: int) -> list[list]:
     The strict check fixes the 'Target bar not in buffer; skipping resolution'
     warnings.
     """
+    open_bar_ms = target_open_ms + INTERVAL_15M_MS
     for _ in range(FRESHNESS_RETRY_MAX):
         kl = fetch.fetch_klines(PAIR, "15m", n_bars=10)
-        if any(int(k[0]) == target_open_ms for k in kl):
+        ts_set = {int(k[0]) for k in kl}
+        if target_open_ms in ts_set and open_bar_ms in ts_set:
             return kl
         time.sleep(FRESHNESS_RETRY_DELAY_S)
     raise TimeoutError(
-        f"Target bar {target_open_ms} not published by Bitstamp after "
-        f"{FRESHNESS_RETRY_MAX} attempts."
+        f"Bitstamp did not publish both the closed bar {target_open_ms} and "
+        f"the opening bar {open_bar_ms} after {FRESHNESS_RETRY_MAX} attempts."
     )
 
 
@@ -617,6 +697,8 @@ def _write_outcome(df: pd.DataFrame, idx, outcome: str, source: str,
 def _resolution_event(row: pd.Series, stats: dict, df_after_write: pd.DataFrame) -> dict:
     """Build the dict the main loop hands to notify.send_bet_resolved_real."""
     running_bets, running_pnl = _running_pnl_stats(df_after_write)
+    redeem_tx = row.get("redeem_tx_hash")
+    redeem_tx = str(redeem_tx) if pd.notna(redeem_tx) else None
     return {
         "_stuck": False,
         "direction": str(row["direction"]),
@@ -627,6 +709,7 @@ def _resolution_event(row: pd.Series, stats: dict, df_after_write: pd.DataFrame)
         "target_close_iso": pd.Timestamp(int(row["target_close_ms"]), unit="ms", tz="UTC").strftime("%Y-%m-%d %H:%M UTC"),
         "running_bets": running_bets,
         "running_pnl": running_pnl,
+        "redeem_tx_hash": redeem_tx,
     }
 
 
@@ -634,7 +717,9 @@ def _resolution_event(row: pd.Series, stats: dict, df_after_write: pd.DataFrame)
 #  Place a real bet (LIVE_MODE=true)
 # ============================================================
 def place_real_bet(client, team: str, p_up: float, p_dn: float,
-                    target_open_ms: int, dry_run: bool, context: dict) -> dict:
+                    target_open_ms: int, dry_run: bool, context: dict,
+                    prefetched_balance: float | None = None,
+                    prefetched_market: dict | None = None) -> dict:
     """Place a real Polymarket FAK BUY for this cycle's UP/DOWN signal.
     Appends one row to bets.csv. Returns the row that was written (for the
     cycle's Telegram message).
@@ -642,6 +727,9 @@ def place_real_bet(client, team: str, p_up: float, p_dn: float,
     `client` must be non-None and ready. Caller already checked LIVE_MODE.
     `context` carries the decision context for the log row:
         {th_up, th_dn, volatility_state, is_weekend, hour}.
+    `prefetched_balance` / `prefetched_market` : optional values fetched during
+    the prior wait_until() so the boundary-time hot path only has to do the
+    POST /order. Pass None to fetch fresh inline (slow path).
     """
     cycle_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     target_close_ms = target_open_ms + INTERVAL_15M_MS
@@ -653,12 +741,16 @@ def place_real_bet(client, team: str, p_up: float, p_dn: float,
     bet_min = float(os.environ.get("BET_MIN_USDC", DEFAULT_BET_MIN_USDC))
     bet_max_frac = DEFAULT_BET_MAX_FRACTION
 
-    # 1. Read balance + size.
-    try:
-        usdc_pre = client.get_usdc_balance()
-    except Exception as e:
-        logging.exception("get_usdc_balance failed: %s", e)
-        usdc_pre = 0.0
+    # 1. Read balance + size. Use the pre-fetched value if the caller has one
+    # (saves the ~500ms web3 RPC round-trip on the hot path).
+    if prefetched_balance is not None:
+        usdc_pre = float(prefetched_balance)
+    else:
+        try:
+            usdc_pre = client.get_usdc_balance()
+        except Exception as e:
+            logging.exception("get_usdc_balance failed: %s", e)
+            usdc_pre = 0.0
     bet_usdc = round(usdc_pre * bet_fraction, 2)
 
     # Base row written regardless of outcome (so we can audit skips too).
@@ -715,22 +807,26 @@ def place_real_bet(client, team: str, p_up: float, p_dn: float,
         _append_bet_row(base)
         return base
 
-    # 2. Look up the Polymarket market.
-    try:
-        from polymarket import MarketNotFoundError
-        market = client.find_btc_15m_market(window_start_unix_s)
-    except MarketNotFoundError as e:
-        logging.warning("Market not found for window_start=%s: %s", window_start_unix_s, e)
-        base["order_status"] = "skipped_market_not_found"
-        base["outcome"] = "skipped"
-        _append_bet_row(base)
-        return base
-    except Exception as e:
-        logging.exception("find_btc_15m_market failed: %s", e)
-        base["order_status"] = "failed"
-        base["outcome"] = "skipped"
-        _append_bet_row(base)
-        return base
+    # 2. Look up the Polymarket market. Use the pre-fetched market dict if the
+    # caller has one (saves the ~500ms Gamma API call on the hot path).
+    if prefetched_market is not None:
+        market = prefetched_market
+    else:
+        try:
+            from polymarket import MarketNotFoundError
+            market = client.find_btc_15m_market(window_start_unix_s)
+        except MarketNotFoundError as e:
+            logging.warning("Market not found for window_start=%s: %s", window_start_unix_s, e)
+            base["order_status"] = "skipped_market_not_found"
+            base["outcome"] = "skipped"
+            _append_bet_row(base)
+            return base
+        except Exception as e:
+            logging.exception("find_btc_15m_market failed: %s", e)
+            base["order_status"] = "failed"
+            base["outcome"] = "skipped"
+            _append_bet_row(base)
+            return base
 
     token_id = market["up_token_id"] if team == "UP" else market["down_token_id"]
     base["polymarket_condition_id"] = market["condition_id"]
@@ -771,8 +867,11 @@ def place_real_bet(client, team: str, p_up: float, p_dn: float,
             pass
         # outcome stays "pending" - we'll resolve at the next cycle.
     elif result["status"] == "rejected":
-        # 0 shares filled -> there's no real bet. Mark loss = 0 PnL.
-        base["outcome"] = "loss"
+        # 0 shares filled -> no real bet placed. NOT a loss: nothing was spent
+        # and no money was at risk. Use a distinct outcome so _running_pnl_stats
+        # does NOT count this in WR / bet count (the canonical filter is
+        # outcome in {win, loss, bitstamp_win, bitstamp_loss}).
+        base["outcome"] = "rejected"
         base["outcome_source"] = "rejected"
         base["outcome_resolved_at_iso"] = cycle_at
         base["realized_pnl_usdc"] = 0.0
@@ -803,6 +902,7 @@ def _emit_resolution_telegrams(events: list[dict]) -> None:
                 target_close_iso=ev["target_close_iso"],
                 running_bets=ev["running_bets"],
                 running_pnl=ev["running_pnl"],
+                redeem_tx_hash=ev.get("redeem_tx_hash"),
             )
 
 
@@ -887,25 +987,56 @@ def main():
         # Sleep until next xx:00 / xx:15 / xx:30 / xx:45
         next_boundary = next_15m_boundary_s()
         next_boundary_ms = next_boundary * 1000
+
+        # --- Pre-fetch Polymarket info during the wait, so the boundary-time
+        # hot path only does the POST /order. Both calls are slow (~500ms each
+        # web3 RPC + ~500ms Gamma API) but we have ~10-15min of idle wait
+        # before the next boundary. The returned values may be slightly stale
+        # by the time we use them, but balance changes only when a bet is
+        # placed (= during this same cycle) and the market for the upcoming
+        # window is listed on Polymarket several windows in advance.
+        pre_market_fut: Future | None = None
+        pre_balance_fut: Future | None = None
+        if polymarket_client is not None:
+            pre_market_fut = _BG_EXECUTOR.submit(
+                polymarket_client.find_btc_15m_market, next_boundary,
+            )
+            pre_balance_fut = _BG_EXECUTOR.submit(
+                polymarket_client.get_usdc_balance,
+            )
+
         wait_until(next_boundary)
 
         try:
+            t_cycle_start = time.perf_counter()
             freshness_retry(next_boundary_ms - INTERVAL_15M_MS)  # latest closed bar's open_time
+            t_after_fresh = time.perf_counter()
 
-            buf_15m = fetch.fetch_klines(PAIR, "15m", WARMUP_15M)
-            buf_5m  = fetch.fetch_klines(PAIR, "5m",  WARMUP_5M)
-            buf_30m = fetch.fetch_klines(PAIR, "30m", WARMUP_30M)
-            buf_1h  = fetch.fetch_klines(PAIR, "1h",  WARMUP_1H)
+            # Multi-TF parallel + incremental fetch. Cold start does the full
+            # warmup (~3-5s once at boot) ; warm cycles only fetch the last 20
+            # bars per TF in parallel (~0.3-0.5s).
+            buffers = refresh_buffers()
+            buf_15m     = buffers["15m"]
+            buf_5m      = buffers["5m"]
+            buf_30m     = buffers["30m"]
+            buf_1h      = buffers["1h"]
+            buf_eth_15m = buffers["eth_15m"]
+            t_after_fetch = time.perf_counter()
 
             # The bar that JUST CLOSED has open_time = next_boundary - 15min
             just_closed_open = next_boundary_ms - INTERVAL_15M_MS
 
-            # === 0. Resolve pending REAL bets (LIVE_MODE=true only) ===
-            # Runs before paper resolution so the Telegram order is:
-            #   real-bet result(s) -> paper resolution -> new prediction -> new real bet (if any).
+            # === 0. Resolve pending REAL bets (LIVE_MODE=true) -- IN BACKGROUND ===
+            # The Polymarket Gamma + relayer calls take ~1-2s ; run them in a
+            # thread parallel with feature build + predict (CPU-bound, ~400ms).
+            # We await the result BEFORE place_real_bet to avoid a bets.csv
+            # write race (both resolve and place_real_bet read+modify+write the
+            # same CSV). Net saving on the critical path : ~0.5-1.5s.
+            resolve_fut: Future | None = None
             if polymarket_client is not None:
-                resolved_events = resolve_pending_bets(polymarket_client, buf_15m, stats)
-                _emit_resolution_telegrams(resolved_events)
+                resolve_fut = _BG_EXECUTOR.submit(
+                    resolve_pending_bets, polymarket_client, buf_15m, stats,
+                )
 
             # === 1. Resolve previous cycle ===
             resolution = None
@@ -950,12 +1081,50 @@ def main():
             # last_idx = -2 inside build_features ; the last entry of buf_15m must be
             # the CURRENTLY OPEN bar. fetch returns bars up to and including the
             # bar at next_boundary_ms (which has open_time = next_boundary_ms).
+            #
+            # Both models are independent at feature time (2026-05-25 cleanup
+            # removed the leaky `p_up_xmodel` feature from modele_down). The
+            # cross-model link is now only the runtime gating below via the
+            # `max_p_*_runtime` sidecar fields.
             feats_up = feat_up_mod.build_features(buf_15m, buf_5m, buf_30m, buf_1h)
-            feats_dn = feat_dn_mod.build_features(buf_15m, buf_5m, buf_30m, buf_1h)
-
-            # === 3. Predict ===
             p_up, take_up, th_up = _predict_one(model_up, sidecar_up, feats_up)
+
+            feats_dn = feat_dn_mod.build_features(buf_15m, buf_5m, buf_30m, buf_1h,
+                                                  buf_eth_15m)
+            if np.isnan(feats_dn["ef_ret2"]):
+                logging.warning("No ETH 15m bar concurrent with the just-closed "
+                                "BTC bar; modele_down ef_* features are NaN this cycle.")
+
+            # === 3. Predict modele_down ===
             p_dn, take_dn, th_dn = _predict_one(model_dn, sidecar_dn, feats_dn)
+            t_after_predict = time.perf_counter()
+
+            # === 3a. Await background resolve (must finish before any new
+            # bets.csv write to avoid the read-modify-write race). Fire its
+            # telegrams in the background so we don't block on the network.
+            if resolve_fut is not None:
+                try:
+                    resolved_events = resolve_fut.result(timeout=10)
+                except Exception as e:
+                    logging.exception("background resolve_pending_bets failed: %s", e)
+                    resolved_events = []
+                if resolved_events:
+                    _BG_EXECUTOR.submit(_emit_resolution_telegrams, resolved_events)
+
+            # === 3b. Cross-model runtime filters (post-take gating) ===
+            # Each sidecar carries an optional `max_p_*_runtime` (1.0 = disabled).
+            # modele_up's filter : reject UP bet if modele_down's p_down >= max_p_down_runtime.
+            # modele_down's filter: reject DOWN bet if modele_up's p_up >= max_p_up_runtime.
+            max_p_down_rt = float(sidecar_up.get("max_p_down_runtime", 1.0))
+            if take_up and p_dn >= max_p_down_rt:
+                logging.info(f"cross-model: UP take rejected (p_dn={p_dn:.4f} >= "
+                             f"max_p_down_runtime={max_p_down_rt:.4f})")
+                take_up = False
+            max_p_up_rt = float(sidecar_dn.get("max_p_up_runtime", 1.0))
+            if take_dn and p_up >= max_p_up_rt:
+                logging.info(f"cross-model: DOWN take rejected (p_up={p_up:.4f} >= "
+                             f"max_p_up_runtime={max_p_up_rt:.4f})")
+                take_dn = False
 
             team = team_decision(take_up, take_dn)
             prediction = {
@@ -1013,19 +1182,48 @@ def main():
             # decision for this cycle, regardless of order success.
             bet_row = None
             if polymarket_client is not None and team in ("UP", "DOWN"):
+                # Each model bucketizes independently in its own features dict.
+                # Log the bucket that the WINNING model actually used so the
+                # bets.csv row matches the sidecar lookup that picked the
+                # threshold for this bet (avoids audit confusion when feats_up
+                # and feats_dn disagree on volatility_state, e.g. after a fresh
+                # restart with short warmup).
+                feats_for_bucket = feats_up if team == "UP" else feats_dn
+                # Resolve the pre-fetched market + balance (kicked off during
+                # the prior wait_until). Block at most a couple of seconds in
+                # case Polymarket was slow ; fall back to None which makes
+                # place_real_bet do the slow fresh fetch.
+                prefetched_market = None
+                prefetched_balance = None
+                try:
+                    if pre_market_fut is not None:
+                        prefetched_market = pre_market_fut.result(timeout=3)
+                except Exception as e:
+                    logging.warning("pre_market_fut failed (will refetch inline): %s", e)
+                try:
+                    if pre_balance_fut is not None:
+                        prefetched_balance = pre_balance_fut.result(timeout=3)
+                except Exception as e:
+                    logging.warning("pre_balance_fut failed (will refetch inline): %s", e)
+
                 bet_row = place_real_bet(
                     polymarket_client, team, p_up, p_dn,
                     target_open_ms=next_boundary_ms, dry_run=dry_run,
                     context={
                         "th_up": th_up, "th_dn": th_dn,
-                        "volatility_state": int(feats_up["volatility_state"]),
-                        "is_weekend": int(feats_up["is_weekend"]),
+                        "volatility_state": int(feats_for_bucket["volatility_state"]),
+                        "is_weekend": int(feats_for_bucket["is_weekend"]),
                         "hour": hour,
                     },
+                    prefetched_balance=prefetched_balance,
+                    prefetched_market=prefetched_market,
                 )
                 target_open_iso = pd.Timestamp(int(bet_row["target_open_ms"]), unit="ms", tz="UTC").strftime("%H:%M")
                 target_close_iso = pd.Timestamp(int(bet_row["target_close_ms"]), unit="ms", tz="UTC").strftime("%H:%M UTC")
-                notify.send_bet_placed(
+                # Fire telegram in the background -- the order has already been
+                # placed, the user doesn't need us to block on the Telegram POST.
+                _BG_EXECUTOR.submit(
+                    notify.send_bet_placed,
                     direction=str(bet_row["direction"]),
                     usdc_amount=float(bet_row["bet_size_usdc"]),
                     fill_price=bet_row.get("fill_price_avg"),
@@ -1037,17 +1235,21 @@ def main():
                     shares_filled=float(bet_row["shares_filled"]) if bet_row.get("shares_filled") else None,
                     error_msg=str(bet_row.get("error_msg") or ""),
                 )
+            t_after_bet = time.perf_counter()
 
             # === 5. Render ===
             cycle_n = stats["cycles"] + 1
             render_cycle(cycle_n, just_closed_open, resolution, prediction, stats)
 
             # === 6. Telegram notif (only when a real bet was just resolved) ===
+            # Fire-and-forget : the resolution is already in stats / bets.csv ;
+            # the Telegram POST can finish on its own time.
             if resolution is not None and pending is not None and pending["team"] in ("UP", "DOWN"):
                 bet_conf = pending["p_up"] if pending["team"] == "UP" else pending["p_dn"]
                 target_ms = pending["target_open"]
                 close_ms = target_ms + INTERVAL_15M_MS
-                notify.send_resolution(
+                _BG_EXECUTOR.submit(
+                    notify.send_resolution,
                     cycle_n=stats["cycles"],  # # of the cycle that just RESOLVED
                     bar_close_ts_iso=pd.Timestamp(close_ms, unit="ms", tz="UTC")
                                        .strftime("%Y-%m-%d %H:%M UTC"),
@@ -1064,14 +1266,29 @@ def main():
 
             # === 7. Save pending for next cycle ===
             # Carries the full decision context so the next cycle can write a
-            # complete paper bets.csv row when this cycle resolves.
+            # complete paper bets.csv row when this cycle resolves. The bucket
+            # comes from the model that actually bet (matches what the sidecar
+            # used to pick the threshold).
+            pending_bucket_feats = feats_up if team == "UP" else feats_dn
             pending = {"target_open": next_boundary_ms, "team": team,
                        "p_up": p_up, "p_dn": p_dn,
                        "th_up": th_up, "th_dn": th_dn,
                        "cycle_at": row["cycle_at"],
-                       "volatility_state": int(feats_up["volatility_state"]),
-                       "is_weekend": int(feats_up["is_weekend"]),
+                       "volatility_state": int(pending_bucket_feats["volatility_state"]),
+                       "is_weekend": int(pending_bucket_feats["is_weekend"]),
                        "hour": hour}
+
+            # === 8. Per-cycle timing breakdown (for performance monitoring) ===
+            t_cycle_end = time.perf_counter()
+            logging.info(
+                "cycle timing : fresh=%.2fs fetch=%.2fs predict=%.2fs bet=%.2fs render=%.2fs TOTAL=%.2fs",
+                t_after_fresh - t_cycle_start,
+                t_after_fetch - t_after_fresh,
+                t_after_predict - t_after_fetch,
+                t_after_bet - t_after_predict,
+                t_cycle_end - t_after_bet,
+                t_cycle_end - t_cycle_start,
+            )
 
         except KeyboardInterrupt:
             console.print("\n[bold red]Stopping.[/bold red]")

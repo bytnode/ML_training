@@ -6,8 +6,11 @@ build_master_15m but runs on klines buffers instead of the SQLite DB.
 
 Public API
 ----------
-    build_features(klines_15m, klines_5m, klines_30m, klines_1h) -> dict
-        Returns the feature dict for the LAST CLOSED 15m bar.
+    build_features(klines_15m, klines_5m, klines_30m, klines_1h,
+                   klines_eth_15m) -> dict
+        Returns the feature dict for the LAST CLOSED 15m bar, including the
+        14 exogenous ETH/USD `ef_*` features (ported from the backtest patch
+        modele_down/add_eth_features.py).
 
 Convention : klines = list of [open_time_ms, open, high, low, close, volume].
 """
@@ -88,22 +91,103 @@ def _add_lookup_features_live(df_15m: pd.DataFrame, df_other: pd.DataFrame,
     return df_15m
 
 
-# Columns from modele_down parquet (= the feature schema the model was trained on)
+# Columns from modele_down parquet (= the feature schema the model was trained on).
+# 2026-05-25 cleanup: dropped volume_ratio_30m, body_ratio_close_30m, hour_sin;
+# added volume_rel_30d (ported from modele_up). See backtest clean_parquet.py.
 _PARQUET_COLS = [
     "high_ret", "low_ret", "close_ret",
     "high_ret_5m", "low_ret_5m", "close_ret_5m", "obv_pressure_5m",
-    "low_ret_30m", "close_ret_30m", "volume_ratio_30m", "body_ratio_close_30m",
+    "low_ret_30m", "close_ret_30m",
     "low_ret_1h", "close_ret_1h",
-    "dist_ema_20", "return_3", "hour_sin",
+    "dist_ema_20", "return_3",
     "macd", "macd_hist", "bb_position", "mfi_norm",
     "is_weekend", "volatility_state",
     "dist_to_high_50", "dist_to_low_50",
     "autocorr_24", "acc_4",
+    "volume_rel_30d",
 ]
 
+# 5 exogenous ETH/USD 15m features kept after the 2026-05-25 cleanup. Pruned
+# from 14 -> 5 to remove redundancy (ef_ret1<->ef_body r=0.98, ef_macd_hist<->
+# ef_ret8 r=0.84, etc.). Joined onto each BTC bar by EXACT timestamp -- the
+# concurrent ETH 15m bar shares the BTC open_time and closes at decision time T.
+_ETH_FEATURES = ["ef_ret2", "ef_ret8", "ef_streak", "ef_macd", "ef_body"]
 
-def build_features(klines_15m, klines_5m, klines_30m, klines_1h) -> dict:
-    """Build the feature row for the LAST CLOSED 15m bar (= last_idx = -2)."""
+
+def _eth_ema(s: pd.Series, span: int) -> pd.Series:
+    return s.ewm(span=span, adjust=False).mean()
+
+
+def _eth_streak(close_ret: pd.Series) -> np.ndarray:
+    """Signed run length: +k after k green ETH bars, -k after k red bars."""
+    sign = np.sign(close_ret.to_numpy())
+    s = pd.Series(sign)
+    grp = (s != s.shift()).cumsum()
+    run = s.groupby(grp).cumcount().to_numpy() + 1
+    return run * sign
+
+
+def _compute_eth_features(eth: pd.DataFrame) -> pd.DataFrame:
+    """ETH 15m OHLCV -> DataFrame[timestamp_ms + 14 ef_ feature columns].
+
+    Exact port of modele_down/add_eth_features.compute_eth_features so the
+    live ef_* values reproduce the patched parquet the model trained on.
+    """
+    eth = eth.sort_values("timestamp_ms").reset_index(drop=True)
+    o = eth["open"].astype(float)
+    h = eth["high"].astype(float)
+    l = eth["low"].astype(float)
+    c = eth["close"].astype(float)
+    cp = c.shift(1)
+    cr = (c - cp) / cp
+    vol = eth["volume"].astype(float)
+
+    f = {"timestamp_ms": eth["timestamp_ms"].to_numpy(dtype=np.int64)}
+
+    # momentum -- only ef_ret2 and ef_ret8 are kept after the 2026-05-25 prune.
+    for n in (2, 8):
+        f[f"ef_ret{n}"] = (c / c.shift(n) - 1.0).to_numpy()
+
+    # trend
+    f["ef_streak"] = _eth_streak(cr)
+    macd = (_eth_ema(c, 12) - _eth_ema(c, 26)) / c
+    f["ef_macd"] = macd.to_numpy()
+
+    # microstructure -- only ef_body retained.
+    f["ef_body"] = ((c - o) / cp).to_numpy()
+
+    return pd.DataFrame(f)
+
+
+def _eth_features_for_ts(klines_eth_15m, target_ts: int) -> dict:
+    """The 14 ef_* values for the ETH 15m bar at exactly `target_ts`.
+
+    Missing ETH data (empty buffer or no concurrent bar) -> all-NaN. XGBoost
+    routes NaN natively, exactly as the backtest parquet does for BTC bars
+    that predate ETH history.
+    """
+    nan_row = {col: float("nan") for col in _ETH_FEATURES}
+    if not klines_eth_15m:
+        return nan_row
+    eth_feat = _compute_eth_features(_klines_to_df(klines_eth_15m))
+    hit = eth_feat.loc[eth_feat["timestamp_ms"] == int(target_ts)]
+    if len(hit) != 1:
+        return nan_row
+    r = hit.iloc[0]
+    return {col: float(r[col]) for col in _ETH_FEATURES}
+
+
+def build_features(klines_15m, klines_5m, klines_30m, klines_1h,
+                   klines_eth_15m=None) -> dict:
+    """Build the feature row for the LAST CLOSED 15m bar (= last_idx = -2).
+
+    `klines_eth_15m` is the ETH/USD 15m buffer used for the 5 kept `ef_*`
+    features; pass None (or an empty list) and they fall back to NaN.
+
+    The 2026-05-25 cleanup removed `p_up_xmodel` (was in-sample leakage):
+    the cross-model gating is now only applied at runtime via the
+    `max_p_up_runtime` sidecar field inside live.py.
+    """
     # Phase 1: compute per-TF normalized features
     feat_15 = compute_normalized_features(_klines_to_df(klines_15m))
     feat_5  = compute_normalized_features(_klines_to_df(klines_5m))
@@ -130,7 +214,7 @@ def build_features(klines_15m, klines_5m, klines_30m, klines_1h) -> dict:
     _add_tier1_derived(feat_15)
     _add_tier2(feat_15)
 
-    # Phase 4: dist_to_high_50 / dist_to_low_50 / autocorr_24 / acc_4
+    # Phase 4: dist_to_high_50 / dist_to_low_50 / autocorr_24 / acc_4 / volume_rel_30d
     close = feat_15["close"].to_numpy(dtype=float)
     high_50 = pd.Series((feat_15["high_ret"] + 1) * pd.Series(close).shift(1)).rolling(50).max()
     low_50  = pd.Series((feat_15["low_ret"]  + 1) * pd.Series(close).shift(1)).rolling(50).min()
@@ -139,6 +223,12 @@ def build_features(klines_15m, klines_5m, klines_30m, klines_1h) -> dict:
     cr = feat_15["close_ret"]
     feat_15["autocorr_24"] = cr.rolling(24).corr(cr.shift(1))
     feat_15["acc_4"] = (pd.Series(close) - 2 * pd.Series(close).shift(4) + pd.Series(close).shift(8)) / pd.Series(close).shift(8)
+
+    # volume_rel_30d : volume relative to its 30-day rolling mean (2880 15m bars).
+    # Ported from modele_up parquet on 2026-05-25; min_periods set high enough to
+    # avoid noisy values on cold start (warmup config in live.py = 3200 bars).
+    vol = feat_15["volume"].astype(float)
+    feat_15["volume_rel_30d"] = vol / vol.rolling(2880, min_periods=2880).mean()
 
     # Phase 5: is_weekend + volatility_state
     ts = pd.to_datetime(feat_15["timestamp_ms"], unit="ms", utc=True)
@@ -162,6 +252,8 @@ def build_features(klines_15m, klines_5m, klines_30m, klines_1h) -> dict:
             out[c] = int(v)
         else:
             out[c] = float(v)
+    # Exogenous ETH/USD features -- exact-timestamp join onto the target bar.
+    out.update(_eth_features_for_ts(klines_eth_15m, int(row["timestamp_ms"])))
     return out
 
 

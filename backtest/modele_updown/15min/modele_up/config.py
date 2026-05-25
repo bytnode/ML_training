@@ -27,7 +27,7 @@ WARMUP = 500            # bars 15m ignorées en début (warmup ATR long)
 # --- Volatility state (seul calcul dérivé en plus des colonnes DB) ---
 # ratio = atr_15m / rolling_mean(atr_15m, ATR_LONG_PERIOD)
 # bucket : 0 = low (< VOLATILITY_LOW), 1 = mid, 2 = high (> VOLATILITY_HIGH)
-ATR_LONG_PERIOD = 100
+ATR_LONG_PERIOD = 500
 VOLATILITY_HIGH = 1.5
 VOLATILITY_LOW = 0.7
 
@@ -40,7 +40,7 @@ VOLATILITY_LOW = 0.7
 MODEL_OUTPUT = "btc_updown_model.json"
 
 TRAIN_DAYS = 3600
-TEST_DAYS = 366
+TEST_DAYS = 365
 VAL_FRACTION = 0.1
 
 # ============================================================
@@ -75,8 +75,8 @@ ADAPTIVE_STRATEGY = "asym_wknd_excl_hour_boost"
 # trouve sur TEST_DAYS=365 (V1=1761 paris @ 59.23%):
 #   - weekday : T_wd=0.594 = val_weekday_pool quantile_98.7 (275/21706 = 1.27%)
 #   - weekend : T_we=0.555 = val_weekend_pool quantile_83.3 (1499/8960 = 16.72%)
-ASYM_VOL_FRAC_WEEKDAY = 0.018       # top 1.3% du val weekday non-skip
-ASYM_VOL_FRAC_WEEKEND = 0.18       # top 16.7% du val weekend non-skip
+ASYM_VOL_FRAC_WEEKDAY = 0.01       # top 1.3% du val weekday non-skip
+ASYM_VOL_FRAC_WEEKEND = 0.075      # top 16.7% du val weekend non-skip
 ASYM_SKIP_CELLS = ((2, 0), (2, 1))  # (volatility_state, is_weekend) exclus
 ASYM_USE_FULL_VAL = True            # True = full val, False = derniers 55j
 
@@ -85,7 +85,34 @@ ASYM_USE_FULL_VAL = True            # True = full val, False = derniers 55j
 # le seuil de la bougie est abaisse de ASYM_HOUR_BOOST_DELTA. Les cellules
 # skippees (ASYM_SKIP_CELLS) ne sont jamais boostees.
 ASYM_HOUR_BOOST_GOOD_HOURS = (20, 21, 22)
-ASYM_HOUR_BOOST_DELTA = 0.020
+ASYM_HOUR_BOOST_DELTA = 0.02
+
+# --- Bad-hours exclusion (V2 extension) ---
+# UTC hours where we NEVER bet, regardless of confidence.
+# Empirical losers on weekday+weekend mix (cf optimize/deep_analysis.py) :
+#   hour 2  (35 % WR weekday, 68 % weekend)
+#   hour 4  (22 % WR weekday, 83 % weekend - small)  -> dropped, weekend rescues it
+#   hour 8  (20 % WR weekday, 58 % weekend)
+#   hour 11 (46 % WR weekday, 56 % weekend)
+#   hour 23 (56 % WR weekday, 52 % weekend)
+# Hour 23 was even in the OLD hour_boost (= MORE bets there) which was
+# clearly hurting. Removed from boost above + added to bad_hours.
+ASYM_BAD_HOURS = (2, 4, 8, 11, 16, 23)
+
+# --- Cross-model filter (V3 extension) ---
+# Pour chaque bar pris par modele_up, on lit p_down du modele_down (meme bar,
+# join par timestamp) et on n'engage le pari UP que si p_down < ASYM_MAX_P_DOWN.
+# Rationale (cf optimize/deep_analysis.py) : sur les 1159 bets actuels,
+# p_down in [0.47, 0.50) donne 51.2 % WR vs 63.7 % pour p_down in [0.45, 0.47).
+# La frontiere est nette autour de 0.47.
+# 1.0 desactive le filtre (= use p_down_xmodel as a model feature instead).
+ASYM_MAX_P_DOWN = 0.530
+# 2026-05-25 : retuned from 0.470 -> 0.530 because modele_down's p_down distribution
+# was shifted upward (mean 0.50 -> 0.55) by the spw=1.30 fix that aligned its
+# probability distribution with UP (cf project_modele_down_15min_high_wr). The
+# old 0.47 cutoff rejected 100 % of UP bets after the shift; 0.530 reproduces
+# the same SEMANTIC filter (bars where modele_down is "above its own mean").
+ASYM_MODELE_DOWN_PREDS = "../modele_down/logs/test_predictions.csv"
 
 # --- Hyperparamètres XGBoost (identiques à modele_15m) ---
 XGB_N_ESTIMATORS = 1000

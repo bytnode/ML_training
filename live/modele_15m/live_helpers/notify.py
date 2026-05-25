@@ -239,11 +239,16 @@ def send_bet_placed(direction: str, usdc_amount: float, fill_price: float | None
 def send_bet_resolved_real(direction: str, outcome: str, source: str,
                             realized_pnl_usdc: float | None,
                             fill_price: float | None, target_close_iso: str,
-                            running_bets: int, running_pnl: float) -> None:
+                            running_bets: int, running_pnl: float,
+                            redeem_tx_hash: str | None = None) -> None:
     """Sent when a real bet's outcome lands in bets.csv (win/loss).
 
     `outcome` is one of: 'win' / 'loss' / 'bitstamp_win' / 'bitstamp_loss'.
     `source` is one of: 'polymarket' / 'bitstamp_fallback'.
+    `redeem_tx_hash`: on wins only, the tx hash returned by client.redeem().
+        - a real 0x... hash -> auto-redeem succeeded (no operator action needed)
+        - 'MANUAL_REDEEM_REQUIRED' -> relayer key missing, operator must claim
+        - None -> redeem was not attempted (typically: loss, or pre-redeem state)
     """
     if not is_configured():
         return
@@ -256,11 +261,19 @@ def send_bet_resolved_real(direction: str, outcome: str, source: str,
     pnl_str = f"{realized_pnl_usdc:+.2f}" if realized_pnl_usdc is not None else "n/a"
     fill_str = f"{fill_price:.4f}" if fill_price is not None else "n/a"
 
-    # On a win, winnings sit as CTF shares in the deposit wallet until claimed.
-    # CLOB V2 deposit-wallet redemption is operator-gated (see polymarket.redeem),
-    # so it can't be automated - remind the operator to claim it by hand.
-    redeem_note = ("\n\n⚠️ CLAIM: redeem this win manually on polymarket.com"
-                   if is_win else "")
+    # Redeem footer: depends on what client.redeem() returned for this win.
+    # Only show a footer on a WIN -- losses have nothing to redeem.
+    if not is_win:
+        redeem_note = ""
+    elif redeem_tx_hash is None:
+        redeem_note = "\n\n⚠️ redeem not attempted - check logs"
+    elif redeem_tx_hash == "MANUAL_REDEEM_REQUIRED":
+        redeem_note = ("\n\n⚠️ CLAIM: no RELAYER_API_KEY configured - redeem "
+                       "this win manually on polymarket.com")
+    else:
+        # auto-redeem succeeded; show short tx hint
+        tx_short = redeem_tx_hash[:10] + "..." if len(redeem_tx_hash) > 10 else redeem_tx_hash
+        redeem_note = f"\n\n✅ auto-redeemed (tx {tx_short})"
 
     text = (
         f"<b>{emoji} REAL BET {verdict}</b>\n"

@@ -7,10 +7,13 @@ internal format used by features_up/features_down:
 Usage:
     klines_15m = fetch_klines("btcusd", "15m", n_bars=3200)
     klines_5m  = fetch_klines("btcusd", "5m",  n_bars=200)
+
+For multi-TF parallel fetch (warm or cold), see fetch_many_parallel below.
 """
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterable
 
 import requests
@@ -27,29 +30,58 @@ TF_STEP_SEC = {
 INTERVAL_MS = {tf: sec * 1000 for tf, sec in TF_STEP_SEC.items()}
 MAX_LIMIT = 1000  # Bitstamp hard cap
 
+REQUEST_TIMEOUT_S = 15            # per-request timeout (bumped from 10 for parallel)
+REQUEST_RETRIES = 3               # retry on timeout / connection error
+REQUEST_BACKOFF_S = 0.5           # exponential backoff base : 0.5, 1.0, 2.0, ...
+
+# Module-level requests Session for HTTP keep-alive. Each thread sees the same
+# Session but urllib3's pool gives each thread its own connection from the
+# pool. With 5 concurrent threads we need a pool of >=5 per host to avoid
+# blocking. requests.Session() defaults to pool_connections=10 which is enough.
+# Without a Session, each call does a fresh TCP + TLS handshake (~300-500ms),
+# completely dominating the call latency.
+_SESSION = requests.Session()
+
 
 def _request_chunk(pair: str, step_sec: int, limit: int, end_sec: int | None = None) -> list[list]:
     """One Bitstamp call. If end_sec is given, returns bars ending at or before that time.
     Returns list of [open_time_ms, open, high, low, close, volume].
+
+    Retries up to REQUEST_RETRIES times on timeout / connection error with
+    exponential backoff. Raises the last exception if all retries fail.
     """
     params = {"step": step_sec, "limit": limit}
     if end_sec is not None:
         params["end"] = end_sec
     url = BITSTAMP_OHLC.format(pair=pair)
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    data = r.json().get("data", {}).get("ohlc", [])
-    return [
-        [
-            int(c["timestamp"]) * 1000,
-            float(c["open"]),
-            float(c["high"]),
-            float(c["low"]),
-            float(c["close"]),
-            float(c["volume"]),
-        ]
-        for c in data
-    ]
+
+    last_exc: Exception | None = None
+    for attempt in range(REQUEST_RETRIES + 1):
+        try:
+            r = _SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT_S)
+            r.raise_for_status()
+            data = r.json().get("data", {}).get("ohlc", [])
+            return [
+                [
+                    int(c["timestamp"]) * 1000,
+                    float(c["open"]),
+                    float(c["high"]),
+                    float(c["low"]),
+                    float(c["close"]),
+                    float(c["volume"]),
+                ]
+                for c in data
+            ]
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError) as e:
+            last_exc = e
+            if attempt < REQUEST_RETRIES:
+                time.sleep(REQUEST_BACKOFF_S * (2 ** attempt))
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    return []
 
 
 def fetch_klines(pair: str, tf: str, n_bars: int) -> list[list]:
@@ -108,6 +140,29 @@ def merge_klines(buffer: list[list], fresh: list[list]) -> list[list]:
 
 def latest_open_ms(klines: list[list]) -> int:
     return int(klines[-1][0]) if klines else 0
+
+
+def fetch_many_parallel(specs: list[tuple[str, str, int]]) -> dict[tuple[str, str], list[list]]:
+    """Parallel fetch of multiple (pair, tf, n_bars) tuples in one shot.
+
+    Each tuple becomes a separate ThreadPool task. Total wall time is ~ the
+    SLOWEST single fetch (dominated by Bitstamp publish latency + 1 HTTP RTT),
+    not the SUM. Replaces 5 serial fetch_klines calls (~2.5s) with one
+    parallel batch (~0.3-0.7s).
+
+    Returns a dict keyed by (pair, tf) -> klines list. Caller is responsible
+    for merging into any pre-existing cached buffer.
+
+    If any task raises, the exception propagates (sequential semantics on error).
+    """
+    if not specs:
+        return {}
+    with ThreadPoolExecutor(max_workers=len(specs)) as ex:
+        futures = {
+            (pair, tf): ex.submit(fetch_klines, pair, tf, n_bars)
+            for (pair, tf, n_bars) in specs
+        }
+        return {key: fut.result() for key, fut in futures.items()}
 
 
 if __name__ == "__main__":

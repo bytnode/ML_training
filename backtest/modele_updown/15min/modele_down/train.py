@@ -29,6 +29,8 @@ from config import (
     ASYM_VOL_FRAC_WEEKDAY, ASYM_VOL_FRAC_WEEKEND, ASYM_SKIP_CELLS,
     ASYM_USE_FULL_VAL,
     ASYM_HOUR_BOOST_GOOD_HOURS, ASYM_HOUR_BOOST_DELTA,
+    ASYM_BAD_HOURS,
+    ASYM_MAX_P_UP, ASYM_MODELE_UP_PREDS,
     XGB_N_ESTIMATORS, XGB_MAX_DEPTH, XGB_LEARNING_RATE,
     XGB_MIN_CHILD_WEIGHT, XGB_SUBSAMPLE, XGB_COLSAMPLE_BYTREE,
     XGB_REG_LAMBDA, XGB_REG_ALPHA, XGB_GAMMA,
@@ -109,8 +111,14 @@ def save_thresholds_sidecar_asym(model_path, thresholds_per_wknd: dict, skip_cel
 
 def save_thresholds_sidecar_asym_hour_boost(model_path, thresholds_per_wknd: dict,
                                              skip_cells: list, good_hours: tuple,
-                                             hour_boost_delta: float, metadata=None):
-    """Sidecar V2 (asym_wknd_excl_hour_boost) : V1 + champ optional `hour_boost`."""
+                                             hour_boost_delta: float,
+                                             bad_hours: tuple = (),
+                                             max_p_up_runtime: float = 1.0,
+                                             metadata=None):
+    """Sidecar V2 (asym_wknd_excl_hour_boost) : V1 + champ optional `hour_boost`
+    + champ optional `bad_hours` (= heures UTC ou on ne parie jamais)
+    + champ optional `max_p_up_runtime` (= filtre cross-model qui rejette
+    le bet DOWN si modele_up's p_up >= ce seuil. 1.0 = filtre desactive)."""
     sidecar = Path(model_path).with_suffix(".thresholds.json")
     payload = {
         "strategy": "asym_wknd_excl_hour_boost",
@@ -120,6 +128,8 @@ def save_thresholds_sidecar_asym_hour_boost(model_path, thresholds_per_wknd: dic
             "good_hours": [int(h) for h in good_hours],
             "delta": float(hour_boost_delta),
         },
+        "bad_hours": [int(h) for h in bad_hours],
+        "max_p_up_runtime": float(max_p_up_runtime),
         "metadata": metadata or {},
     }
     with open(sidecar, "w") as f:
@@ -139,6 +149,38 @@ def hour_of_day_from_ms(ts_ms: np.ndarray) -> np.ndarray:
 
 
 # ============================================================
+#  Cross-model p_up loader (V3 extension)
+# ============================================================
+def _load_p_up_keep_mask(test_ts_ms: np.ndarray, preds_path: str,
+                         max_p_up: float) -> np.ndarray:
+    """Renvoie un mask boolean (1 par bar de `test_ts_ms`) :
+       True ssi le modele_up a predit `p_up < max_p_up` sur le meme timestamp.
+    Bars sans match (timestamp absent du CSV modele_up) sont REJETEs
+    (mask = False) -- conservatif : pas de pari sans confirmation cross-model.
+    """
+    p_up_path = (ROOT / preds_path).resolve() if not Path(preds_path).is_absolute() \
+                else Path(preds_path)
+    if not p_up_path.exists():
+        print(f"  WARN: modele_up preds not found at {p_up_path}, cross-model filter DISABLED")
+        return np.ones(len(test_ts_ms), dtype=bool)
+    up = pd.read_csv(p_up_path, usecols=["timestamp", "p_up"])
+    # Map timestamp -> p_up.
+    up_map = dict(zip(up["timestamp"].astype("int64").to_numpy(),
+                       up["p_up"].astype(float).to_numpy()))
+    keep = np.zeros(len(test_ts_ms), dtype=bool)
+    n_missing = 0
+    for i, ts in enumerate(test_ts_ms):
+        p_up = up_map.get(int(ts))
+        if p_up is None:
+            n_missing += 1
+            continue
+        keep[i] = (p_up < max_p_up)
+    if n_missing > 0:
+        print(f"  cross-model: {n_missing}/{len(test_ts_ms)} test bars had no modele_up match (rejected)")
+    return keep
+
+
+# ============================================================
 #  Asymmetric weekday/weekend strategy with cell exclusions (V1)
 # ============================================================
 def compute_thresholds_asym_wknd_excl(
@@ -149,6 +191,7 @@ def compute_thresholds_asym_wknd_excl(
     skip_cells=ASYM_SKIP_CELLS,
     use_full_val: bool = ASYM_USE_FULL_VAL,
     calib_days: int = 55,
+    bad_hours: tuple = (),
 ):
     """Calibration par quantile :
       T_axis = val_pool_quantile(1 - vol_frac_axis)
@@ -157,11 +200,16 @@ def compute_thresholds_asym_wknd_excl(
     Stable cross-window car le quantile s'auto-ajuste a la distribution
     p_down de la fenetre val.
 
+    `bad_hours` : heures UTC ou on ne parie jamais -> exclues du pool de
+    calibration pour que le quantile reflete la distribution effective des
+    bars sur lesquels on parie reellement.
+
     Renvoie :
         thresholds_per_wknd : {0: T_wd, 1: T_we}
         report : list[dict]
     """
     skip_set = set((int(v), int(w)) for (v, w) in skip_cells)
+    bad_hours_set = set(int(h) for h in bad_hours)
 
     if len(val_df) == 0 or "volatility_state" not in val_df.columns or "is_weekend" not in val_df.columns:
         return {0: 1.0, 1: 1.0}, []
@@ -178,10 +226,14 @@ def compute_thresholds_asym_wknd_excl(
     labels = val_df["label"].to_numpy().astype(int)
     vol_arr = val_df["volatility_state"].astype(int).to_numpy()
     wknd_arr = val_df["is_weekend"].astype(int).to_numpy()
+    hour_arr = hour_of_day_from_ms(val_df["timestamp"].to_numpy())
 
     not_skipped = np.ones(len(val_df), dtype=bool)
     for (v, w) in skip_set:
         not_skipped &= ~((vol_arr == v) & (wknd_arr == w))
+    if bad_hours_set:
+        bad_mask = np.isin(hour_arr, list(bad_hours_set))
+        not_skipped &= ~bad_mask
     cal_mask = mask & not_skipped
 
     thresholds_per_wknd = {}
@@ -189,13 +241,24 @@ def compute_thresholds_asym_wknd_excl(
     for wknd_axis, vol_frac in ((0, vol_frac_wd), (1, vol_frac_we)):
         axis_mask = cal_mask & (wknd_arr == wknd_axis)
         n_axis = int(axis_mask.sum())
+        # Detect "axis fully skipped" : all (vol, wknd_axis) cells are in
+        # skip_set. This is the intentional case (e.g. skip-all-weekday) and
+        # should be labeled as such -- NOT "insufficient_data" which suggests
+        # a data bug.
+        axis_cells_skipped = all((int(v), int(wknd_axis)) in skip_set for v in (0, 1, 2))
         if n_axis < 30 or vol_frac <= 0:
             thresholds_per_wknd[wknd_axis] = 1.0
+            if axis_cells_skipped:
+                source = "axis_fully_skipped"
+            elif vol_frac <= 0:
+                source = "vol_frac=0"
+            else:
+                source = "insufficient_data"
             report.append({
                 "axis": "weekday" if wknd_axis == 0 else "weekend",
                 "wknd": wknd_axis, "vol_frac": vol_frac, "n_val": n_axis,
                 "T": None, "wr_val_at_T": None, "n_at_T": 0,
-                "source": "insufficient_data" if n_axis < 30 else "vol_frac=0",
+                "source": source,
             })
             continue
 
@@ -242,11 +305,14 @@ def apply_thresholds_asym_wknd_excl(df, p_down, thresholds_per_wknd: dict,
 def apply_thresholds_asym_hour_boost(df, p_down, thresholds_per_wknd: dict,
                                       skip_cells=ASYM_SKIP_CELLS,
                                       good_hours=ASYM_HOUR_BOOST_GOOD_HOURS,
-                                      hour_boost_delta: float = ASYM_HOUR_BOOST_DELTA) -> np.ndarray:
-    """V2 application : V1 thresholds + boost horaire.
+                                      hour_boost_delta: float = ASYM_HOUR_BOOST_DELTA,
+                                      bad_hours: tuple = ()) -> np.ndarray:
+    """V2 application : V1 thresholds + boost horaire + bad_hours exclusion.
 
-    Pour les rows dont l'heure UTC ∈ good_hours, le seuil effectif est abaisse
+    Pour les rows dont l'heure UTC in good_hours, le seuil effectif est abaisse
     de `hour_boost_delta` (skip cells non boostees).
+    Pour les rows dont l'heure UTC in bad_hours, take = False quel que soit
+    le p_down (filtre dur d'heures losers, comme un skip_cells horaire).
     """
     p_down = np.asarray(p_down, dtype=float)
     if len(df) == 0:
@@ -258,6 +324,7 @@ def apply_thresholds_asym_hour_boost(df, p_down, thresholds_per_wknd: dict,
 
     skip_set = set((int(v), int(w)) for (v, w) in skip_cells)
     good_hours_set = set(int(h) for h in good_hours)
+    bad_hours_set = set(int(h) for h in bad_hours)
     vol = df["volatility_state"].astype(int).to_numpy()
     wknd = df["is_weekend"].astype(int).to_numpy()
     hour = hour_of_day_from_ms(df["timestamp"].to_numpy())
@@ -266,8 +333,11 @@ def apply_thresholds_asym_hour_boost(df, p_down, thresholds_per_wknd: dict,
     for i in range(len(p_down)):
         if (int(vol[i]), int(wknd[i])) in skip_set:
             continue
+        h_i = int(hour[i])
+        if h_i in bad_hours_set:
+            continue
         T = thresholds_per_wknd.get(int(wknd[i]), 1.0)
-        if int(hour[i]) in good_hours_set:
+        if h_i in good_hours_set:
             T = T - hour_boost_delta
         if p_down[i] >= T:
             take[i] = True
@@ -325,7 +395,10 @@ def train_and_evaluate(
     # volatility_state reste dans le parquet (cle de bucket pour le seuil
     # adaptatif) mais n'est PAS donne au modele en feature : delta_logloss
     # negatif lors de l'analyse, le modele s'en sert tres peu.
-    feature_cols = [c for c in df.columns if c not in ("timestamp", "label", "volatility_state")]
+    # is_weekend reste dans le parquet (bucket key pour le seuil adaptatif)
+    # mais n'est PAS donne au modele en feature (mirror modele_up).
+    feature_cols = [c for c in df.columns
+                    if c not in ("timestamp", "label", "volatility_state", "is_weekend")]
     X_train, y_train = train[feature_cols], train["label"]
     X_val, y_val = val[feature_cols], val["label"]
     X_test, y_test = test[feature_cols], test["label"]
@@ -389,7 +462,9 @@ def train_and_evaluate(
     report: list[dict] = []
     if len(val) > 0:
         p_down_val = model.predict_proba(X_val)[:, 1]
-        thresholds_per_wknd, report = compute_thresholds_asym_wknd_excl(val, p_down_val)
+        thresholds_per_wknd, report = compute_thresholds_asym_wknd_excl(
+            val, p_down_val, bad_hours=ASYM_BAD_HOURS,
+        )
 
     # ---- Test predictions ----
     p_down_test = model.predict_proba(X_test)[:, 1]
@@ -397,9 +472,32 @@ def train_and_evaluate(
 
     # ---- Decision sur test (V1 ou V2) ----
     if ADAPTIVE_STRATEGY == "asym_wknd_excl_hour_boost":
-        take_test = apply_thresholds_asym_hour_boost(test, p_down_test, thresholds_per_wknd)
+        take_test = apply_thresholds_asym_hour_boost(
+            test, p_down_test, thresholds_per_wknd, bad_hours=ASYM_BAD_HOURS,
+        )
     else:
         take_test = apply_thresholds_asym_wknd_excl(test, p_down_test, thresholds_per_wknd)
+
+    # ---- Cross-model filter (V3 extension) ----
+    # Si ASYM_MAX_P_UP < 1.0, on lit modele_up's p_up sur les memes timestamps
+    # et on n'engage QUE si p_up < ASYM_MAX_P_UP. Bars sans match (p_up
+    # manquant) sont REJETES par defaut (= conservative : on ne parie pas
+    # sans confirmation cross-model).
+    n_pre_cross = int(take_test.sum())
+    wr_pre_cross = float(y_test.to_numpy().astype(int)[take_test].mean()) if n_pre_cross > 0 else None
+    if ASYM_MAX_P_UP < 1.0:
+        cross_keep = _load_p_up_keep_mask(
+            test["timestamp"].to_numpy(),
+            preds_path=ASYM_MODELE_UP_PREDS,
+            max_p_up=ASYM_MAX_P_UP,
+        )
+        take_test = take_test & cross_keep
+        if verbose:
+            n_post = int(take_test.sum())
+            print(f"  cross-model filter: p_up < {ASYM_MAX_P_UP:.3f}  "
+                  f"=> {n_pre_cross} -> {n_post} bets "
+                  f"(WR pre={wr_pre_cross:.4f})" if wr_pre_cross else "")
+
     label_arr = y_test.to_numpy().astype(int)
 
     n_test = len(test)
@@ -429,11 +527,15 @@ def train_and_evaluate(
             save_thresholds_sidecar_asym_hour_boost(
                 MODEL_OUTPUT, thresholds_per_wknd, list(ASYM_SKIP_CELLS),
                 ASYM_HOUR_BOOST_GOOD_HOURS, ASYM_HOUR_BOOST_DELTA,
+                bad_hours=ASYM_BAD_HOURS,
+                max_p_up_runtime=ASYM_MAX_P_UP,
                 metadata={
                     **common_metadata,
                     **calib_meta,
                     "hour_boost_good_hours": list(ASYM_HOUR_BOOST_GOOD_HOURS),
                     "hour_boost_delta":      ASYM_HOUR_BOOST_DELTA,
+                    "bad_hours":             list(ASYM_BAD_HOURS),
+                    "max_p_up_runtime":      ASYM_MAX_P_UP,
                 },
             )
         else:
@@ -474,6 +576,8 @@ def train_and_evaluate(
     if ADAPTIVE_STRATEGY == "asym_wknd_excl_hour_boost":
         metrics["asym_hour_boost_good_hours"] = str(list(ASYM_HOUR_BOOST_GOOD_HOURS))
         metrics["asym_hour_boost_delta"]      = ASYM_HOUR_BOOST_DELTA
+        metrics["asym_bad_hours"]             = str(list(ASYM_BAD_HOURS))
+        metrics["asym_max_p_up"]              = ASYM_MAX_P_UP
 
     # ---- Print + log ----
     if verbose:
