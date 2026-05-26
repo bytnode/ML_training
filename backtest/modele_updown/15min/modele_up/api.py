@@ -19,8 +19,19 @@ responsable de choisir une fenêtre out-of-sample s'il veut un chiffre non biais
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import xgboost as xgb
+
+# Robust config import: works whether api.py is imported as a submodule via
+# `from modele_up import api` (main.py path) or with the package dir on
+# sys.path (cd modele_up && python predict.py). We read ADAPTIVE_BAD_DAYS /
+# ADAPTIVE_WR_BAD_DAY from config at runtime so the user can re-run main.py
+# after editing config.py without retraining.
+try:
+    from . import config as _cfg
+except ImportError:
+    import config as _cfg
 
 NAME = "modele_up"
 
@@ -94,10 +105,19 @@ def _hour_from_ts_ms(ts_ms) -> int:
     return int(((ts_ms // (15 * 60 * 1000)) % 96) // 4)
 
 
+def _isoweekday_from_ts_ms(ts_ms) -> int:
+    """1=Monday ... 7=Sunday (UTC, isoweekday). Unix epoch 1970-01-01 was a
+    Thursday (=4), so iso = ((days_since_epoch + 3) % 7) + 1."""
+    return ((int(ts_ms) // 86_400_000 + 3) % 7) + 1
+
+
 def _bucket_threshold(volatility_state: int, is_weekend: int, sidecar: dict,
                       ts_ms=None) -> float:
     """Supporte 2 formats sidecar : V1 (asym_wknd_excl) et V2 (asym_wknd_excl_hour_boost),
-    plus l'extension optionnelle V2 `bad_hours`."""
+    plus l'extension optionnelle V2 `bad_hours`.
+
+    Ajoute aussi un boost de seuil pour les jours `ADAPTIVE_BAD_DAYS` lus
+    depuis config.py au runtime (= pas besoin de retrain)."""
     strategy = sidecar.get("strategy")
     if strategy not in ("asym_wknd_excl", "asym_wknd_excl_hour_boost"):
         raise ValueError(f"Sidecar strategy={strategy!r} non supporte. "
@@ -118,6 +138,19 @@ def _bucket_threshold(volatility_state: int, is_weekend: int, sidecar: dict,
         delta = float(hb.get("delta", 0.0))
         if _hour_from_ts_ms(ts_ms) in good_hours:
             T -= delta
+    # Bad-days penalty (config-driven, runtime): raise T on weak weekdays so the
+    # model becomes more selective on those days. isoweekday: 1=Mon..7=Sun.
+    if ts_ms is not None:
+        bad_days = set(int(d) for d in (getattr(_cfg, "ADAPTIVE_BAD_DAYS", ()) or ()))
+        if bad_days and _isoweekday_from_ts_ms(ts_ms) in bad_days:
+            T += float(getattr(_cfg, "ADAPTIVE_WR_BAD_DAY", 0.0))
+    # Bad-hours soft boost (config-driven, runtime): mirror of ASYM_HOUR_BOOST
+    # but ADDS delta instead of subtracting. Lets the model still bet on these
+    # hours if its confidence is high enough (unlike ASYM_BAD_HOURS hard skip).
+    if ts_ms is not None:
+        bad_hours_soft = set(int(h) for h in (getattr(_cfg, "ADAPTIVE_BAD_HOURS", ()) or ()))
+        if bad_hours_soft and _hour_from_ts_ms(ts_ms) in bad_hours_soft:
+            T += float(getattr(_cfg, "ASYM_BAD_HOURS_DELTA", 0.0))
     return T
 
 
@@ -175,13 +208,22 @@ def _predict_all_bars(start_ms: int, end_ms: int) -> pd.DataFrame:
 
     # Cross-model runtime filter : reject UP take when modele_down's p_down
     # exceeds max_p_down_runtime. Mirrors live.py runtime check.
+    #
+    # NaN policy : bars without a cross-model p_down value (= timestamps
+    # outside modele_down's test_predictions.csv coverage, typically older
+    # than its TEST_DAYS window) PASS the filter rather than get rejected.
+    # This lets main.py run team backtests with TEAM_TEST_DAYS > each model's
+    # TEST_DAYS without losing all bars beyond the shared test slice. Live
+    # mode is unaffected (live.py uses the live p_down from the running model
+    # directly, never the CSV).
     max_p_dn_rt = float(sidecar.get("max_p_down_runtime", 1.0))
     if max_p_dn_rt < 1.0:
         dn_map = _load_dn_preds()
         if dn_map:
             ts_arr = df["timestamp_ms"].astype("int64").to_numpy()
-            p_dn_arr = pd.Series([dn_map.get(int(t), float("nan")) for t in ts_arr])
-            reject = (p_dn_arr.to_numpy() >= max_p_dn_rt) | pd.isna(p_dn_arr).to_numpy()
+            p_dn_arr = np.array([dn_map.get(int(t), float("nan")) for t in ts_arr])
+            has_value = ~np.isnan(p_dn_arr)
+            reject = has_value & (p_dn_arr >= max_p_dn_rt)
             df.loc[reject, "take"] = 0
 
     df["timestamp"] = df["timestamp_ms"].astype("int64")

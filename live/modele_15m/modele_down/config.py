@@ -71,14 +71,14 @@ ADAPTIVE_STRATEGY = "asym_wknd_excl_hour_boost"
 # Parametres asym (V1 + V2 partagent le meme bloc) :
 # Fraction de val non-skip a garder par axe. Retunes par audit walk-forward
 # 6 fenetres sur le modele DOWN + features ETH (cf optimize/opt_calib.py).
-ASYM_VOL_FRAC_WEEKDAY = 0.0225     # ignored: weekday is fully skipped below
+ASYM_VOL_FRAC_WEEKDAY = 0.0225    # ignored: weekday is fully skipped below
                                     # (kept for the runs.csv schema only).
 ASYM_VOL_FRAC_WEEKEND = 0.145      # tuned for clean parquet: target T_we ~= 0.5375.
 
 # Skip ALL weekday cells. Per-bucket diagnostic (cf optimize/sweep_high_wr.py)
 # shows weekday WR plafonne at 56-58 % across all volatility states, vs
 # weekend at 59-67 %. Sacrificing weekday volume lifts pooled WR by +3 pt.
-ASYM_SKIP_CELLS = ((0, 0), (1, 0), (2, 0))
+ASYM_SKIP_CELLS = ((2, 0), (2, 1))
 ASYM_USE_FULL_VAL = True            # True = full val, False = derniers 55j
 
 # Parametres specifiques V2 ("asym_wknd_excl_hour_boost") :
@@ -86,15 +86,15 @@ ASYM_USE_FULL_VAL = True            # True = full val, False = derniers 55j
 # from the UP model. On DOWN, hour 22 is the WORST hour empirically
 # (52-55 % WR), so boosting it pulled losing bets in. Empty good_hours +
 # delta=0 = no boost; the V2 strategy still applies correctly.
-ASYM_HOUR_BOOST_GOOD_HOURS = ()
-ASYM_HOUR_BOOST_DELTA = 0.0
+ASYM_HOUR_BOOST_GOOD_HOURS = (13, 20, 21, 22)
+ASYM_HOUR_BOOST_DELTA = 0.01
 
 # --- Bad-hours exclusion (V2 extension) ---
 # UTC hours where we NEVER bet, regardless of confidence. Empirical losers
 # on weekend (Asian off-peak + lunch dump): hour 3, 4, 11, 13, 22 sit at
 # 51-58 % WR while pooled weekend WR is ~64 % at the same threshold. Cutting
 # them concentrates volume on the high-WR hours. cf optimize/sweep_weekend_only.py.
-ASYM_BAD_HOURS = (0, 3, 4, 11, 13, 18, 22, 23)
+ASYM_BAD_HOURS = ( 0, 3, 4, 11, 13, 18, 23, )
 
 # --- Cross-model filter (V3 extension) ---
 # Pour chaque bar pris par modele_down, on lit p_up du modele_up (meme bar,
@@ -102,7 +102,7 @@ ASYM_BAD_HOURS = (0, 3, 4, 11, 13, 18, 22, 23)
 # Rationale (cf optimize/deep_analysis.py) : sur les 799 bets actuels,
 # p_up < 0.47 donne 66.4 % WR vs 58.4 % pour p_up >= 0.47 -- ecart de +8 pt
 # pour un seul filtre binaire. ASYM_MAX_P_UP = 1.0 desactive le filtre.
-ASYM_MAX_P_UP = 0.48                # runtime filter (feature was removed from parquet for leakage).
+ASYM_MAX_P_UP = 0.48               # runtime filter (feature was removed from parquet for leakage).
 # Path vers modele_up's test_predictions.csv (relatif au cwd au moment du
 # run -- train.py est suppose etre execute depuis 15min/modele_down/).
 ASYM_MODELE_UP_PREDS = "../modele_up/logs/test_predictions.csv"
@@ -126,7 +126,7 @@ XGB_RANDOM_STATE = 42
 #   False  -> pas passé à XGBoost (= 1.0, comportement par défaut, asymétrie subie)
 #   "auto" -> calculé à l'entraînement = n_up / n_down (équilibrage exact)
 #   float  -> valeur fixe (ex 1.05 pour un upweight DOWN manuel)
-XGB_SCALE_POS_WEIGHT = 1.30
+XGB_SCALE_POS_WEIGHT = 1.3
 # Pourquoi 1.30 et pas 1.03 / "auto" ?
 # La cause DIRECTE de l'incoherence p-distribution UP vs DOWN : XGBoost converge
 # ses predictions vers mean(y_train). UP train_mean=0.5097, DOWN train_mean=0.4903

@@ -45,6 +45,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -76,6 +77,11 @@ ROOT = Path(__file__).resolve().parent       # live/modele_15m/ - self-contained
 LOGS_DIR = ROOT / "logs"
 LIVE_CSV = LOGS_DIR / "live_predictions.csv"
 BETS_CSV = LOGS_DIR / "bets.csv"
+
+# Serializes every read-modify-write or append to bets.csv so the main thread
+# (place_real_bet -> _append_bet_row) and the background resolve thread
+# (resolve_pending_bets -> _save_bets) never clobber each other.
+_BETS_CSV_LOCK = threading.Lock()
 
 # Model artifacts live in this folder's own modele_up/ + modele_down/ subdirs
 # (copies, kept independent of backtest/).
@@ -460,8 +466,9 @@ def _append_bet_row(row: dict) -> None:
     LOGS_DIR.mkdir(exist_ok=True)
     full_row = {k: row.get(k) for k in BETS_COLUMNS}
     df_row = pd.DataFrame([full_row], columns=BETS_COLUMNS)
-    write_header = not BETS_CSV.exists()
-    df_row.to_csv(BETS_CSV, mode="a", header=write_header, index=False)
+    with _BETS_CSV_LOCK:
+        write_header = not BETS_CSV.exists()
+        df_row.to_csv(BETS_CSV, mode="a", header=write_header, index=False)
 
 
 def _window_utc(open_ms: int) -> str:
@@ -591,7 +598,10 @@ def resolve_pending_bets(client, buf_15m: list[list], stats: dict) -> list[dict]
         return []
 
     newly_resolved: list[dict] = []
-    changed = False
+    # Track which bet_ids we mutated on the snapshot so the final save (under
+    # lock) can re-apply by bet_id without holding the lock across the slow
+    # Polymarket / relayer network calls below.
+    changed_bet_ids: list[str] = []
 
     for idx in df.index[pending_mask]:
         row = df.loc[idx]
@@ -600,6 +610,7 @@ def resolve_pending_bets(client, buf_15m: list[list], stats: dict) -> list[dict]
         # for a paper bet if LIVE_MODE was flipped between runs.
         if str(row.get("order_status")) == "paper":
             continue
+        bet_id = str(row["bet_id"])
         slug = str(row["polymarket_slug"])
         target_close_ms = int(row["target_close_ms"])
         cycles_since_close = (now_ms - target_close_ms) // INTERVAL_15M_MS
@@ -616,7 +627,7 @@ def resolve_pending_bets(client, buf_15m: list[list], stats: dict) -> list[dict]
             _write_outcome(df, idx, outcome, source, redeem_tx,
                            resolved_actual=str(winner).lower())
             newly_resolved.append(_resolution_event(df.loc[idx], stats, df))
-            changed = True
+            changed_bet_ids.append(bet_id)
             continue
 
         # 2. Polymarket not resolved yet. Fall back to Bitstamp if at least one
@@ -641,14 +652,14 @@ def resolve_pending_bets(client, buf_15m: list[list], stats: dict) -> list[dict]
                                resolved_actual=actual.lower(),
                                resolved_open=o, resolved_close=c)
                 newly_resolved.append(_resolution_event(df.loc[idx], stats, df))
-                changed = True
+                changed_bet_ids.append(bet_id)
                 continue
 
         # 3. Still nothing. If too many cycles have passed, mark stuck.
         if cycles_since_close > SETTLEMENT_STUCK_AFTER_CYCLES:
             df.at[idx, "outcome"] = "stuck"
             df.at[idx, "outcome_resolved_at_iso"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            changed = True
+            changed_bet_ids.append(bet_id)
             newly_resolved.append({
                 "_stuck": True,
                 "slug": slug,
@@ -656,8 +667,26 @@ def resolve_pending_bets(client, buf_15m: list[list], stats: dict) -> list[dict]
                 "cycles_pending": int(cycles_since_close),
             })
 
-    if changed:
-        _save_bets(df)
+    # Re-apply the snapshot mutations to the live file under the lock so any
+    # row that place_real_bet appended while we were doing network calls is
+    # preserved. We match by bet_id (place_real_bet always writes a fresh uuid,
+    # so no collision with rows we resolved here).
+    if changed_bet_ids:
+        with _BETS_CSV_LOCK:
+            live = _load_bets()
+            if "bet_id" in live.columns:
+                for bet_id in changed_bet_ids:
+                    src_rows = df[df["bet_id"] == bet_id]
+                    if src_rows.empty:
+                        continue
+                    src = src_rows.iloc[0]
+                    dst_mask = live["bet_id"] == bet_id
+                    if not dst_mask.any():
+                        continue
+                    for col in df.columns:
+                        if col in live.columns:
+                            live.loc[dst_mask, col] = src[col]
+                _save_bets(live)
     return newly_resolved
 
 
@@ -1099,19 +1128,13 @@ def main():
             p_dn, take_dn, th_dn = _predict_one(model_dn, sidecar_dn, feats_dn)
             t_after_predict = time.perf_counter()
 
-            # === 3a. Await background resolve (must finish before any new
-            # bets.csv write to avoid the read-modify-write race). Fire its
-            # telegrams in the background so we don't block on the network.
-            if resolve_fut is not None:
-                try:
-                    resolved_events = resolve_fut.result(timeout=10)
-                except Exception as e:
-                    logging.exception("background resolve_pending_bets failed: %s", e)
-                    resolved_events = []
-                if resolved_events:
-                    _BG_EXECUTOR.submit(_emit_resolution_telegrams, resolved_events)
-
             # === 3b. Cross-model runtime filters (post-take gating) ===
+            # resolve_fut keeps running in the background ; its result is no
+            # longer awaited here (used to be step 3a) so place_real_bet below
+            # can fire the POST /order without waiting for the slow Polymarket
+            # settlement reads. The bets.csv read-modify-write race is now
+            # handled by _BETS_CSV_LOCK ; we collect resolved_events after the
+            # POST.
             # Each sidecar carries an optional `max_p_*_runtime` (1.0 = disabled).
             # modele_up's filter : reject UP bet if modele_down's p_down >= max_p_down_runtime.
             # modele_down's filter: reject DOWN bet if modele_up's p_up >= max_p_up_runtime.
@@ -1236,6 +1259,20 @@ def main():
                     error_msg=str(bet_row.get("error_msg") or ""),
                 )
             t_after_bet = time.perf_counter()
+
+            # === 4.6. Await background resolve (moved here from before
+            # team_decision so the POST /order above is never blocked by the
+            # slow Polymarket settlement reads). The _BETS_CSV_LOCK in
+            # _append_bet_row + resolve_pending_bets keeps the read-modify-write
+            # race safe even though they may now run concurrently.
+            if resolve_fut is not None:
+                try:
+                    resolved_events = resolve_fut.result(timeout=10)
+                except Exception as e:
+                    logging.exception("background resolve_pending_bets failed: %s", e)
+                    resolved_events = []
+                if resolved_events:
+                    _BG_EXECUTOR.submit(_emit_resolution_telegrams, resolved_events)
 
             # === 5. Render ===
             cycle_n = stats["cycles"] + 1

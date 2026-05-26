@@ -18,6 +18,13 @@ aure.thresholds.json
 *.sqlite3
 *.log
 
+# Backup files of any of the above (foo.parquet.bak, foo.parquet.bak2,
+# foo.parquet.bak_clean, etc). The *.parquet rule above only matches paths
+# ENDING in .parquet, so .parquet.bak* leaks through without this.
+*.bak
+*.bak[0-9]*
+*.bak_*
+
 # ============================================================
 #  Python
 # ============================================================

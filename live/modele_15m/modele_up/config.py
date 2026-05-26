@@ -27,7 +27,7 @@ WARMUP = 500            # bars 15m ignorées en début (warmup ATR long)
 # --- Volatility state (seul calcul dérivé en plus des colonnes DB) ---
 # ratio = atr_15m / rolling_mean(atr_15m, ATR_LONG_PERIOD)
 # bucket : 0 = low (< VOLATILITY_LOW), 1 = mid, 2 = high (> VOLATILITY_HIGH)
-ATR_LONG_PERIOD = 100
+ATR_LONG_PERIOD = 500
 VOLATILITY_HIGH = 1.5
 VOLATILITY_LOW = 0.7
 
@@ -75,8 +75,8 @@ ADAPTIVE_STRATEGY = "asym_wknd_excl_hour_boost"
 # trouve sur TEST_DAYS=365 (V1=1761 paris @ 59.23%):
 #   - weekday : T_wd=0.594 = val_weekday_pool quantile_98.7 (275/21706 = 1.27%)
 #   - weekend : T_we=0.555 = val_weekend_pool quantile_83.3 (1499/8960 = 16.72%)
-ASYM_VOL_FRAC_WEEKDAY = 0.01       # top 1.3% du val weekday non-skip
-ASYM_VOL_FRAC_WEEKEND = 0.075      # top 16.7% du val weekend non-skip
+ASYM_VOL_FRAC_WEEKDAY = 0.015      # top 1.3% du val weekday non-skip
+ASYM_VOL_FRAC_WEEKEND = 0.125      # top 16.7% du val weekend non-skip
 ASYM_SKIP_CELLS = ((2, 0), (2, 1))  # (volatility_state, is_weekend) exclus
 ASYM_USE_FULL_VAL = True            # True = full val, False = derniers 55j
 

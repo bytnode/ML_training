@@ -23,8 +23,18 @@ responsable de choisir une fenetre out-of-sample s'il veut un chiffre non biaise
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import xgboost as xgb
+
+# Robust config import: works whether api.py is imported as a submodule via
+# `from modele_down import api` (main.py path) or with the package dir on
+# sys.path. ADAPTIVE_BAD_DAYS / ADAPTIVE_WR_BAD_DAY are read at runtime so
+# editing config.py + re-running main.py needs no retrain.
+try:
+    from . import config as _cfg
+except ImportError:
+    import config as _cfg
 
 NAME = "modele_updown"
 
@@ -102,6 +112,12 @@ def _hour_from_ts_ms(ts_ms) -> int:
     return int(((ts_ms // (15 * 60 * 1000)) % 96) // 4)
 
 
+def _isoweekday_from_ts_ms(ts_ms) -> int:
+    """1=Monday ... 7=Sunday (UTC, isoweekday). Unix epoch 1970-01-01 was a
+    Thursday (=4), so iso = ((days_since_epoch + 3) % 7) + 1."""
+    return ((int(ts_ms) // 86_400_000 + 3) % 7) + 1
+
+
 def _bucket_threshold(volatility_state: int, is_weekend: int, sidecar: dict,
                       ts_ms=None) -> float:
     strategy = sidecar.get("strategy")
@@ -125,6 +141,12 @@ def _bucket_threshold(volatility_state: int, is_weekend: int, sidecar: dict,
         delta = float(hb.get("delta", 0.0))
         if _hour_from_ts_ms(ts_ms) in good_hours:
             T -= delta
+    # Bad-days penalty (config-driven, runtime): raise T on weak weekdays so
+    # the model becomes more selective on those days. iso: 1=Mon..7=Sun.
+    if ts_ms is not None:
+        bad_days = set(int(d) for d in (getattr(_cfg, "ADAPTIVE_BAD_DAYS", ()) or ()))
+        if bad_days and _isoweekday_from_ts_ms(ts_ms) in bad_days:
+            T += float(getattr(_cfg, "ADAPTIVE_WR_BAD_DAY", 0.0))
     return T
 
 
@@ -180,13 +202,22 @@ def _predict_all_bars(start_ms: int, end_ms: int) -> pd.DataFrame:
     # max_p_up_runtime < 1.0, reject DOWN take when modele_up's p_up exceeds
     # the threshold. Mirrors live.py's runtime check so team backtest matches
     # live behaviour.
+    #
+    # NaN policy : bars without a cross-model p_up value (= timestamps outside
+    # modele_up's test_predictions.csv coverage, typically older than its
+    # TEST_DAYS window) PASS the filter rather than get rejected. This lets
+    # main.py run team backtests with TEAM_TEST_DAYS > each model's TEST_DAYS
+    # without losing all bars beyond the shared test slice. Live mode is
+    # unaffected (live.py uses the live p_up from the running model directly,
+    # never the CSV).
     max_p_up_rt = float(sidecar.get("max_p_up_runtime", 1.0))
     if max_p_up_rt < 1.0:
         up_map = _load_up_preds()
         if up_map:
             ts_arr = df["timestamp_ms"].astype("int64").to_numpy()
-            p_up_arr = pd.Series([up_map.get(int(t), float("nan")) for t in ts_arr])
-            reject = (p_up_arr.to_numpy() >= max_p_up_rt) | pd.isna(p_up_arr).to_numpy()
+            p_up_arr = np.array([up_map.get(int(t), float("nan")) for t in ts_arr])
+            has_value = ~np.isnan(p_up_arr)
+            reject = has_value & (p_up_arr >= max_p_up_rt)
             df.loc[reject, "take"] = 0
 
     df["timestamp"] = df["timestamp_ms"].astype("int64")

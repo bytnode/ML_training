@@ -53,7 +53,7 @@ ROOT = Path(__file__).resolve().parent
 LOGS_DIR = ROOT / "logs"
 TEAM_RUNS_CSV = LOGS_DIR / "team_runs.csv"
 
-TEAM_TEST_DAYS = 365
+TEAM_TEST_DAYS = 180
 DAY_MS = 24 * 3600 * 1000
 
 
@@ -110,6 +110,39 @@ def build_team_bets(up_bets: pd.DataFrame, down_bets: pd.DataFrame) -> tuple[pd.
 
 def _wr(df: pd.DataFrame) -> float:
     return float(df["label"].mean()) if not df.empty else float("nan")
+
+
+_WEEKDAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday",
+                  "Friday", "Saturday", "Sunday"]
+
+
+def _weekday_take_rate(per_bar: pd.DataFrame) -> pd.DataFrame:
+    """Per-weekday counts of analyzed bars vs bets taken (UP or DOWN). Returns a
+    DataFrame indexed by weekday name (Mon..Sun) with columns
+    [bars, taken, wins, pct_of_taken, wr] where pct_of_taken is the share of
+    THE TOTAL taken bets that fall on this weekday (the 7 values sum to 100%)
+    and wr is the win-rate of taken bets that day."""
+    cols = ["bars", "taken", "wins", "pct_of_taken", "wr"]
+    if per_bar.empty:
+        return pd.DataFrame(columns=cols)
+    weekday = pd.to_datetime(per_bar["timestamp"], unit="ms", utc=True).dt.day_name()
+    bars = weekday.value_counts().reindex(_WEEKDAY_ORDER, fill_value=0)
+    taken_mask = per_bar["team_decision"].isin(["UP", "DOWN"])
+    taken = weekday[taken_mask].value_counts().reindex(_WEEKDAY_ORDER, fill_value=0)
+    win_mask = taken_mask & (per_bar["result"] == "win")
+    wins = weekday[win_mask].value_counts().reindex(_WEEKDAY_ORDER, fill_value=0)
+    out = pd.DataFrame({"bars": bars, "taken": taken, "wins": wins})
+    total_taken = int(taken.sum())
+    if total_taken > 0:
+        out["pct_of_taken"] = (out["taken"] / total_taken * 100).round(2)
+    else:
+        out["pct_of_taken"] = pd.NA
+    # .where(taken > 0) returns floats (NaN for zero-taken rows), so the
+    # division and .round() stay numeric. Using .replace(0, pd.NA) here would
+    # coerce dtype to object and break .round() under pandas >= 2.2.
+    denom = out["taken"].where(out["taken"] > 0)
+    out["wr"] = (out["wins"].astype(float) / denom * 100).round(2)
+    return out
 
 
 def _fmt_ms(ts_ms: int) -> str:
@@ -173,7 +206,10 @@ def main() -> None:
     }
     append_run(stats)
 
-    _render_report(stats, team_wr, up_wr, down_wr, {**log_counts, **full_counts})
+    weekday_table = _weekday_take_rate(per_bar)
+
+    _render_report(stats, team_wr, up_wr, down_wr,
+                   {**log_counts, **full_counts}, weekday_table)
 
 
 def _wr_color(wr: float) -> str:
@@ -190,7 +226,7 @@ def _wr_color(wr: float) -> str:
 
 
 def _render_report(stats: dict, team_wr: float, up_wr: float, down_wr: float,
-                   log_counts: dict) -> None:
+                   log_counts: dict, weekday_table: pd.DataFrame) -> None:
     console = Console()
 
     header = Text.assemble(
@@ -256,6 +292,50 @@ def _render_report(stats: dict, team_wr: float, up_wr: float, down_wr: float,
     coh.add_row(Text("Total team", style="bold"), Text(f"{stats['team_bets']:>5}", style="bold"),
                 "bets actually taken by the team")
     console.print(coh)
+
+    # --- Share of taken bets per weekday (the 7 % values sum to 100%) ---
+    if not weekday_table.empty:
+        wk = Table(
+            title="Share of taken bets per weekday",
+            title_style="bold cyan",
+            border_style="cyan",
+            header_style="bold",
+            show_lines=False,
+            expand=False,
+        )
+        wk.add_column("Day", style="bold")
+        wk.add_column("Bars", justify="right")
+        wk.add_column("Taken", justify="right")
+        wk.add_column("% of taken", justify="right")
+        wk.add_column("WR", justify="right")
+        for day, r in weekday_table.iterrows():
+            pct = r["pct_of_taken"]
+            pct_str = "  n/a" if pd.isna(pct) else f"{pct:6.2f}%"
+            wr = r["wr"]
+            wr_str = "  n/a" if pd.isna(wr) else f"{wr:6.2f}%"
+            wr_style = _wr_color(float(wr) / 100.0) if pd.notna(wr) else "dim"
+            wk.add_row(
+                day,
+                f"{int(r['bars']):>6}",
+                f"{int(r['taken']):>5}",
+                pct_str,
+                Text(wr_str, style=wr_style),
+            )
+        total_bars = int(weekday_table["bars"].sum())
+        total_taken = int(weekday_table["taken"].sum())
+        total_wins = int(weekday_table["wins"].sum())
+        total_pct_str = "  n/a" if total_taken == 0 else "100.00%"
+        total_wr = (total_wins / total_taken * 100) if total_taken else float("nan")
+        total_wr_str = "  n/a" if pd.isna(total_wr) else f"{total_wr:6.2f}%"
+        total_wr_style = _wr_color(total_wr / 100.0) if not pd.isna(total_wr) else "dim"
+        wk.add_row(
+            Text("Total", style="bold"),
+            Text(f"{total_bars:>6}", style="bold"),
+            Text(f"{total_taken:>5}", style="bold"),
+            Text(total_pct_str, style="bold"),
+            Text(total_wr_str, style=f"bold {total_wr_style}"),
+        )
+        console.print(wk)
 
     # --- Final headline ---
     delta_up = team_wr - up_wr

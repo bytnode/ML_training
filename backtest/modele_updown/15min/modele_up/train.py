@@ -27,6 +27,8 @@ from config import (
     ASYM_USE_FULL_VAL,
     ASYM_HOUR_BOOST_GOOD_HOURS, ASYM_HOUR_BOOST_DELTA,
     ASYM_BAD_HOURS,
+    ADAPTIVE_BAD_DAYS, ADAPTIVE_WR_BAD_DAY,
+    ADAPTIVE_BAD_HOURS, ASYM_BAD_HOURS_DELTA,
     ASYM_MAX_P_DOWN, ASYM_MODELE_DOWN_PREDS,
     XGB_N_ESTIMATORS, XGB_MAX_DEPTH, XGB_LEARNING_RATE,
     XGB_MIN_CHILD_WEIGHT, XGB_SUBSAMPLE, XGB_COLSAMPLE_BYTREE,
@@ -156,6 +158,13 @@ def hour_of_day_from_ms(ts_ms: np.ndarray) -> np.ndarray:
     return ((ts_ms // (15 * 60 * 1000)) % 96 // 4).astype(int)
 
 
+def isoweekday_from_ms(ts_ms: np.ndarray) -> np.ndarray:
+    """1=Monday ... 7=Sunday (UTC isoweekday). Unix epoch 1970-01-01 was a
+    Thursday (=4), so iso = ((days_since_epoch + 3) % 7) + 1."""
+    ts_ms = np.asarray(ts_ms, dtype=np.int64)
+    return ((ts_ms // 86_400_000 + 3) % 7 + 1).astype(int)
+
+
 # ============================================================
 #  Cross-model p_down loader (V3 extension)
 # ============================================================
@@ -187,12 +196,21 @@ def apply_thresholds_asym_hour_boost(df, p_up, thresholds_per_wknd: dict,
                                       skip_cells=ASYM_SKIP_CELLS,
                                       good_hours=ASYM_HOUR_BOOST_GOOD_HOURS,
                                       hour_boost_delta: float = ASYM_HOUR_BOOST_DELTA,
-                                      bad_hours: tuple = ()) -> np.ndarray:
+                                      bad_hours: tuple = (),
+                                      bad_days: tuple = ADAPTIVE_BAD_DAYS,
+                                      wr_bad_day: float = ADAPTIVE_WR_BAD_DAY,
+                                      adaptive_bad_hours: tuple = ADAPTIVE_BAD_HOURS,
+                                      bad_hours_delta: float = ASYM_BAD_HOURS_DELTA) -> np.ndarray:
     """V2 application : V1 thresholds + boost horaire + bad_hours exclusion.
 
     Pour les rows dont l'heure UTC in good_hours, le seuil effectif est abaisse
     de `hour_boost_delta`. Pour les rows dont l'heure UTC in bad_hours, take
     = False quel que soit le p_up (filtre dur d'heures losers).
+
+    Soft penalties (ADDED to T, le pari peut encore etre pris si la confiance
+    est assez haute) :
+      - `bad_days` (isoweekday 1=Mon..7=Sun) -> T += wr_bad_day
+      - `adaptive_bad_hours` (heures UTC)    -> T += bad_hours_delta
     """
     p_up = np.asarray(p_up, dtype=float)
     if len(df) == 0:
@@ -205,9 +223,13 @@ def apply_thresholds_asym_hour_boost(df, p_up, thresholds_per_wknd: dict,
     skip_set = set((int(v), int(w)) for (v, w) in skip_cells)
     good_hours_set = set(int(h) for h in good_hours)
     bad_hours_set = set(int(h) for h in bad_hours)
+    bad_days_set = set(int(d) for d in (bad_days or ()))
+    adaptive_bad_hours_set = set(int(h) for h in (adaptive_bad_hours or ()))
     vol = df["volatility_state"].astype(int).to_numpy()
     wknd = df["is_weekend"].astype(int).to_numpy()
-    hour = hour_of_day_from_ms(df["timestamp"].to_numpy())
+    ts_arr = df["timestamp"].to_numpy()
+    hour = hour_of_day_from_ms(ts_arr)
+    iso_day = isoweekday_from_ms(ts_arr)
 
     take = np.zeros(len(p_up), dtype=bool)
     for i in range(len(p_up)):
@@ -219,6 +241,10 @@ def apply_thresholds_asym_hour_boost(df, p_up, thresholds_per_wknd: dict,
         T = thresholds_per_wknd.get(int(wknd[i]), 1.0)
         if h_i in good_hours_set:
             T = T - hour_boost_delta
+        if bad_days_set and int(iso_day[i]) in bad_days_set:
+            T = T + wr_bad_day
+        if adaptive_bad_hours_set and h_i in adaptive_bad_hours_set:
+            T = T + bad_hours_delta
         if p_up[i] >= T:
             take[i] = True
     return take
@@ -569,6 +595,7 @@ def train_and_evaluate(
         _print_evaluation(metrics, model, feature_cols)
         _print_adaptive_section(report)
         _print_bet_samples(test, p_up_test, take_test, label_arr, n_samples=5)
+        _print_hourly_wr(test, take_test, label_arr, side="up")
 
     if log_run:
         append_to_runs_csv(metrics)
@@ -663,6 +690,43 @@ def _print_adaptive_section(report):
         wr_str = f"{r['wr_val_at_T']:.4f}" if r["wr_val_at_T"] is not None else "N/A"
         print(f"  {r['axis']:<10} {r['vol_frac']:<10.4f} {r['n_val']:<8} "
               f"{T_str:<10} {wr_str:<10} {r['n_at_T']:<8} {r['source']}")
+
+
+def _print_hourly_wr(test_df, take, label_raw, side: str = "up"):
+    """Affiche un tableau par heure UTC : n bets pris, n wins, WR.
+    Friday-skip / bad_hours / hour_boost sont DEJA appliques dans take : on lit
+    juste le take final.
+    """
+    take_arr = np.asarray(take, dtype=bool)
+    label_arr = np.asarray(label_raw, dtype=int)
+    ts_arr = test_df["timestamp"].to_numpy()
+    hours = hour_of_day_from_ms(ts_arr)
+
+    print("\n" + "=" * 70)
+    print(f"  WR PAR HEURE UTC ({side.upper()}-only, paris pris sur le test)")
+    print("=" * 70)
+    print(f"  {'Heure':<8}{'Pris':>7}{'Wins':>8}{'WR':>10}{'% du total':>14}")
+    print(f"  {'-' * 47}")
+    total_taken = int(take_arr.sum())
+    total_wins = int((take_arr & (label_arr == 1)).sum())
+    for h in range(24):
+        h_mask = hours == h
+        h_taken_mask = h_mask & take_arr
+        n_taken_h = int(h_taken_mask.sum())
+        n_wins_h = int((h_taken_mask & (label_arr == 1)).sum())
+        if n_taken_h > 0:
+            wr_h = n_wins_h / n_taken_h * 100
+            pct = n_taken_h / total_taken * 100 if total_taken else 0.0
+            wr_str = f"{wr_h:6.2f}%"
+            pct_str = f"{pct:6.2f}%"
+        else:
+            wr_str = "   n/a"
+            pct_str = "   n/a"
+        print(f"  {f'{h:02d}h':<8}{n_taken_h:>7}{n_wins_h:>8}{wr_str:>10}{pct_str:>14}")
+    print(f"  {'-' * 47}")
+    total_wr = (total_wins / total_taken * 100) if total_taken else float("nan")
+    total_wr_str = "   n/a" if total_taken == 0 else f"{total_wr:6.2f}%"
+    print(f"  {'Total':<8}{total_taken:>7}{total_wins:>8}{total_wr_str:>10}{'100.00%':>14}")
 
 
 def _print_bet_samples(test_df, p_up, take, label_raw, n_samples=5):
