@@ -240,29 +240,48 @@ def send_bet_resolved_real(direction: str, outcome: str, source: str,
                             realized_pnl_usdc: float | None,
                             fill_price: float | None, target_close_iso: str,
                             running_bets: int, running_pnl: float,
+                            cycle_n: int,
+                            confidence: float,
+                            window_open_iso: str, window_close_iso: str,
+                            open_price: float | None,
+                            close_price: float | None,
+                            current_capital_usdc: float | None,
+                            running_wr: float | None = None,
                             redeem_tx_hash: str | None = None) -> None:
-    """Sent when a real bet's outcome lands in bets.csv (win/loss).
+    """Single unified notif sent when a real bet's outcome lands in bets.csv.
 
-    `outcome` is one of: 'win' / 'loss' / 'bitstamp_win' / 'bitstamp_loss'.
-    `source` is one of: 'polymarket' / 'bitstamp_fallback'.
+    Replaces the previous 3-notif flow (BET PLACED + paper BET WON/LOST +
+    REAL BET WON/LOST) with ONE message covering everything: cycle, direction,
+    confidence, window, open/close prices, verdict, pnl, capital.
+
+    `outcome`: 'win' / 'loss' / 'bitstamp_win' / 'bitstamp_loss'.
+    `source` : 'polymarket' / 'bitstamp_fallback'.
     `redeem_tx_hash`: on wins only, the tx hash returned by client.redeem().
-        - a real 0x... hash -> auto-redeem succeeded (no operator action needed)
-        - 'MANUAL_REDEEM_REQUIRED' -> relayer key missing, operator must claim
-        - None -> redeem was not attempted (typically: loss, or pre-redeem state)
     """
     if not is_configured():
         return
 
     is_win = outcome.endswith("win")
-    emoji = "💰" if is_win else "💔"
+    emoji = "🟢" if is_win else "🔴"
     verdict = "WON" if is_win else "LOST"
 
     source_label = "Polymarket" if source == "polymarket" else "Bitstamp fallback"
-    pnl_str = f"{realized_pnl_usdc:+.2f}" if realized_pnl_usdc is not None else "n/a"
-    fill_str = f"{fill_price:.4f}" if fill_price is not None else "n/a"
+    pnl_str = f"{realized_pnl_usdc:+.2f} USDC" if realized_pnl_usdc is not None else "n/a"
+    capital_str = (f"{current_capital_usdc:.2f} USDC"
+                   if current_capital_usdc is not None else "n/a")
+
+    if open_price is not None and close_price is not None:
+        pct_move = (close_price - open_price) / open_price * 100 if open_price else 0.0
+        pct_sign = "+" if pct_move >= 0 else ""
+        open_line  = f"open      : {_fmt_usd(open_price)} USD\n"
+        close_line = f"close     : {_fmt_usd(close_price)} USD  ({pct_sign}{pct_move:.2f}%)\n"
+    else:
+        open_line  = "open      : n/a\n"
+        close_line = "close     : n/a\n"
+
+    wr_part = f" · WR {_fmt_pct(running_wr)}" if running_wr is not None else ""
 
     # Redeem footer: depends on what client.redeem() returned for this win.
-    # Only show a footer on a WIN -- losses have nothing to redeem.
     if not is_win:
         redeem_note = ""
     elif redeem_tx_hash is None:
@@ -271,20 +290,24 @@ def send_bet_resolved_real(direction: str, outcome: str, source: str,
         redeem_note = ("\n\n⚠️ CLAIM: no RELAYER_API_KEY configured - redeem "
                        "this win manually on polymarket.com")
     else:
-        # auto-redeem succeeded; show short tx hint
         tx_short = redeem_tx_hash[:10] + "..." if len(redeem_tx_hash) > 10 else redeem_tx_hash
         redeem_note = f"\n\n✅ auto-redeemed (tx {tx_short})"
 
     text = (
-        f"<b>{emoji} REAL BET {verdict}</b>\n"
+        f"<b>{emoji} BET {verdict}</b>\n"
         f"<pre>"
+        f"cycle     : #{cycle_n} closed at {target_close_iso}\n"
         f"direction : {_dir_arrow(direction)}\n"
-        f"fill_price: {fill_str} USD/share\n"
-        f"pnl       : {pnl_str} USDC\n"
+        f"confidence: {_fmt_pct(confidence)}\n"
+        f"window    : {window_open_iso} → {window_close_iso}\n"
+        f"{open_line}"
+        f"{close_line}"
+        f"verdict   : {'✓ correct' if is_win else '✗ wrong'}\n"
+        f"pnl       : {pnl_str}\n"
+        f"capital   : {capital_str}\n"
         f"source    : {source_label}\n"
-        f"closed at : {target_close_iso}\n"
         f"\n"
-        f"running   : {running_bets} bets · pnl {running_pnl:+.2f} USDC"
+        f"running   : {running_bets} bets{wr_part} · pnl {running_pnl:+.2f} USDC"
         f"{redeem_note}"
         f"</pre>"
     )

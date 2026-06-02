@@ -169,10 +169,18 @@ _FEATURE_COLS = [
 ]
 
 
-def build_features(klines_15m, klines_5m, klines_30m, klines_1h) -> dict:
+def build_features(klines_15m, klines_5m, klines_30m, klines_1h,
+                   target_open_ms: int | None = None) -> dict:
     """Build the 22-feature row for the LAST CLOSED 15m bar.
 
-    last_idx = len(klines_15m) - 2 (assumes the last entry is the currently-open bar).
+    Target-bar selection:
+      - target_open_ms given  -> pick the row whose open_time == target_open_ms.
+        Lets the caller name the just-closed bar explicitly, so we no longer
+        depend on the currently-open bar being present in the buffer (Bitstamp
+        publishes it a few seconds late). Feature VALUES are identical either
+        way (all backward-looking from the target row).
+      - target_open_ms None   -> legacy positional pick: last_idx = len-2
+        (assumes the last entry is the currently-open bar). Used by backfill.
     """
     df15 = _add_atr_pct(_add_returns(_klines_to_df(klines_15m)))
     df5  = _add_returns(_klines_to_df(klines_5m))
@@ -181,7 +189,13 @@ def build_features(klines_15m, klines_5m, klines_30m, klines_1h) -> dict:
 
     df15 = _compute_15m_tier12(df15)
 
-    last_idx = len(df15) - 2
+    if target_open_ms is not None:
+        pos = np.where(df15["open_time_ms"].to_numpy() == int(target_open_ms))[0]
+        if len(pos) == 0:
+            raise ValueError(f"target_open_ms {target_open_ms} not found in 15m buffer.")
+        last_idx = int(pos[-1])
+    else:
+        last_idx = len(df15) - 2
     if last_idx < 0:
         raise ValueError("klines_15m too short (need at least 2 bars).")
     row15 = df15.iloc[last_idx]

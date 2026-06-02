@@ -53,7 +53,7 @@ ROOT = Path(__file__).resolve().parent
 LOGS_DIR = ROOT / "logs"
 TEAM_RUNS_CSV = LOGS_DIR / "team_runs.csv"
 
-TEAM_TEST_DAYS = 180
+TEAM_TEST_DAYS = 720
 DAY_MS = 24 * 3600 * 1000
 
 

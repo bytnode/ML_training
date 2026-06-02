@@ -75,8 +75,9 @@ ADAPTIVE_STRATEGY = "asym_wknd_excl_hour_boost"
 # trouve sur TEST_DAYS=365 (V1=1761 paris @ 59.23%):
 #   - weekday : T_wd=0.594 = val_weekday_pool quantile_98.7 (275/21706 = 1.27%)
 #   - weekend : T_we=0.555 = val_weekend_pool quantile_83.3 (1499/8960 = 16.72%)
-ASYM_VOL_FRAC_WEEKDAY = 0.015      # top 1.3% du val weekday non-skip
-ASYM_VOL_FRAC_WEEKEND = 0.125      # top 16.7% du val weekend non-skip
+ASYM_VOL_FRAC_WEEKDAY = 0.0225    # ignored: weekday is fully skipped below
+                                   # (kept for the runs.csv schema only).
+ASYM_VOL_FRAC_WEEKEND = 0.145     # top 16.7% du val weekend non-skip
 ASYM_SKIP_CELLS = ((2, 0), (2, 1))  # (volatility_state, is_weekend) exclus
 ASYM_USE_FULL_VAL = True            # True = full val, False = derniers 55j
 
@@ -84,8 +85,8 @@ ASYM_USE_FULL_VAL = True            # True = full val, False = derniers 55j
 # Pour les bougies ouvertes a une heure UTC dans ASYM_HOUR_BOOST_GOOD_HOURS,
 # le seuil de la bougie est abaisse de ASYM_HOUR_BOOST_DELTA. Les cellules
 # skippees (ASYM_SKIP_CELLS) ne sont jamais boostees.
-ASYM_HOUR_BOOST_GOOD_HOURS = (20, 21, 22)
-ASYM_HOUR_BOOST_DELTA = 0.02
+ASYM_HOUR_BOOST_GOOD_HOURS = (00 ,10, 12, 21)
+ASYM_HOUR_BOOST_DELTA = 0.015
 
 # --- Bad-hours exclusion (V2 extension) ---
 # UTC hours where we NEVER bet, regardless of confidence.
@@ -97,7 +98,29 @@ ASYM_HOUR_BOOST_DELTA = 0.02
 #   hour 23 (56 % WR weekday, 52 % weekend)
 # Hour 23 was even in the OLD hour_boost (= MORE bets there) which was
 # clearly hurting. Removed from boost above + added to bad_hours.
-ASYM_BAD_HOURS = (2, 4, 8, 11, 16, 23)
+ASYM_BAD_HOURS = (1,4, 6, 8, 16, 17, 19, 22,23)
+
+# --- Bad-days threshold boost ---
+# UTC isoweekday(s) where the bucket threshold is RAISED by ADAPTIVE_WR_BAD_DAY
+# (= fewer, more selective bets on these days). isoweekday: 1=Monday..7=Sunday.
+# Empirically Friday (=5) shows the weakest team WR in the per-weekday
+# breakdown (cf main.py "Share of taken bets per weekday" table). Boosting the
+# threshold there forces the model to pick only its highest-confidence Friday
+# bets. Read at runtime by api.py._bucket_threshold (no retrain needed).
+# Empty tuple disables the filter.
+ADAPTIVE_BAD_DAYS = (5,)
+ADAPTIVE_WR_BAD_DAY = 0.015
+
+# --- Bad-hours soft boost (mirror of ASYM_HOUR_BOOST_GOOD_HOURS) ---
+# UTC hours where the bucket threshold is RAISED by ASYM_BAD_HOURS_DELTA.
+# Same mechanism as ASYM_HOUR_BOOST_GOOD_HOURS / ASYM_HOUR_BOOST_DELTA but the
+# delta is ADDED to T instead of subtracted (= the model becomes MORE selective
+# on these hours, fewer bets, higher confidence required).
+# Unlike ASYM_BAD_HOURS which is a HARD skip (T=1.0), this lets the model still
+# bet if its confidence is high enough. Read at runtime by
+# api.py._bucket_threshold (no retrain needed). Empty tuple disables.
+ADAPTIVE_BAD_HOURS = (13,3)
+ASYM_BAD_HOURS_DELTA = 0.01
 
 # --- Cross-model filter (V3 extension) ---
 # Pour chaque bar pris par modele_up, on lit p_down du modele_down (meme bar,

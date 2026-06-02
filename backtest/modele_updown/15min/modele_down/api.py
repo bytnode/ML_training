@@ -147,6 +147,12 @@ def _bucket_threshold(volatility_state: int, is_weekend: int, sidecar: dict,
         bad_days = set(int(d) for d in (getattr(_cfg, "ADAPTIVE_BAD_DAYS", ()) or ()))
         if bad_days and _isoweekday_from_ts_ms(ts_ms) in bad_days:
             T += float(getattr(_cfg, "ADAPTIVE_WR_BAD_DAY", 0.0))
+    # Bad-hours soft boost (config-driven, runtime ; CLONE de modele_up). Releve
+    # T sur les heures faibles. Mirror de apply_thresholds_asym_hour_boost (train.py).
+    if ts_ms is not None:
+        bad_hours_soft = set(int(h) for h in (getattr(_cfg, "ADAPTIVE_BAD_HOURS", ()) or ()))
+        if bad_hours_soft and _hour_from_ts_ms(ts_ms) in bad_hours_soft:
+            T += float(getattr(_cfg, "ASYM_BAD_HOURS_DELTA", 0.0))
     return T
 
 

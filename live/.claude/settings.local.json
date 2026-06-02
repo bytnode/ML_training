@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chown -R 1000:1000 logs)",
+      "Bash(chmod 755 logs)",
+      "Bash(docker compose *)",
+      "Bash(python3 -c \"import time,datetime; nb=\\(int\\(time.time\\(\\)\\)//900+1\\)*900; time.sleep\\(max\\(0, nb+12-time.time\\(\\)\\)\\)\")",
+      "Bash(python3 -c \"import time; nb=\\(int\\(time.time\\(\\)\\)//900+1\\)*900; time.sleep\\(max\\(0, nb+12-time.time\\(\\)\\)\\)\")",
+      "Bash(python3 -c \"import time; nb=\\(int\\(time.time\\(\\)\\)//900+1\\)*900; time.sleep\\(max\\(0, nb+8-time.time\\(\\)\\)\\)\")"
+    ]
+  }
+}

@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
-from config import MODEL_OUTPUT
+from config import MODEL_OUTPUT, ADAPTIVE_BAD_HOURS, ASYM_BAD_HOURS_DELTA
 
 _model = None
 _thresholds = None
@@ -103,6 +103,11 @@ def _bucket_threshold(volatility_state, is_weekend, sidecar, ts_ms=None) -> floa
         delta = float(hb.get("delta", 0.0))
         if _hour_from_ts_ms(ts_ms) in good_hours:
             T -= delta
+    # Bad-hours soft boost (config-driven ; CLONE de modele_up).
+    if ts_ms is not None:
+        bad_hours_soft = set(int(h) for h in (ADAPTIVE_BAD_HOURS or ()))
+        if bad_hours_soft and _hour_from_ts_ms(ts_ms) in bad_hours_soft:
+            T += float(ASYM_BAD_HOURS_DELTA)
     return T
 
 

@@ -25,6 +25,7 @@ from config import (
     ADAPTIVE_STRATEGY,
     ASYM_VOL_FRAC_WEEKDAY, ASYM_VOL_FRAC_WEEKEND, ASYM_SKIP_CELLS,
     ASYM_USE_FULL_VAL,
+    ASYM_UNANIMOUS_WKND, ASYM_UNANIMOUS_THRESHOLD,
     ASYM_HOUR_BOOST_GOOD_HOURS, ASYM_HOUR_BOOST_DELTA,
     ASYM_BAD_HOURS,
     ADAPTIVE_BAD_DAYS, ADAPTIVE_WR_BAD_DAY,
@@ -306,6 +307,26 @@ def compute_thresholds_asym_wknd_excl(
 
     thresholds_per_wknd = {}
     report = []
+
+    # --- Mode UNANIME HARDCODE : un seul seuil ecrit en dur ---
+    # T = ASYM_UNANIMOUS_THRESHOLD pris tel quel (PAS de quantile). On l'assigne
+    # aux deux axes -> sidecar {"0": T, "1": T}. La boucle par axe ci-dessous
+    # (vol_frac_wd / vol_frac_we) n'est jamais executee : l'autre mode est OFF.
+    # Les stats val (n_at_T, wr_val) sont purement informatives pour le report.
+    if ASYM_UNANIMOUS_WKND:
+        T = float(ASYM_UNANIMOUS_THRESHOLD)
+        pb = probas[cal_mask]
+        yb = labels[cal_mask]
+        bet = pb >= T
+        n_at_T = int(bet.sum())
+        wr_val = float(yb[bet].mean()) if n_at_T > 0 else 0.0
+        report.append({
+            "axis": "unanimous", "wknd": -1, "vol_frac": None,
+            "n_val": int(cal_mask.sum()), "T": T, "wr_val_at_T": wr_val,
+            "n_at_T": n_at_T, "source": "hardcoded",
+        })
+        return {0: T, 1: T}, report
+
     for wknd_axis, vol_frac in ((0, vol_frac_wd), (1, vol_frac_we)):
         axis_mask = cal_mask & (wknd_arr == wknd_axis)
         n_axis = int(axis_mask.sum())
@@ -675,7 +696,11 @@ def _print_adaptive_section(report):
     print("\n" + "=" * 70)
     name = "ASYM_WKND_EXCL_HOUR_BOOST (V2)" if ADAPTIVE_STRATEGY == "asym_wknd_excl_hour_boost" else "ASYM_WKND_EXCL (V1)"
     print(f"  CALIBRATION {name} - methode quantile")
-    print(f"  vol_frac_weekday={ASYM_VOL_FRAC_WEEKDAY}  vol_frac_weekend={ASYM_VOL_FRAC_WEEKEND}")
+    if ASYM_UNANIMOUS_WKND:
+        print(f"  MODE UNANIME HARDCODE: T={ASYM_UNANIMOUS_THRESHOLD} pour weekday ET weekend "
+              f"(mode par axe DESACTIVE)")
+    else:
+        print(f"  vol_frac_weekday={ASYM_VOL_FRAC_WEEKDAY}  vol_frac_weekend={ASYM_VOL_FRAC_WEEKEND}")
     print(f"  skip_cells={list(ASYM_SKIP_CELLS)}  use_full_val={ASYM_USE_FULL_VAL}")
     if ADAPTIVE_STRATEGY == "asym_wknd_excl_hour_boost":
         print(f"  HOUR BOOST: good_hours={list(ASYM_HOUR_BOOST_GOOD_HOURS)}  delta={ASYM_HOUR_BOOST_DELTA}")
@@ -688,7 +713,8 @@ def _print_adaptive_section(report):
     for r in report:
         T_str = f"{r['T']:.4f}" if r["T"] is not None else "N/A"
         wr_str = f"{r['wr_val_at_T']:.4f}" if r["wr_val_at_T"] is not None else "N/A"
-        print(f"  {r['axis']:<10} {r['vol_frac']:<10.4f} {r['n_val']:<8} "
+        vf_str = f"{r['vol_frac']:.4f}" if r["vol_frac"] is not None else "N/A"
+        print(f"  {r['axis']:<10} {vf_str:<10} {r['n_val']:<8} "
               f"{T_str:<10} {wr_str:<10} {r['n_at_T']:<8} {r['source']}")
 
 

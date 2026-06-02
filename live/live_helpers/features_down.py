@@ -178,8 +178,13 @@ def _eth_features_for_ts(klines_eth_15m, target_ts: int) -> dict:
 
 
 def build_features(klines_15m, klines_5m, klines_30m, klines_1h,
-                   klines_eth_15m=None) -> dict:
-    """Build the feature row for the LAST CLOSED 15m bar (= last_idx = -2).
+                   klines_eth_15m=None, target_open_ms: int | None = None) -> dict:
+    """Build the feature row for the LAST CLOSED 15m bar.
+
+    Target-bar selection: if `target_open_ms` is given, pick the row whose
+    open_time == target_open_ms (so we don't depend on the currently-open bar
+    being present in the buffer); otherwise legacy positional pick last_idx=-2.
+    Feature values are identical either way (all backward-looking).
 
     `klines_eth_15m` is the ETH/USD 15m buffer used for the 5 kept `ef_*`
     features; pass None (or an empty list) and they fall back to NaN.
@@ -239,10 +244,16 @@ def build_features(klines_15m, klines_5m, klines_30m, klines_1h,
     feat_15["volatility_state"] = np.where(ratio > 1.5, 2,
                                            np.where(ratio < 0.7, 0, 1)).astype(int)
 
-    # Pick last CLOSED bar (last_idx = -2)
-    if len(feat_15) < 2:
-        raise ValueError("klines_15m too short.")
-    row = feat_15.iloc[-2]
+    # Pick the target CLOSED bar : by timestamp if named, else legacy last_idx=-2.
+    if target_open_ms is not None:
+        pos = np.where(feat_15["timestamp_ms"].to_numpy() == int(target_open_ms))[0]
+        if len(pos) == 0:
+            raise ValueError(f"target_open_ms {target_open_ms} not found in 15m buffer.")
+        row = feat_15.iloc[int(pos[-1])]
+    else:
+        if len(feat_15) < 2:
+            raise ValueError("klines_15m too short.")
+        row = feat_15.iloc[-2]
     out = {"timestamp": int(row["timestamp_ms"])}
     for c in _PARQUET_COLS:
         if c not in row.index:

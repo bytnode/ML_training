@@ -72,6 +72,12 @@ from live_helpers import fetch
 from live_helpers import features_up as feat_up_mod
 from live_helpers import features_down as feat_dn_mod
 from live_helpers import notify
+# Per-model configs read at runtime so ADAPTIVE_BAD_DAYS / ADAPTIVE_BAD_HOURS /
+# ADAPTIVE_WR_BAD_DAY / ASYM_BAD_HOURS_DELTA are picked up without retrain or
+# image rebuild. Mirrors backtest/.../api.py's `from . import config as _cfg`
+# pattern so the live threshold logic stays identical to the backtest one.
+from modele_up import config as cfg_up
+from modele_down import config as cfg_dn
 
 ROOT = Path(__file__).resolve().parent       # live/modele_15m/ - self-contained
 LOGS_DIR = ROOT / "logs"
@@ -178,20 +184,42 @@ def _load_sidecar(path: Path) -> dict:
         return json.load(f)
 
 
-def _bucket_threshold(volatility_state: int, is_weekend: int, sidecar: dict, ts_ms: int) -> float:
-    """Reproduces predict.decide()'s threshold lookup (V1 + V2 hour_boost
-    + optional V2 bad_hours)."""
+def _isoweekday_from_ts_ms(ts_ms: int) -> int:
+    """1=Monday ... 7=Sunday (UTC isoweekday). Unix epoch 1970-01-01 was a
+    Thursday (=4), so iso = ((days_since_epoch + 3) % 7) + 1. Mirrors the
+    helper in backtest/.../api.py."""
+    return ((int(ts_ms) // 86_400_000 + 3) % 7) + 1
+
+
+def _bucket_threshold(volatility_state: int, is_weekend: int, sidecar: dict,
+                      ts_ms: int, cfg) -> tuple[float, str | None]:
+    """Reproduces backtest api.py._bucket_threshold EXACTLY (numeric value) and
+    additionally returns a human-readable *skip reason* for display/logging :
+      V1 (skip_cells + thresholds_per_wknd)
+      + V2 hour_boost (sidecar, good_hours -> T -= delta)
+      + V2 bad_hours (sidecar, hard skip)
+      + ADAPTIVE_BAD_DAYS (cfg, isoweekday penalty)
+      + ADAPTIVE_BAD_HOURS (cfg, soft hour penalty, modele_up only).
+    `cfg` is the per-model config module (cfg_up or cfg_dn); attribute reads
+    use getattr defaults so a config missing a key (e.g. modele_down has no
+    ADAPTIVE_BAD_HOURS) silently no-ops instead of crashing.
+
+    Returns (T, reason). `reason` is None for a normal (bettable) threshold, or
+    a short string when the cell is effectively skipped (T >= 1.0) — exactly
+    why: high-vol cell, bad hour, or pushed over 1.0 by runtime penalties. The
+    numeric T is unchanged from the backtest, so the mirror still holds.
+    """
     strategy = sidecar.get("strategy")
     if strategy not in ("asym_wknd_excl", "asym_wknd_excl_hour_boost"):
         raise ValueError(f"Unknown sidecar strategy: {strategy!r}")
+    hour = int(((ts_ms // (15 * 60 * 1000)) % 96) // 4)
     skip = {(int(v), int(w)) for v, w in sidecar.get("skip_cells", [])}
     if (int(volatility_state), int(is_weekend)) in skip:
-        return 1.0
-    hour = int(((ts_ms // (15 * 60 * 1000)) % 96) // 4)
+        return 1.0, f"high-vol cell (state={int(volatility_state)})"
     # Bad-hours exclusion (V2 extension) : force T=1.0 = never bet.
     bad_hours = set(int(h) for h in sidecar.get("bad_hours", []))
     if bad_hours and hour in bad_hours:
-        return 1.0
+        return 1.0, f"bad hour {hour}h"
     T = float(sidecar.get("thresholds_per_wknd", {}).get(str(int(is_weekend)), 1.0))
     if strategy == "asym_wknd_excl_hour_boost":
         hb = sidecar.get("hour_boost", {})
@@ -199,20 +227,35 @@ def _bucket_threshold(volatility_state: int, is_weekend: int, sidecar: dict, ts_
         delta = float(hb.get("delta", 0.0))
         if hour in good:
             T -= delta
-    return T
+    # Bad-days penalty (config-driven, runtime): raise T on weak weekdays.
+    bad_days = set(int(d) for d in (getattr(cfg, "ADAPTIVE_BAD_DAYS", ()) or ()))
+    if bad_days and _isoweekday_from_ts_ms(ts_ms) in bad_days:
+        T += float(getattr(cfg, "ADAPTIVE_WR_BAD_DAY", 0.0))
+    # Bad-hours soft boost (config-driven, runtime): mirror of ASYM_HOUR_BOOST
+    # but ADDS delta. Lets the model still bet on these hours if its
+    # confidence is high enough (unlike sidecar bad_hours hard skip).
+    bad_hours_soft = set(int(h) for h in (getattr(cfg, "ADAPTIVE_BAD_HOURS", ()) or ()))
+    if bad_hours_soft and hour in bad_hours_soft:
+        T += float(getattr(cfg, "ASYM_BAD_HOURS_DELTA", 0.0))
+    # Penalties can push a normal threshold to >=1.0 -> still an effective skip.
+    reason = "threshold >= 1.0 (penalties)" if T >= 1.0 else None
+    return T, reason
 
 
-def _predict_one(model: xgb.XGBClassifier, sidecar: dict, features: dict) -> tuple[float, bool, float]:
-    """Returns (confidence, take, threshold)."""
+def _predict_one(model: xgb.XGBClassifier, sidecar: dict, features: dict,
+                  cfg) -> tuple[float, bool, float, str | None]:
+    """Returns (confidence, take, threshold, skip_reason). `cfg` = cfg_up or
+    cfg_dn. `skip_reason` is None unless the cell is hard-skipped (threshold
+    >= 1.0), in which case it explains why (see _bucket_threshold)."""
     feature_cols = model.get_booster().feature_names
     df = pd.DataFrame([features])
     missing = [c for c in feature_cols if c not in df.columns]
     if missing:
         raise ValueError(f"Missing model features at predict time: {missing}")
     conf = float(model.predict_proba(df[feature_cols])[0, 1])
-    th = _bucket_threshold(int(features["volatility_state"]), int(features["is_weekend"]),
-                            sidecar, int(features["timestamp"]))
-    return conf, conf >= th, th
+    th, reason = _bucket_threshold(int(features["volatility_state"]), int(features["is_weekend"]),
+                                   sidecar, int(features["timestamp"]), cfg)
+    return conf, conf >= th, th, reason
 
 
 # ============================================================
@@ -282,33 +325,32 @@ def refresh_buffers() -> dict[str, list[list]]:
 
 
 def freshness_retry(target_open_ms: int) -> list[list]:
-    """Refetch last 15m bars until BOTH the just-closed bar (at target_open_ms)
-    AND the currently-opening bar (at target_open_ms + 15m) are in Bitstamp's
-    response.
+    """Refetch last 15m bars until the just-closed target bar (at target_open_ms)
+    is present in Bitstamp's response, then return.
 
-    Why both? build_features picks `last_idx = len(df15) - 2`, assuming the
-    last entry is the currently-open bar so the second-to-last is the just-
-    closed target. If Bitstamp returns only `[..., bar(B-30m), bar(B-15m)]`
-    (just-closed at [-1], new bar not published yet), then last_idx=-2 lands
-    on bar(B-30m) -- features get computed on the bar from TWO cycles ago.
-    Requiring both bars eliminates this off-by-one race.
+    We require ONLY the just-closed bar -- not the currently-opening bar. Two
+    measured facts justify this (see the 2026-05-30 investigation):
 
-    Previously this passed as soon as kl[-1][0] >= target_open_ms, which is
-    true the moment Bitstamp publishes the currently-forming bar - but the
-    just-closed target bar might still be missing for another second or two.
-    The strict check fixes the 'Target bar not in buffer; skipping resolution'
-    warnings.
+      1. The just-closed bar's OHLCV is already FINAL the moment it appears
+         (~+0.15s after the boundary); it never changes afterward.
+      2. In the first ~4s after a boundary Bitstamp serves an inconsistent
+         view: once the new bar publishes, the just-closed bar transiently
+         DISAPPEARS for ~3s before reappearing. Waiting for BOTH bars at once
+         (the old behavior) therefore cost ~4.5s every cycle for nothing.
+
+    Off-by-one safety no longer relies on the new bar being present: callers
+    pass `target_open_ms` to build_features, which selects the target row by
+    timestamp instead of the positional `len-2`. So a buffer that ends on the
+    just-closed bar (new bar not yet published) is fine.
     """
-    open_bar_ms = target_open_ms + INTERVAL_15M_MS
     for _ in range(FRESHNESS_RETRY_MAX):
         kl = fetch.fetch_klines(PAIR, "15m", n_bars=10)
-        ts_set = {int(k[0]) for k in kl}
-        if target_open_ms in ts_set and open_bar_ms in ts_set:
+        if target_open_ms in {int(k[0]) for k in kl}:
             return kl
         time.sleep(FRESHNESS_RETRY_DELAY_S)
     raise TimeoutError(
-        f"Bitstamp did not publish both the closed bar {target_open_ms} and "
-        f"the opening bar {open_bar_ms} after {FRESHNESS_RETRY_MAX} attempts."
+        f"Bitstamp did not publish the just-closed bar {target_open_ms} "
+        f"after {FRESHNESS_RETRY_MAX} attempts."
     )
 
 
@@ -343,6 +385,35 @@ def append_live_log(row: dict) -> None:
     df_row = pd.DataFrame([row])
     write_header = not LIVE_CSV.exists()
     df_row.to_csv(LIVE_CSV, mode="a", header=write_header, index=False)
+
+
+def _load_persisted_stats() -> dict:
+    """Restore running stats from the last row of live_predictions.csv so they
+    survive container rebuilds / restarts. Returns the zero dict if the file
+    is missing, empty, or unreadable. Each row already carries cumulative
+    `run_*` columns written by append_live_log, so the LAST row holds the
+    latest totals.
+    """
+    zero = {"cycles": 0, "bets": 0, "correct": 0, "pass": 0, "cancel": 0}
+    if not LIVE_CSV.exists():
+        return zero
+    try:
+        df = pd.read_csv(LIVE_CSV, usecols=["run_cycles", "run_bets", "run_wins",
+                                             "run_pass", "run_cancel"])
+    except (ValueError, pd.errors.EmptyDataError, pd.errors.ParserError) as e:
+        logging.warning("Could not parse %s for stats reload (%s) ; "
+                        "starting from zero.", LIVE_CSV.name, e)
+        return zero
+    if df.empty:
+        return zero
+    last = df.iloc[-1]
+    return {
+        "cycles": int(last["run_cycles"] or 0),
+        "bets":   int(last["run_bets"] or 0),
+        "correct": int(last["run_wins"] or 0),
+        "pass":   int(last["run_pass"] or 0),
+        "cancel": int(last["run_cancel"] or 0),
+    }
 
 
 # ============================================================
@@ -425,14 +496,17 @@ def render_cycle(cycle_n: int, just_closed_ts: int, resolution: dict | None,
     pt.add_column("Confidence", justify="right")
     pt.add_column("Threshold", justify="right")
     pt.add_column("Take?", justify="right")
-    for name, p, th, take, color in [
-        ("modele_up",   prediction["p_up"], prediction["th_up"], prediction["take_up"], "bright_blue"),
-        ("modele_down", prediction["p_dn"], prediction["th_dn"], prediction["take_dn"], "bright_red"),
+    for name, p, th, take, why, color in [
+        ("modele_up",   prediction["p_up"], prediction["th_up"], prediction["take_up"], prediction.get("why_up"), "bright_blue"),
+        ("modele_down", prediction["p_dn"], prediction["th_dn"], prediction["take_dn"], prediction.get("why_dn"), "bright_red"),
     ]:
+        # A hard-skipped cell (threshold == 1.0) shows WHY instead of a useless
+        # "100.00%" the confidence can never beat.
+        th_cell = Text(f"skip · {why}", style="yellow") if why else f"{th*100:6.2f}%"
         pt.add_row(
             Text(name, style=color),
             f"{p*100:6.2f}%",
-            f"{th*100:6.2f}%",
+            th_cell,
             Text("yes", style="bold green") if take else Text("no", style="dim"),
         )
     console.print(pt)
@@ -626,7 +700,7 @@ def resolve_pending_bets(client, buf_15m: list[list], stats: dict) -> list[dict]
             redeem_tx = client.redeem(condition_id) if outcome == "win" else None
             _write_outcome(df, idx, outcome, source, redeem_tx,
                            resolved_actual=str(winner).lower())
-            newly_resolved.append(_resolution_event(df.loc[idx], stats, df))
+            newly_resolved.append(_resolution_event(df.loc[idx], stats, df, buf_15m, client))
             changed_bet_ids.append(bet_id)
             continue
 
@@ -651,7 +725,7 @@ def resolve_pending_bets(client, buf_15m: list[list], stats: dict) -> list[dict]
                 _write_outcome(df, idx, outcome, source, redeem_tx,
                                resolved_actual=actual.lower(),
                                resolved_open=o, resolved_close=c)
-                newly_resolved.append(_resolution_event(df.loc[idx], stats, df))
+                newly_resolved.append(_resolution_event(df.loc[idx], stats, df, buf_15m, client))
                 changed_bet_ids.append(bet_id)
                 continue
 
@@ -723,11 +797,66 @@ def _write_outcome(df: pd.DataFrame, idx, outcome: str, source: str,
         ) if resolved_open else 0.0
 
 
-def _resolution_event(row: pd.Series, stats: dict, df_after_write: pd.DataFrame) -> dict:
-    """Build the dict the main loop hands to notify.send_bet_resolved_real."""
+def _resolution_event(row: pd.Series, stats: dict, df_after_write: pd.DataFrame,
+                       buf_15m: list[list] | None = None,
+                       client=None) -> dict:
+    """Build the dict the main loop hands to notify.send_bet_resolved_real.
+
+    Pulls all the data the unified notif needs : cycle counter (from stats),
+    confidence (from the bets.csv row), window times (from target_open/close_ms),
+    open/close prices (from the bets.csv row if bitstamp-resolved, else looked
+    up in buf_15m), and the current USDC capital (queried from the client).
+    """
     running_bets, running_pnl = _running_pnl_stats(df_after_write)
     redeem_tx = row.get("redeem_tx_hash")
     redeem_tx = str(redeem_tx) if pd.notna(redeem_tx) else None
+
+    target_open_ms = int(row["target_open_ms"])
+    target_close_ms = int(row["target_close_ms"])
+
+    # Open/close prices : bitstamp_fallback bets have them in the row,
+    # polymarket-resolved ones need a buf lookup (the row only has the winner
+    # outcome, not the prices). If lookup fails, we send n/a.
+    open_price = row.get("resolved_open_price")
+    close_price = row.get("resolved_close_price")
+    if (not pd.notna(open_price) or not pd.notna(close_price)) and buf_15m is not None:
+        bar = find_bar(buf_15m, target_open_ms)
+        if bar is not None:
+            open_price = float(bar[1])
+            close_price = float(bar[4])
+    open_price = float(open_price) if pd.notna(open_price) else None
+    close_price = float(close_price) if pd.notna(close_price) else None
+
+    # Capital: fresh wallet read if a client is available, else fall back to
+    # wallet_usdc_post + realized_pnl (= what the balance should be after the
+    # bet settles and the win is redeemed).
+    current_capital = None
+    if client is not None:
+        try:
+            current_capital = float(client.get_usdc_balance())
+        except Exception as e:
+            logging.warning("get_usdc_balance failed for notif (%s); falling back to "
+                            "wallet_usdc_post + pnl.", e)
+    if current_capital is None:
+        post = row.get("wallet_usdc_post")
+        pnl = row.get("realized_pnl_usdc")
+        if pd.notna(post) and pd.notna(pnl):
+            # wallet_usdc_post is the balance just after placement (spent already
+            # debited). On a win, the payout of (shares × 1 - 0) - which equals
+            # spent + pnl - lands on the wallet at redeem time. So:
+            #   capital ≈ post + (spent + pnl)  if win and redeemed
+            #   capital ≈ post                  if loss (already debited)
+            outcome = str(row.get("outcome", ""))
+            spent = float(row.get("usdc_spent") or 0.0)
+            if outcome.endswith("win"):
+                current_capital = float(post) + spent + float(pnl)
+            else:
+                current_capital = float(post)
+
+    bets = int(running_bets) if running_bets is not None else 0
+    wins = int(df_after_write["outcome"].isin(["win", "bitstamp_win"]).sum()) if not df_after_write.empty else 0
+    running_wr = (wins / bets) if bets else None
+
     return {
         "_stuck": False,
         "direction": str(row["direction"]),
@@ -735,10 +864,19 @@ def _resolution_event(row: pd.Series, stats: dict, df_after_write: pd.DataFrame)
         "source": str(row["outcome_source"]),
         "realized_pnl_usdc": float(row["realized_pnl_usdc"]) if pd.notna(row["realized_pnl_usdc"]) else None,
         "fill_price": float(row["fill_price_avg"]) if pd.notna(row["fill_price_avg"]) else None,
-        "target_close_iso": pd.Timestamp(int(row["target_close_ms"]), unit="ms", tz="UTC").strftime("%Y-%m-%d %H:%M UTC"),
+        "target_close_iso": pd.Timestamp(target_close_ms, unit="ms", tz="UTC").strftime("%Y-%m-%d %H:%M UTC"),
         "running_bets": running_bets,
         "running_pnl": running_pnl,
+        "running_wr": running_wr,
         "redeem_tx_hash": redeem_tx,
+        # New fields for the unified notif
+        "cycle_n": int(stats.get("cycles", 0)),
+        "confidence": float(row["confidence"]) if pd.notna(row.get("confidence")) else 0.0,
+        "window_open_iso": pd.Timestamp(target_open_ms, unit="ms", tz="UTC").strftime("%H:%M"),
+        "window_close_iso": pd.Timestamp(target_close_ms, unit="ms", tz="UTC").strftime("%H:%M UTC"),
+        "open_price": open_price,
+        "close_price": close_price,
+        "current_capital_usdc": current_capital,
     }
 
 
@@ -931,6 +1069,14 @@ def _emit_resolution_telegrams(events: list[dict]) -> None:
                 target_close_iso=ev["target_close_iso"],
                 running_bets=ev["running_bets"],
                 running_pnl=ev["running_pnl"],
+                cycle_n=ev["cycle_n"],
+                confidence=ev["confidence"],
+                window_open_iso=ev["window_open_iso"],
+                window_close_iso=ev["window_close_iso"],
+                open_price=ev["open_price"],
+                close_price=ev["close_price"],
+                current_capital_usdc=ev["current_capital_usdc"],
+                running_wr=ev.get("running_wr"),
                 redeem_tx_hash=ev.get("redeem_tx_hash"),
             )
 
@@ -1010,7 +1156,14 @@ def main():
             _emit_resolution_telegrams(boot_resolved)
 
     pending: dict | None = None
-    stats = {"cycles": 0, "bets": 0, "correct": 0, "pass": 0, "cancel": 0}
+    stats = _load_persisted_stats()
+    if any(stats.values()):
+        logging.info(
+            "restored running stats from %s: %d cycles, %d bets, %d wins, "
+            "%d pass, %d cancel",
+            LIVE_CSV.name, stats["cycles"], stats["bets"], stats["correct"],
+            stats["pass"], stats["cancel"],
+        )
 
     while True:
         # Sleep until next xx:00 / xx:15 / xx:30 / xx:45
@@ -1038,18 +1191,31 @@ def main():
 
         try:
             t_cycle_start = time.perf_counter()
-            freshness_retry(next_boundary_ms - INTERVAL_15M_MS)  # latest closed bar's open_time
+            # freshness_retry returns a 15m fetch GUARANTEED to contain the
+            # just-closed bar (its exit condition), with final OHLCV. We keep it
+            # and merge it into buf_15m below -- see the merge note.
+            fresh_kl = freshness_retry(next_boundary_ms - INTERVAL_15M_MS)
             t_after_fresh = time.perf_counter()
 
             # Multi-TF parallel + incremental fetch. Cold start does the full
             # warmup (~3-5s once at boot) ; warm cycles only fetch the last 20
             # bars per TF in parallel (~0.3-0.5s).
             buffers = refresh_buffers()
-            buf_15m     = buffers["15m"]
             buf_5m      = buffers["5m"]
             buf_30m     = buffers["30m"]
             buf_1h      = buffers["1h"]
             buf_eth_15m = buffers["eth_15m"]
+
+            # Merge freshness_retry's validated fetch into the 15m buffer.
+            # refresh_buffers' own fetch can land in Bitstamp's post-boundary
+            # glitch window where the just-closed bar is transiently DROPPED
+            # (it reappears ~4s later) -- without this merge, buf_15m would have
+            # a gap at the just-closed bar and build_features would raise
+            # "target_open_ms not found". fresh_kl always has it (final values),
+            # so merging guarantees presence. We also write it back to the cache
+            # so no gap persists into the next cycle.
+            buf_15m = fetch.merge_klines(buffers["15m"], fresh_kl)[-WARMUP_15M:]
+            _CACHED_BUFFERS[(PAIR, "15m")] = buf_15m
             t_after_fetch = time.perf_counter()
 
             # The bar that JUST CLOSED has open_time = next_boundary - 15min
@@ -1107,25 +1273,29 @@ def main():
                         stats["pass"] += 1
 
             # === 2. Build features for the bar that just closed ===
-            # last_idx = -2 inside build_features ; the last entry of buf_15m must be
-            # the CURRENTLY OPEN bar. fetch returns bars up to and including the
-            # bar at next_boundary_ms (which has open_time = next_boundary_ms).
+            # We name the just-closed bar explicitly (target_open_ms) so the
+            # builders select it by timestamp, not by the positional `len-2`.
+            # That decouples us from the currently-open bar being present in
+            # buf_15m -- Bitstamp publishes it a few seconds late (and even
+            # transiently drops the just-closed bar while doing so), which used
+            # to cost ~4.5s/cycle in freshness_retry. See freshness_retry.
             #
             # Both models are independent at feature time (2026-05-25 cleanup
             # removed the leaky `p_up_xmodel` feature from modele_down). The
             # cross-model link is now only the runtime gating below via the
             # `max_p_*_runtime` sidecar fields.
-            feats_up = feat_up_mod.build_features(buf_15m, buf_5m, buf_30m, buf_1h)
-            p_up, take_up, th_up = _predict_one(model_up, sidecar_up, feats_up)
+            feats_up = feat_up_mod.build_features(buf_15m, buf_5m, buf_30m, buf_1h,
+                                                  target_open_ms=just_closed_open)
+            p_up, take_up, th_up, why_up = _predict_one(model_up, sidecar_up, feats_up, cfg_up)
 
             feats_dn = feat_dn_mod.build_features(buf_15m, buf_5m, buf_30m, buf_1h,
-                                                  buf_eth_15m)
+                                                  buf_eth_15m, target_open_ms=just_closed_open)
             if np.isnan(feats_dn["ef_ret2"]):
                 logging.warning("No ETH 15m bar concurrent with the just-closed "
                                 "BTC bar; modele_down ef_* features are NaN this cycle.")
 
             # === 3. Predict modele_down ===
-            p_dn, take_dn, th_dn = _predict_one(model_dn, sidecar_dn, feats_dn)
+            p_dn, take_dn, th_dn, why_dn = _predict_one(model_dn, sidecar_dn, feats_dn, cfg_dn)
             t_after_predict = time.perf_counter()
 
             # === 3b. Cross-model runtime filters (post-take gating) ===
@@ -1151,8 +1321,8 @@ def main():
 
             team = team_decision(take_up, take_dn)
             prediction = {
-                "p_up": p_up, "take_up": take_up, "th_up": th_up,
-                "p_dn": p_dn, "take_dn": take_dn, "th_dn": th_dn,
+                "p_up": p_up, "take_up": take_up, "th_up": th_up, "why_up": why_up,
+                "p_dn": p_dn, "take_dn": take_dn, "th_dn": th_dn, "why_dn": why_dn,
                 "team": team,
             }
 
@@ -1241,23 +1411,8 @@ def main():
                     prefetched_balance=prefetched_balance,
                     prefetched_market=prefetched_market,
                 )
-                target_open_iso = pd.Timestamp(int(bet_row["target_open_ms"]), unit="ms", tz="UTC").strftime("%H:%M")
-                target_close_iso = pd.Timestamp(int(bet_row["target_close_ms"]), unit="ms", tz="UTC").strftime("%H:%M UTC")
-                # Fire telegram in the background -- the order has already been
-                # placed, the user doesn't need us to block on the Telegram POST.
-                _BG_EXECUTOR.submit(
-                    notify.send_bet_placed,
-                    direction=str(bet_row["direction"]),
-                    usdc_amount=float(bet_row["bet_size_usdc"]),
-                    fill_price=bet_row.get("fill_price_avg"),
-                    confidence=float(bet_row["confidence"]),
-                    target_open_iso=target_open_iso,
-                    target_close_iso=target_close_iso,
-                    order_id=bet_row.get("polymarket_order_id"),
-                    status=str(bet_row["order_status"]) if bet_row.get("order_status") else "unknown",
-                    shares_filled=float(bet_row["shares_filled"]) if bet_row.get("shares_filled") else None,
-                    error_msg=str(bet_row.get("error_msg") or ""),
-                )
+                # No Telegram notif at placement time -- the unified resolution
+                # notif (send_bet_resolved_real) covers everything at bet closure.
             t_after_bet = time.perf_counter()
 
             # === 4.6. Await background resolve (moved here from before
@@ -1278,10 +1433,12 @@ def main():
             cycle_n = stats["cycles"] + 1
             render_cycle(cycle_n, just_closed_open, resolution, prediction, stats)
 
-            # === 6. Telegram notif (only when a real bet was just resolved) ===
-            # Fire-and-forget : the resolution is already in stats / bets.csv ;
-            # the Telegram POST can finish on its own time.
-            if resolution is not None and pending is not None and pending["team"] in ("UP", "DOWN"):
+            # === 6. Telegram notif (PAPER mode only) ===
+            # Real-mode bets get a single unified notif via send_bet_resolved_real
+            # when Polymarket settles -- so we skip the paper-style notif here to
+            # avoid duplicates.
+            if (polymarket_client is None and resolution is not None
+                    and pending is not None and pending["team"] in ("UP", "DOWN")):
                 bet_conf = pending["p_up"] if pending["team"] == "UP" else pending["p_dn"]
                 target_ms = pending["target_open"]
                 close_ms = target_ms + INTERVAL_15M_MS

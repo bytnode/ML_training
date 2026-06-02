@@ -98,6 +98,7 @@ C = dict(
     price="#4dd0e1",
     atr="#ba68c8",
     capital="#66bb6a",
+    bets="#ef5350",
 )
 
 # Injected after the plot is built. Jobs:
@@ -114,10 +115,10 @@ _AUTO_Y_JS = """
 
   // ===== trace indices (must match build_figure add_trace order) ==========
   var T_CI = 0, T_BASE = 1, T_SMOOTH = 2, T_ROLL = 3,
-      T_PRICE = 4, T_ATR = 5, T_CAP = 6;
+      T_PRICE = 4, T_ATR = 5, T_CAP = 6, T_BETS = 7;
 
   // Lower panes: each indicator is simply on or off. "on" => its own pane.
-  var state = { price: false, atr: false, cap: false };
+  var state = { price: false, atr: false, cap: false, bets: false };
   // WR axis scale: false = fixed 50-70 %, true = auto-fit (min..max).
   var wrAuto = false;
   // Read-out persistence: a redraw fires a spurious unhover, so we keep the
@@ -132,6 +133,7 @@ _AUTO_Y_JS = """
   SDATA[T_PRICE]  = WR_PRICE;
   SDATA[T_ATR]    = rollingATR(ATR_DAYS);
   SDATA[T_CAP]    = WR_CAPITAL;
+  SDATA[T_BETS]   = WR_BETS;
 
   // ===== shared helpers ==================================================
   var xcache = null;
@@ -190,6 +192,7 @@ _AUTO_Y_JS = """
     if (state.price) { g.push({ key: "yaxis2", traces: [T_PRICE] }); }
     // yaxis3 (ATR) is a fixed 0-100 index axis -- no auto-fit on zoom.
     if (state.cap)   { g.push({ key: "yaxis4", traces: [T_CAP], log: true }); }
+    if (state.bets)  { g.push({ key: "yaxis5", traces: [T_BETS] }); }
     return g;
   }
 
@@ -337,6 +340,8 @@ _AUTO_Y_JS = """
     1: { main: [0.40, 1.0], panes: [[0.0, 0.36]] },
     2: { main: [0.56, 1.0], panes: [[0.30, 0.52], [0.0, 0.26]] },
     3: { main: [0.55, 1.0], panes: [[0.37, 0.51], [0.19, 0.33], [0.0, 0.15]] },
+    4: { main: [0.62, 1.0], panes: [[0.465, 0.585], [0.31, 0.43],
+                                    [0.155, 0.275], [0.0, 0.12]] },
   };
 
   function paneLayout() {
@@ -344,17 +349,19 @@ _AUTO_Y_JS = """
     if (state.price) { order.push("price"); }
     if (state.atr)   { order.push("atr"); }
     if (state.cap)   { order.push("cap"); }
+    if (state.bets)  { order.push("bets"); }
     var P = order.length, lay = {};
-    var YA = { price: "yaxis2", atr: "yaxis3", cap: "yaxis4" };
-    var XA = { price: "xaxis2", atr: "xaxis3", cap: "xaxis4" };
+    var YA = { price: "yaxis2", atr: "yaxis3", cap: "yaxis4", bets: "yaxis5" };
+    var XA = { price: "xaxis2", atr: "xaxis3", cap: "xaxis4", bets: "xaxis5" };
 
     // Default: main fills everything; pane axes collapse to a full overlap.
     // No trace sits on a pane axis while its pane is closed (render() parks
-    // price / atr / capital back on the main axes), so the overlap is hidden.
+    // price / atr / capital / bets back on the main axes), so it is hidden.
     lay["yaxis.domain"]  = [0.0, 1.0];
     lay["yaxis2.domain"] = [0.0, 1.0];
     lay["yaxis3.domain"] = [0.0, 1.0];
     lay["yaxis4.domain"] = [0.0, 1.0];
+    lay["yaxis5.domain"] = [0.0, 1.0];
     if (P > 0) {
       var dom = DOMAINS[P];
       lay["yaxis.domain"] = dom.main;
@@ -369,6 +376,8 @@ _AUTO_Y_JS = """
     lay["yaxis3.visible"] = state.atr;
     lay["xaxis4.visible"] = state.cap;
     lay["yaxis4.visible"] = state.cap;
+    lay["xaxis5.visible"] = state.bets;
+    lay["yaxis5.visible"] = state.bets;
 
     // tick labels only on the bottom-most visible pane.
     var bottom = P ? XA[order[P - 1]] : "xaxis";
@@ -376,12 +385,14 @@ _AUTO_Y_JS = """
     lay["xaxis2.showticklabels"] = (bottom === "xaxis2");
     lay["xaxis3.showticklabels"] = (bottom === "xaxis3");
     lay["xaxis4.showticklabels"] = (bottom === "xaxis4");
+    lay["xaxis5.showticklabels"] = (bottom === "xaxis5");
 
     // pane name tags (annotations: 0 = WR-final hline, 1 = price, 2 = atr,
-    // 3 = capital).
+    // 3 = capital, 4 = bets/week).
     lay["annotations[1].visible"] = state.price;
     lay["annotations[2].visible"] = state.atr;
     lay["annotations[3].visible"] = state.cap;
+    lay["annotations[4].visible"] = state.bets;
     return lay;
   }
 
@@ -392,12 +403,13 @@ _AUTO_Y_JS = """
     Plotly.update(gd,
       { visible: [state.price ? true : "legendonly",
                   state.atr ? true : "legendonly",
-                  state.cap ? true : "legendonly"],
+                  state.cap ? true : "legendonly",
+                  state.bets ? true : "legendonly"],
         xaxis:   [state.price ? "x2" : "x", state.atr ? "x3" : "x",
-                  state.cap ? "x4" : "x"],
+                  state.cap ? "x4" : "x", state.bets ? "x5" : "x"],
         yaxis:   [state.price ? "y2" : "y", state.atr ? "y3" : "y",
-                  state.cap ? "y4" : "y"] },
-      paneLayout(), [T_PRICE, T_ATR, T_CAP]);
+                  state.cap ? "y4" : "y", state.bets ? "y5" : "y"] },
+      paneLayout(), [T_PRICE, T_ATR, T_CAP, T_BETS]);
     schedule();
   }
 
@@ -433,6 +445,8 @@ _AUTO_Y_JS = """
       input: { days: ATR_DAYS, recompute: rollingATR } },
     { idx: T_CAP,    name: "Capital (500 $, paliers)", color: "#66bb6a",
       fmt: "cap", kind: "ind", ind: "cap" },
+    { idx: T_BETS,   name: "Paris / semaine",  color: "#ef5350", fmt: "count",
+      kind: "ind", ind: "bets" },
   ];
 
   function isVisible(idx) {
@@ -446,6 +460,7 @@ _AUTO_Y_JS = """
     if (fmt === "pct") { return (v * 100).toFixed(2) + " %"; }
     if (fmt === "usd") { return "$" + Math.round(v).toLocaleString("en-US"); }
     if (fmt === "idx") { return v.toFixed(1); }
+    if (fmt === "count") { return Math.round(v) + " paris"; }
     if (fmt === "cap") {
       if (v >= 1e7 || (v > 0 && v < 0.01)) { return "$" + v.toExponential(2); }
       return "$" + v.toLocaleString("en-US",
@@ -700,14 +715,14 @@ def load_bets(csv_path: Path) -> pd.DataFrame:
     if not csv_path.exists():
         sys.exit(f"[erreur] Fichier introuvable : {csv_path}")
     df = pd.read_csv(csv_path)
-    missing = {"timestamp_ms", "result", "high", "low", "close"} - set(df.columns)
+    missing = {"timestamp", "result", "high", "low", "close"} - set(df.columns)
     if missing:
         sys.exit(f"[erreur] Colonnes manquantes dans le CSV : {sorted(missing)}")
     df = df[df["result"].isin(["win", "loss"])].copy()
     if df.empty:
         sys.exit("[erreur] Aucun pari resolu (win/loss) dans le fichier.")
-    df = df.sort_values("timestamp_ms").reset_index(drop=True)
-    df["dt"] = pd.to_datetime(df["timestamp_ms"], unit="ms")
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    df["dt"] = pd.to_datetime(df["timestamp"], unit="ms")
     return df
 
 
@@ -770,6 +785,24 @@ def rolling_mean_days(values: np.ndarray, ts_ms: np.ndarray,
             lo += 1
         if cnt > 0:
             out[i] = acc / cnt
+    return out
+
+
+def rolling_count_days(ts_ms: np.ndarray, days: int) -> np.ndarray:
+    """Count of bets in the trailing `days`-day window at each bet.
+
+    For bet i, count every bet j with ts[i] - days < ts[j] <= ts[i] (bet i
+    included). With days=7 this is the bets-per-week curve: how many bets the
+    team placed in the week ending at each bet. No NaN -- the count is valid
+    from the first bet (it just ramps up as the window fills)."""
+    window_ms = int(days) * 86_400_000
+    n = len(ts_ms)
+    out = np.empty(n, dtype=float)
+    lo = 0
+    for i in range(n):
+        while ts_ms[i] - ts_ms[lo] > window_ms:
+            lo += 1
+        out[i] = i - lo + 1
     return out
 
 
@@ -867,9 +900,9 @@ def load_warmup(test_start_ms: int, days: int = MAX_WARMUP_DAYS):
         if taken.empty:
             print("  [warmup] aucun pari avant la periode de test.")
             return np.empty(0, dtype=int), np.empty(0, dtype="int64")
-        taken = taken.sort_values("timestamp_ms")
+        taken = taken.sort_values("timestamp")
         w_win = (taken["result"] == "win").to_numpy().astype(int)
-        w_ts = taken["timestamp_ms"].to_numpy().astype("int64")
+        w_ts = taken["timestamp"].to_numpy().astype("int64")
         print(f"  [warmup] {len(w_win)} paris charges "
               f"({days} j avant le test).")
         return w_win, w_ts
@@ -886,7 +919,7 @@ def compute_series(df: pd.DataFrame, warmup: tuple) -> dict:
     other curve stays test-period only.
     """
     win = (df["result"] == "win").to_numpy().astype(int)
-    ts_ms = df["timestamp_ms"].to_numpy().astype("int64")
+    ts_ms = df["timestamp"].to_numpy().astype("int64")
     n = win.size
     bet_no = np.arange(1, n + 1)
     cum_wins = np.cumsum(win)
@@ -913,11 +946,13 @@ def compute_series(df: pd.DataFrame, warmup: tuple) -> dict:
     atr = compute_atr(df, ATR_PERIOD)
     atr_ma = rolling_mean_days(atr, ts_ms, ATR_MA_DAYS)
     capital = compute_capital(win)
+    bets_week = rolling_count_days(ts_ms, 7)   # bets in the trailing 7 days
 
     return dict(win=win, ts_ms=ts_ms, n=n, bet_no=bet_no, cum_wins=cum_wins,
                 cum_losses=cum_losses, cum_wr=cum_wr, head_wr=head_wr,
                 rolling=rolling, ci_lo=ci_lo, ci_hi=ci_hi,
                 price=price, atr=atr, atr_ma=atr_ma, capital=capital,
+                bets_week=bets_week,
                 roll_win=roll_win, roll_ts=roll_ts, test_offset=test_offset)
 
 
@@ -1014,6 +1049,16 @@ def build_figure(df: pd.DataFrame, s: dict):
         hovertemplate="%{y}<extra></extra>",
     ))
 
+    # --- trace 7 : bets per week. Trailing 7-day count at each bet.
+    #               Parked on the main axes; render() moves it to its own
+    #               pane (x5/y5) when the user opens it. -------------------
+    fig.add_trace(go.Scatter(
+        x=x, y=s["bets_week"], mode="lines", xaxis="x", yaxis="y",
+        line=dict(color=C["bets"], width=1.4, shape="hv"),
+        name="Paris / semaine", visible="legendonly",
+        hovertemplate="%{y}<extra></extra>",
+    ))
+
     # --- final WR reference line (annotation index 0) ---------------------
     fig.add_hline(
         y=final_wr, line=dict(color=C["final"], width=1, dash="dot"),
@@ -1040,6 +1085,13 @@ def build_figure(df: pd.DataFrame, s: dict):
         x=0.008, y=0.94, xanchor="left", yanchor="top", showarrow=False,
         font=dict(color=C["capital"], size=10.5), visible=False,
     )
+    # --- pane name tag (annotation index 4 = bets per week) --------------
+    fig.add_annotation(
+        text="Paris / semaine — comptage glissant sur 7 jours",
+        xref="x5 domain", yref="y5 domain",
+        x=0.008, y=0.94, xanchor="left", yanchor="top", showarrow=False,
+        font=dict(color=C["bets"], size=10.5), visible=False,
+    )
 
     # --- initial axis windows --------------------------------------------
     # WR axis is locked to 50-70 % : a stable, readable scale rather than one
@@ -1048,6 +1100,7 @@ def build_figure(df: pd.DataFrame, s: dict):
     y2_range = _padded_range(s["price"])
     y3_range = [-4.0, 104.0]                     # ATR is a fixed 0-100 index
     y4_range = _padded_log_range(s["capital"])   # log10 units (log axis)
+    y5_range = _padded_range(s["bets_week"])     # bets / week (linear count)
 
     d0 = df["dt"].iloc[0].strftime("%d/%m/%Y")
     d1 = df["dt"].iloc[-1].strftime("%d/%m/%Y")
@@ -1105,6 +1158,9 @@ def build_figure(df: pd.DataFrame, s: dict):
         xaxis4=dict(domain=[0.0, 1.0], anchor="y4", matches="x",
                     visible=False, showspikes=False,
                     hoverformat="%a %d %b %Y · %H:%M", **grid),
+        xaxis5=dict(domain=[0.0, 1.0], anchor="y5", matches="x",
+                    visible=False, showspikes=False,
+                    hoverformat="%a %d %b %Y · %H:%M", **grid),
 
         # --- main Y axis : win rate. fixedrange -> JS-driven -----------
         yaxis=dict(
@@ -1132,6 +1188,12 @@ def build_figure(df: pd.DataFrame, s: dict):
             domain=[0.0, 1.0], anchor="x4", type="log", fixedrange=True,
             visible=False, range=y4_range, tickprefix="$",
             exponentformat="power", showspikes=False, **grid,
+        ),
+        # --- pane Y axis : bets / week (linear count, auto-fit on open) --
+        yaxis5=dict(
+            domain=[0.0, 1.0], anchor="x5", fixedrange=True, visible=False,
+            range=y5_range, tickformat=".0f",
+            showspikes=False, **grid,
         ),
     )
     return fig
@@ -1166,6 +1228,7 @@ def write_chart(fig, out_path: Path, s: dict) -> None:
         "var WR_ATR=" + _arr(s["atr"]) + ";\n"
         "var ATR_DAYS=" + str(ATR_MA_DAYS) + ";\n"
         "var WR_CAPITAL=" + _arr(s["capital"]) + ";\n"
+        "var WR_BETS=" + _arr(s["bets_week"]) + ";\n"
     )
     config = dict(
         # scrollZoom OFF: the wheel is handled by our own listener, which
@@ -1207,6 +1270,9 @@ def print_summary(df: pd.DataFrame, s: dict, out_path: Path) -> None:
     atr = s["atr_ma"][~np.isnan(s["atr_ma"])]
     if atr.size:
         print(f"  {'ATR glissant (moy.)':<20}: {atr.mean():.1f}")
+    bw = s["bets_week"]
+    print(f"  {'Paris / semaine':<20}: {bw.mean():.1f} moy.  "
+          f"(min {bw.min():.0f}, max {bw.max():.0f})")
     cap_final = float(s["capital"][-1])
     mult = cap_final / CAPITAL_START
     cap_str = f"{cap_final:,.2f}" if cap_final < 1e9 else f"{cap_final:.3e}"
@@ -1221,7 +1287,7 @@ def main() -> None:
     df = load_bets(csv_path)
     print(f"Warmup  : prediction des {MAX_WARMUP_DAYS} j avant le test "
           f"(peut prendre ~15 s)...")
-    warmup = load_warmup(int(df["timestamp_ms"].iloc[0]), MAX_WARMUP_DAYS)
+    warmup = load_warmup(int(df["timestamp"].iloc[0]), MAX_WARMUP_DAYS)
     series = compute_series(df, warmup)
     fig = build_figure(df, series)
     write_chart(fig, OUTPUT_HTML, series)

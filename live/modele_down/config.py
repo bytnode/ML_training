@@ -86,15 +86,27 @@ ASYM_USE_FULL_VAL = True            # True = full val, False = derniers 55j
 # from the UP model. On DOWN, hour 22 is the WORST hour empirically
 # (52-55 % WR), so boosting it pulled losing bets in. Empty good_hours +
 # delta=0 = no boost; the V2 strategy still applies correctly.
-ASYM_HOUR_BOOST_GOOD_HOURS = (13, 20, 21, 22)
-ASYM_HOUR_BOOST_DELTA = 0.01
+ASYM_HOUR_BOOST_GOOD_HOURS = (6,19)
+ASYM_HOUR_BOOST_DELTA = 0.0125
 
 # --- Bad-hours exclusion (V2 extension) ---
 # UTC hours where we NEVER bet, regardless of confidence. Empirical losers
 # on weekend (Asian off-peak + lunch dump): hour 3, 4, 11, 13, 22 sit at
 # 51-58 % WR while pooled weekend WR is ~64 % at the same threshold. Cutting
 # them concentrates volume on the high-WR hours. cf optimize/sweep_weekend_only.py.
-ASYM_BAD_HOURS = ( 0, 3, 4, 11, 13, 18, 23, )
+ASYM_BAD_HOURS =  (3,4,5,11,23,9,13)
+
+# --- Bad-days threshold boost ---
+# UTC isoweekday(s) where the bucket threshold is RAISED by ADAPTIVE_WR_BAD_DAY
+# (= fewer, more selective bets on these days). isoweekday: 1=Monday..7=Sunday.
+# Empirically Friday (=5) shows the weakest team WR in the per-weekday
+# breakdown (cf main.py "Share of taken bets per weekday" table). Boosting the
+# threshold there forces the model to pick only its highest-confidence Friday
+# bets. Read at runtime by api.py._bucket_threshold (no retrain needed).
+# Empty tuple disables the filter.
+ADAPTIVE_BAD_DAYS = (5,)
+ADAPTIVE_WR_BAD_DAY = 0.01
+
 
 # --- Cross-model filter (V3 extension) ---
 # Pour chaque bar pris par modele_down, on lit p_up du modele_up (meme bar,

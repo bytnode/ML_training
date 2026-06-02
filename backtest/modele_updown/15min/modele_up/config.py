@@ -41,7 +41,7 @@ MODEL_OUTPUT = "btc_updown_model.json"
 
 TRAIN_DAYS = 3600
 TEST_DAYS = 365
-VAL_FRACTION = 0.1
+VAL_FRACTION = 0.3
 
 # ============================================================
 #  SECTION 2b : Strategie de calibration adaptative (V1 / V2)
@@ -77,9 +77,25 @@ ADAPTIVE_STRATEGY = "asym_wknd_excl_hour_boost"
 #   - weekend : T_we=0.555 = val_weekend_pool quantile_83.3 (1499/8960 = 16.72%)
 ASYM_VOL_FRAC_WEEKDAY = 0.0225    # ignored: weekday is fully skipped below
                                    # (kept for the runs.csv schema only).
-ASYM_VOL_FRAC_WEEKEND = 0.145     # top 16.7% du val weekend non-skip
+ASYM_VOL_FRAC_WEEKEND = 0.07     # top 16.7% du val weekend non-skip
 ASYM_SKIP_CELLS = ((2, 0), (2, 1))  # (volatility_state, is_weekend) exclus
 ASYM_USE_FULL_VAL = True            # True = full val, False = derniers 55j
+
+# --- Seuil UNANIME weekday/weekend, HARDCODE (toggle d'experimentation) ---
+# True  -> UN SEUL seuil pour weekday ET weekend = la valeur que tu ecris dans
+#          ASYM_UNANIMOUS_THRESHOLD, prise TELLE QUELLE (PAS un quantile,
+#          PAS un %). Desactive completement le mode par axe : la boucle
+#          weekday/weekend (ASYM_VOL_FRAC_WEEKDAY / ASYM_VOL_FRAC_WEEKEND) n'est
+#          jamais executee. Le sidecar ecrit {"0": T, "1": T}, donc api.py /
+#          predict.py / live.py l'appliquent sans aucun changement de code.
+# False -> comportement par defaut (deux seuils distincts par axe, calibres
+#          par quantile sur ASYM_VOL_FRAC_WEEKDAY / ASYM_VOL_FRAC_WEEKEND).
+# Les skip_cells, bad_hours, bad_days et le hour_boost restent actifs PAR
+# DESSUS : seul le split weekday/weekend du seuil de base est neutralise.
+ASYM_UNANIMOUS_WKND = True
+# Seuil de confiance P(up) ecrit en dur. Ex: 0.58 -> on prend le pari UP ssi
+# P(up) >= 0.58, weekday comme weekend. C'est exactement le nombre du sidecar.
+ASYM_UNANIMOUS_THRESHOLD = 0.575
 
 # Parametres specifiques V2 ("asym_wknd_excl_hour_boost") :
 # Pour les bougies ouvertes a une heure UTC dans ASYM_HOUR_BOOST_GOOD_HOURS,
@@ -98,7 +114,7 @@ ASYM_HOUR_BOOST_DELTA = 0.015
 #   hour 23 (56 % WR weekday, 52 % weekend)
 # Hour 23 was even in the OLD hour_boost (= MORE bets there) which was
 # clearly hurting. Removed from boost above + added to bad_hours.
-ASYM_BAD_HOURS = (1,4, 6, 8, 16, 17, 19, 22,23)
+ASYM_BAD_HOURS = (2,3,4,8,14,15,16,17,19,23,6,9)
 
 # --- Bad-days threshold boost ---
 # UTC isoweekday(s) where the bucket threshold is RAISED by ADAPTIVE_WR_BAD_DAY
@@ -108,8 +124,8 @@ ASYM_BAD_HOURS = (1,4, 6, 8, 16, 17, 19, 22,23)
 # threshold there forces the model to pick only its highest-confidence Friday
 # bets. Read at runtime by api.py._bucket_threshold (no retrain needed).
 # Empty tuple disables the filter.
-ADAPTIVE_BAD_DAYS = (5,)
-ADAPTIVE_WR_BAD_DAY = 0.015
+ADAPTIVE_BAD_DAYS = (4,5)
+ADAPTIVE_WR_BAD_DAY = 0.02
 
 # --- Bad-hours soft boost (mirror of ASYM_HOUR_BOOST_GOOD_HOURS) ---
 # UTC hours where the bucket threshold is RAISED by ASYM_BAD_HOURS_DELTA.
@@ -119,7 +135,7 @@ ADAPTIVE_WR_BAD_DAY = 0.015
 # Unlike ASYM_BAD_HOURS which is a HARD skip (T=1.0), this lets the model still
 # bet if its confidence is high enough. Read at runtime by
 # api.py._bucket_threshold (no retrain needed). Empty tuple disables.
-ADAPTIVE_BAD_HOURS = (13,3)
+ADAPTIVE_BAD_HOURS = (13,3,15,5,9,00,1,11, 22,5)
 ASYM_BAD_HOURS_DELTA = 0.01
 
 # --- Cross-model filter (V3 extension) ---

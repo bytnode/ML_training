@@ -41,7 +41,7 @@ MODEL_OUTPUT = "btc_updown_model.json"
 
 TRAIN_DAYS = 3600
 TEST_DAYS = 365
-VAL_FRACTION = 0.1
+VAL_FRACTION = 0.15
 
 # ============================================================
 #  SECTION 2b : Strategie de calibration adaptative (V1 / V2)
@@ -73,7 +73,7 @@ ADAPTIVE_STRATEGY = "asym_wknd_excl_hour_boost"
 # 6 fenetres sur le modele DOWN + features ETH (cf optimize/opt_calib.py).
 ASYM_VOL_FRAC_WEEKDAY = 0.0225    # ignored: weekday is fully skipped below
                                     # (kept for the runs.csv schema only).
-ASYM_VOL_FRAC_WEEKEND = 0.145      # tuned for clean parquet: target T_we ~= 0.5375.
+ASYM_VOL_FRAC_WEEKEND = 0.07       # CLONE de modele_up (ex-0.145). Ignore en mode unanime.
 
 # Skip ALL weekday cells. Per-bucket diagnostic (cf optimize/sweep_high_wr.py)
 # shows weekday WR plafonne at 56-58 % across all volatility states, vs
@@ -81,12 +81,29 @@ ASYM_VOL_FRAC_WEEKEND = 0.145      # tuned for clean parquet: target T_we ~= 0.5
 ASYM_SKIP_CELLS = ((2, 0), (2, 1))
 ASYM_USE_FULL_VAL = True            # True = full val, False = derniers 55j
 
+# --- Seuil UNANIME weekday/weekend, HARDCODE (identique a modele_up) ---
+# True  -> UN SEUL seuil pour weekday ET weekend = la valeur ecrite dans
+#          ASYM_UNANIMOUS_THRESHOLD, prise TELLE QUELLE (PAS un quantile,
+#          PAS un %). Desactive completement le mode par axe : la boucle
+#          weekday/weekend (ASYM_VOL_FRAC_WEEKDAY / ASYM_VOL_FRAC_WEEKEND) n'est
+#          jamais executee. Le sidecar ecrit {"0": T, "1": T}, donc api.py /
+#          predict.py / live.py l'appliquent sans aucun changement de code.
+# False -> comportement par defaut (deux seuils distincts par axe, quantile).
+# Les skip_cells, bad_hours, bad_days et le hour_boost restent actifs PAR
+# DESSUS : seul le split weekday/weekend du seuil de base est neutralise.
+# NB: ici le seuil porte sur P(down). spw=1.30 a deja recentre la distribution
+# de p_down vers la zone de UP (p_q95 ~= 0.600), donc 0.58 est atteignable.
+ASYM_UNANIMOUS_WKND = True
+# Seuil de confiance P(down) ecrit en dur. Ex: 0.58 -> pari DOWN ssi
+# P(down) >= 0.58, weekday comme weekend. C'est exactement le nombre du sidecar.
+ASYM_UNANIMOUS_THRESHOLD = 0.595
+
 # Parametres specifiques V2 ("asym_wknd_excl_hour_boost") :
 # DISABLED -- the original boost (20,21,22) was the US-close effect carried
 # from the UP model. On DOWN, hour 22 is the WORST hour empirically
 # (52-55 % WR), so boosting it pulled losing bets in. Empty good_hours +
 # delta=0 = no boost; the V2 strategy still applies correctly.
-ASYM_HOUR_BOOST_GOOD_HOURS = (6,19)
+ASYM_HOUR_BOOST_GOOD_HOURS = ()
 ASYM_HOUR_BOOST_DELTA = 0.0125
 
 # --- Bad-hours exclusion (V2 extension) ---
@@ -94,7 +111,7 @@ ASYM_HOUR_BOOST_DELTA = 0.0125
 # on weekend (Asian off-peak + lunch dump): hour 3, 4, 11, 13, 22 sit at
 # 51-58 % WR while pooled weekend WR is ~64 % at the same threshold. Cutting
 # them concentrates volume on the high-WR hours. cf optimize/sweep_weekend_only.py.
-ASYM_BAD_HOURS =  (3,4,5,11,23,9,13)
+ASYM_BAD_HOURS = (1,5,13,17,3,8,11,9,7,16,14)   # CLONE de modele_up (ex-(3,4,5,9,11,13,23))
 
 # --- Bad-days threshold boost ---
 # UTC isoweekday(s) where the bucket threshold is RAISED by ADAPTIVE_WR_BAD_DAY
@@ -104,8 +121,16 @@ ASYM_BAD_HOURS =  (3,4,5,11,23,9,13)
 # threshold there forces the model to pick only its highest-confidence Friday
 # bets. Read at runtime by api.py._bucket_threshold (no retrain needed).
 # Empty tuple disables the filter.
-ADAPTIVE_BAD_DAYS = (5,)
-ADAPTIVE_WR_BAD_DAY = 0.01
+ADAPTIVE_BAD_DAYS = (4, 5)
+ADAPTIVE_WR_BAD_DAY = 0.02       # CLONE de modele_up (ex-0.01)
+
+# --- Bad-hours soft boost (CLONE de modele_up) ---
+# Heures UTC ou le seuil est RELEVE de ASYM_BAD_HOURS_DELTA (= plus selectif,
+# PAS un skip dur : le pari peut encore passer si la confiance est assez haute).
+# Applique par apply_thresholds_asym_hour_boost. Tuple vide = desactive.
+# Porte depuis modele_up : ce mecanisme n'existait pas dans down avant le clone.
+ADAPTIVE_BAD_HOURS = (2,10,4,12,15,8)
+ASYM_BAD_HOURS_DELTA = 0.01
 
 
 # --- Cross-model filter (V3 extension) ---
@@ -114,7 +139,7 @@ ADAPTIVE_WR_BAD_DAY = 0.01
 # Rationale (cf optimize/deep_analysis.py) : sur les 799 bets actuels,
 # p_up < 0.47 donne 66.4 % WR vs 58.4 % pour p_up >= 0.47 -- ecart de +8 pt
 # pour un seul filtre binaire. ASYM_MAX_P_UP = 1.0 desactive le filtre.
-ASYM_MAX_P_UP = 0.48               # runtime filter (feature was removed from parquet for leakage).
+ASYM_MAX_P_UP = 0.530              # CLONE de modele_up (meme valeur que son ASYM_MAX_P_DOWN ; ex-0.48).
 # Path vers modele_up's test_predictions.csv (relatif au cwd au moment du
 # run -- train.py est suppose etre execute depuis 15min/modele_down/).
 ASYM_MODELE_UP_PREDS = "../modele_up/logs/test_predictions.csv"

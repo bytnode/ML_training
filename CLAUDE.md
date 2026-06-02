@@ -10,9 +10,9 @@ Two top-level code areas:
   - **`15min/`** — the mature tree. Three layers, documented in the rest of this file.
   - **`5m/`** — a sibling variant predicting the next **5-minute** candle. See *The `5m/` sibling tree* below.
   - **`30m/`** — a sibling variant and the current active optimization target. See *The `30m/` sibling tree* below. (The folder name is stale — its content has been converted to a **1h** base timeframe; the rename is pending.)
-- **`live/modele_15m/`** — the **self-contained live trading daemon** (layer 3 below). It carries its own copies of the 15min model artifacts and is deployable on its own, independent of `backtest/`.
+- **`live/`** — the **self-contained live trading daemon** (layer 3 below). It carries its own copies of the 15min model artifacts and is deployable on its own, independent of `backtest/`. (Was `live/modele_15m/` until it was flattened up one level to `live/`.)
 
-Other repo-root content (`aure.json`, most of `docs/superpowers/specs/`) is either a gitignored artifact or historical design notes for surfaces (`modele_15m`, the old `live/` + `infra/` Polymarket daemon) that have since been **deleted** — don't restore those. The exception is the `30m` design notes under `backtest/docs/superpowers/`, which describe live in-progress work. Always cross-check specs against the working tree.
+Other repo-root content (`aure.json`, most of `docs/superpowers/specs/`) is either a gitignored artifact or historical design notes for surfaces (an old `modele_15m`, and an **old** top-level `live/` + `infra/` Polymarket daemon) that have since been **deleted** — don't restore those. ⚠️ Don't confuse that *deleted* old `live/` with the **current** repo-root `live/` daemon described above (it was renamed up from `live/modele_15m/`); the current `live/` is active, its design note is `docs/superpowers/specs/2026-05-14-polymarket-live-betting-design.md`. The exception is the `30m` design notes under `backtest/docs/superpowers/`, which describe live in-progress work. Always cross-check specs against the working tree.
 
 The **`15min/`** tree has three layers, in dependency order:
 
@@ -21,11 +21,11 @@ The **`15min/`** tree has three layers, in dependency order:
    - `modele_down` : `label = 1` iff next candle is red. Output `p_down`.
    - Each package owns its own `CLAUDE.md` — **read those first** before editing inside a package. They document the per-package build chain (`modele_down` has a 5-phase `data.py`; `modele_up` has **no `data.py`** — its parquet is a pre-built artifact), the feature set, the sidecar shape, and the working-directory contract.
 2. **`backtest/modele_updown/15min/main.py`** — team backtest orchestrator. Calls `api.evaluate_on_slice(start_ms, end_ms)` on both sister packages, applies the team coherence rule, prints a Rich report, and appends one row to `logs/team_runs.csv` (= `backtest/modele_updown/15min/logs/team_runs.csv`).
-3. **`live/modele_15m/`** — live trading daemon. **A self-contained folder at the repo root** (NOT under `backtest/`): it carries its own copies of the model artifacts (`modele_up/` + `modele_down/`) and needs nothing from `backtest/` to run. After a retrain, copy the fresh `btc_updown_model.json` + `btc_updown_model.thresholds.json` from `backtest/modele_updown/15min/modele_*/` into `live/modele_15m/modele_*/`. Two modes behind the `LIVE_MODE` env var:
+3. **`live/`** — live trading daemon. **A self-contained folder at the repo root** (NOT under `backtest/`): it carries its own copies of the model artifacts (`modele_up/` + `modele_down/`) and needs nothing from `backtest/` to run. After a retrain, copy the fresh `btc_updown_model.json` + `btc_updown_model.thresholds.json` from `backtest/modele_updown/15min/modele_*/` into `live/modele_*/`. Two modes behind the `LIVE_MODE` env var:
    - `LIVE_MODE=false` (default / absent) — **paper trading**, no orders placed, no Polymarket calls, no `py-clob-client-v2` / `web3` / `eth-account` deps touched at runtime (they're lazy-imported only when needed).
    - `LIVE_MODE=true` — **real money**. Same model + decision flow, but every `UP` / `DOWN` team decision triggers a FAK BUY on the matching `btc-updown-15m-<unix_s>` Polymarket market. Pending bets are reconciled at startup and at the top of every cycle. **Winning bets are auto-redeemed via Polymarket's relayer** — CLOB V2 deposit-wallet redemption is operator-gated (`DepositWallet.execute` is `OnlyFactory`; `DepositWalletFactory.proxy` is `OnlyOperator`), so `redeem()` builds + EIP-712-signs a `redeemPositions` batch and submits it to the relayer (`POST {RELAYER_HOST}/submit`, `type:"WALLET"`). Requires a self-service `RELAYER_API_KEY` (polymarket.com → Settings → API Keys); without it `redeem()` returns `MANUAL_REDEEM_REQUIRED` and the daemon Telegram-alerts you to claim by hand.
 
-   Files in `live/modele_15m/` (flat, self-contained — `live.py` + `modele_up/` + `modele_down/` + `live_helpers/` are all siblings):
+   Files in `live/` (flat, self-contained — `live.py` + `modele_up/` + `modele_down/` + `live_helpers/` are all siblings):
    - `live.py` — the loop. Reads `LIVE_MODE`; the only CLI flag is `--dry-run` (real mode but skip the actual `POST /order`).
    - `polymarket.py` — **the single file** that touches Polymarket / Polygon / `py-clob-client-v2` / `web3`. `PolymarketClient.from_env()` + `place_fak_order` / `read_settlement` / `redeem` / balance reads. Uses CLOB **V2** (`py-clob-client-v2`; V1 is dead since the 2026-04-28 migration) with `signature_type=3` (deposit-wallet flow) and market FAK orders. Empirically validated contract addresses pinned at the top.
    - `live_helpers/` — `fetch.py` (Bitstamp public OHLC), `features_up.py`, `features_down.py`, `notify.py` (Telegram, with `send_bet_placed` / `send_bet_resolved_real` / `send_stuck` / `send_low_matic` events on top of the existing paper-mode `send_resolution`).
@@ -35,13 +35,13 @@ The **`15min/`** tree has three layers, in dependency order:
    - `modele_up/` + `modele_down/` — **copies** of the runtime files the daemon needs: `config.py`, the model `.json` + `.thresholds.json`, and (modele_down only) `data.py` (its feature helpers are imported by `features_down.py`). These are copies of the training packages in `backtest/` — kept here so the folder is independent.
    - `Dockerfile` + `docker-compose.yml` — `live-team` service. **Build context is this folder itself** (`build: .`) — everything is inside it, no parent-directory hack. Same image works in both modes — flip `LIVE_MODE` in `.env` and `docker compose restart live-team`.
    - `Dockerfile.dockerignore` — BuildKit per-Dockerfile ignore (`__pycache__`, `logs/`, `.env`, stray data files).
-   - `.env` (gitignored) + `.env.example` (template) — Telegram + (when `LIVE_MODE=true`) `POLYGON_PRIVATE_KEY`, `POLYGON_EOA_ADDRESS`, `POLYMARKET_PROXY_ADDRESS`, `POLYGON_RPC_URL`, `CLOB_HOST`, `GAMMA_HOST`, plus tunables `SLIPPAGE_BPS` / `BET_FRACTION` / `BET_MIN_USDC`. Optional `TELEGRAM_ERROR_BOT_TOKEN` / `TELEGRAM_ERROR_CHAT_ID` route a **separate** Telegram bot to receive every `logger.error(...)` / `logger.exception(...)` from the daemon — wired via a `logging.Handler` in `notify.py`, so any new error site picks it up automatically.
+   - `.env` (gitignored) — Telegram + (when `LIVE_MODE=true`) `POLYGON_PRIVATE_KEY`, `POLYGON_EOA_ADDRESS`, `POLYMARKET_PROXY_ADDRESS`, `POLYGON_RPC_URL`, `CLOB_HOST`, `GAMMA_HOST`, plus tunables `SLIPPAGE_BPS` / `BET_FRACTION` / `BET_MIN_USDC`. (There is **no** `.env.example` in `live/` anymore — it was removed in the flatten; copy keys from this env-var list. The `5m/live/` daemon still keeps its own `.env.example`.) Optional `TELEGRAM_ERROR_BOT_TOKEN` / `TELEGRAM_ERROR_CHAT_ID` route a **separate** Telegram bot to receive every `logger.error(...)` / `logger.exception(...)` from the daemon — wired via a `logging.Handler` in `notify.py`, so any new error site picks it up automatically.
 
    **France (and most of Western EU) is geo-blocked by Polymarket** — `LIVE_MODE=true` only works from a non-blocked-region VPS. Paper mode runs anywhere. Design notes at `docs/superpowers/specs/2026-05-14-polymarket-live-betting-design.md`.
 
 ## The `15min/` import trick
 
-`15min/` starts with a digit, so `from 15min.modele_up import api` is a syntax error. Both `main.py` and the Dockerfile rely on putting `15min/` itself on `sys.path` and importing the packages as top-level (`from modele_up import api as api_up`). If you add a new entry point that needs both packages, copy the `sys.path.insert` block from `main.py` — don't rename `15min/` to make this go away (the live container's `COPY 15min/...` paths and the per-package working-directory contract both depend on the name).
+`15min/` starts with a digit, so `from 15min.modele_up import api` is a syntax error. Both `main.py` and the Dockerfile rely on putting `15min/` itself on `sys.path` and importing the packages as top-level (`from modele_up import api as api_up`). If you add a new entry point that needs both packages, copy the `sys.path.insert` block from `main.py` — don't rename `15min/` to make this go away (the per-package working-directory contract depends on the name). Note: the **live container no longer copies from `15min/`** — `live/` is self-contained and its Dockerfile `COPY`s its own flat files (`live.py`, `modele_up/`, `modele_down/`, `live_helpers/`); only `main.py`'s sys.path trick still relies on the `15min/` name.
 
 ## Standardized `api.py` contract — the team coupling point
 
@@ -112,7 +112,7 @@ cd backtest\modele_updown\15min
 python main.py        # team coherence run, writes the 3 detailed logs + logs/team_runs.csv (inside 15min/)
 
 # Live trading daemon (host) — self-contained folder at the repo root
-cd live\modele_15m
+cd live
 python live.py        # runs forever, prints Rich panels per cycle, logs to logs/live_predictions.csv + logs/bets.csv
 ```
 
@@ -139,14 +139,14 @@ Each cycle:
 
 Paper mode (`LIVE_MODE=false`, the default) skips steps 3 and 6 — no wallet, no Polymarket CLOB, and `live_predictions.csv` is the only log written. Real-mode reconciliation (step 3) also runs once at startup to catch stale pending bets.
 
-Telegram credentials come from env vars `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `live/modele_15m/.env` (gitignored; `.env.example` is the checked-in template). If either is missing, the loop still runs and `notify` becomes a silent no-op.
+Telegram credentials come from env vars `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `live/.env` (gitignored; there is no `.env.example` in `live/` — copy the keys from the file-list above). If either is missing, the loop still runs and `notify` becomes a silent no-op.
 
 ## Docker — `live-team` service
 
-The Dockerfile and compose file sit inside `live/modele_15m/`. The folder is self-contained, so the build context is **the folder itself** (`build: .`) — no parent-directory hack:
+The Dockerfile and compose file sit inside `live/`. The folder is self-contained, so the build context is **the folder itself** (`build: .`) — no parent-directory hack:
 
 ```powershell
-cd live\modele_15m
+cd live
 docker compose build
 docker compose up -d
 docker compose logs -f live-team   # Rich panels render here thanks to tty: true
@@ -154,13 +154,13 @@ docker compose restart live-team   # restart after a retrain (model files are ba
 docker compose down
 ```
 
-`docker-compose.yml` mounts `./logs:/app/logs` (host path = `live/modele_15m/logs/`) so `live_predictions.csv` + `bets.csv` survive rebuilds, and reads `./.env` for Telegram + (when `LIVE_MODE=true`) the Polymarket + relayer creds. The build context is the folder itself, copied flat into `/app/` (`live.py`, `polymarket.py`, `live_helpers/`, `modele_up/`, `modele_down/`). The whole training pipeline (`train.py`, `features.py`/`predict.py`, the parquet + SQLite DB) is **not** in the folder at all — it lives in `backtest/`. Retrain on the host, copy the fresh model `.json` files into `live/modele_15m/modele_*/`, rebuild the image, restart the service.
+`docker-compose.yml` mounts `./logs:/app/logs` (host path = `live/logs/`) so `live_predictions.csv` + `bets.csv` survive rebuilds, and reads `./.env` for Telegram + (when `LIVE_MODE=true`) the Polymarket + relayer creds. The build context is the folder itself, copied flat into `/app/` (`live.py`, `polymarket.py`, `live_helpers/`, `modele_up/`, `modele_down/`). The whole training pipeline (`train.py`, `features.py`/`predict.py`, the parquet + SQLite DB) is **not** in the folder at all — it lives in `backtest/`. Retrain on the host, copy the fresh model `.json` files into `live/modele_*/`, rebuild the image, restart the service.
 
 No port is published; the container only does outbound calls — Bitstamp public OHLC + Telegram, plus the Polymarket CLOB / Polygon RPC when `LIVE_MODE=true`.
 
 ## The `30m/` sibling tree
 
-`backtest/modele_updown/30m/` is a parallel timeframe variant of the `15min/` tree. It mirrors the same shape — `modele_up/` + `modele_down/` sister packages plus a `main.py` team orchestrator — but with several deliberate differences. There is **no `live/` under `30m/`**: live trading is `15min/`-only.
+`backtest/modele_updown/30m/` is a parallel timeframe variant of the `15min/` tree. It mirrors the same shape — `modele_up/` + `modele_down/` sister packages plus a `main.py` team orchestrator — but with several deliberate differences. There is **no `live/` daemon under `30m/`** — only the `15min/` daemon (now flattened to the repo-root `live/`) and the `5m/live/` daemon exist.
 
 - **The folder name is stale.** Commit `5ff4ca3` converted this tree's content to a **1h base timeframe**; the rename `30m/` → `1h/` is still pending. Inside the tree, `main.py`, both package `CLAUDE.md`s, and `config.py` already say `1h`. Treat it as a **1h** model — the `30m/` directory name is the mismatch, not the code.
 - **Older calibration regime.** The sidecar is a delta map — `{"deltas": {"v_w": float, ...}, "metadata": {...}}` — and the effective threshold is `config.ADAPTIVE_TARGET_WR + delta(volatility_state, is_weekend)` across 6 buckets. This is **not** the V1/V2 quantile sidecar used by `15min/`. Don't copy sidecar or `_bucket_threshold` logic between the two trees.
@@ -172,7 +172,7 @@ This tree is the **current active optimization target** (pushing `modele_down`'s
 
 ## The `5m/` sibling tree
 
-`backtest/modele_updown/5m/` is a parallel timeframe variant of the `15min/` tree, predicting the direction of the next **5-minute** BTC/USD candle. It mirrors the `15min/` shape exactly — `modele_up/` + `modele_down/` sister packages, a `main.py` team orchestrator, `detailed_log.py` + `full_logs.py` — and keeps the **same V1/V2 quantile sidecar** and the same on-the-fly-parquet `api.py` contract. There is **no `live/` under `5m/`**: live trading is `15min/`-only.
+`backtest/modele_updown/5m/` is a parallel timeframe variant of the `15min/` tree, predicting the direction of the next **5-minute** BTC/USD candle. It mirrors the `15min/` shape exactly — `modele_up/` + `modele_down/` sister packages, a `main.py` team orchestrator, `detailed_log.py` + `full_logs.py` — and keeps the **same V1/V2 quantile sidecar** and the same on-the-fly-parquet `api.py` contract. It also carries its **own self-contained `live/` daemon** (`backtest/modele_updown/5m/live/` — tracked, mirrors the repo-root `live/` layout: `live.py` + `polymarket.py` + `live_helpers/` + `modele_up/` + `modele_down/` + Dockerfile + its own `.env.example`). The primary deployed daemon is still the 15min one at the repo root; `5m/live/` is the 5m counterpart.
 
 It is a structural clone of `15min/`, one base TF lower. The deliberate differences:
 
