@@ -43,6 +43,13 @@ TRAIN_DAYS = 3600
 TEST_DAYS = 365
 VAL_FRACTION = 0.15
 
+# Bridge (embargo) : nombre de JOURS de pause entre la fin de (train+val) et le
+# debut du test. Les bougies de cet intervalle ne sont ni en val ni en test.
+# 0 = pas de pause (val colle au test = comportement historique). Sert a couper
+# la fuite des features a lookback (ex: return_96, volume_rel_30d) dont la
+# fenetre chevaucherait le debut du test.
+BRIDGE_DAYS = 0
+
 # ============================================================
 #  SECTION 2b : Strategie de calibration adaptative (V1 / V2)
 # ============================================================

@@ -24,7 +24,7 @@ import xgboost as xgb
 
 from config import (
     DB_PATH, MODEL_OUTPUT,
-    TRAIN_DAYS, TEST_DAYS, VAL_FRACTION,
+    TRAIN_DAYS, TEST_DAYS, VAL_FRACTION, BRIDGE_DAYS,
     ADAPTIVE_STRATEGY,
     ASYM_VOL_FRAC_WEEKDAY, ASYM_VOL_FRAC_WEEKEND, ASYM_SKIP_CELLS,
     ASYM_USE_FULL_VAL,
@@ -420,21 +420,29 @@ def train_and_evaluate(
         train_val_cutoff_ts = test_cutoff_ts - TRAIN_DAYS * ms_per_day
         train_val_start = int(df["timestamp"].searchsorted(train_val_cutoff_ts, side="left"))
 
-    n_train_val = test_start - train_val_start
+    # Bridge (embargo) : pause de BRIDGE_DAYS jours entre la fin de (train+val) et
+    # le debut du test. Les bougies de [val_end, test_start) sont DROPPED (ni val
+    # ni test) -> coupe la fuite des features a lookback qui chevauchent le test.
+    # BRIDGE_DAYS = 0 -> val colle au test (comportement historique).
+    bridge_cutoff_ts = test_cutoff_ts - BRIDGE_DAYS * ms_per_day
+    val_end = int(df["timestamp"].searchsorted(bridge_cutoff_ts, side="left"))
+
+    n_train_val = val_end - train_val_start
     val_size = int(n_train_val * VAL_FRACTION)
-    train_end = test_start - val_size
-    val_end = test_start
+    train_end = val_end - val_size
 
     train = df.iloc[train_val_start:train_end]
     val   = df.iloc[train_end:val_end]
-    test  = df.iloc[val_end:]
+    test  = df.iloc[test_start:]
 
     if verbose:
         ignored = train_val_start
-        print(f"\nSplit temporel : TRAIN_DAYS={TRAIN_DAYS}, TEST_DAYS={TEST_DAYS}, VAL_FRACTION={VAL_FRACTION}")
+        print(f"\nSplit temporel : TRAIN_DAYS={TRAIN_DAYS}, TEST_DAYS={TEST_DAYS}, VAL_FRACTION={VAL_FRACTION}, BRIDGE_DAYS={BRIDGE_DAYS}")
         print(f"  ignore : {ignored:,} rows")
         print(f"  train  : {len(train):,} rows  ({pd.to_datetime(train['timestamp'].min(), unit='ms').date()} -> {pd.to_datetime(train['timestamp'].max(), unit='ms').date()})")
         print(f"  val    : {len(val):,} rows  ({pd.to_datetime(val['timestamp'].min(), unit='ms').date()} -> {pd.to_datetime(val['timestamp'].max(), unit='ms').date()})")
+        if BRIDGE_DAYS > 0:
+            print(f"  bridge : {test_start - val_end:,} rows DROPPED (pause {BRIDGE_DAYS}j entre val et test)")
         print(f"  test   : {len(test):,} rows  ({pd.to_datetime(test['timestamp'].min(), unit='ms').date()} -> {pd.to_datetime(test['timestamp'].max(), unit='ms').date()})")
 
     # volatility_state reste dans le parquet (cle de bucket pour le seuil
