@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(powershell -NoProfile -Command \"\\(Get-Item 'C:\\\\Users\\\\fremo\\\\Desktop\\\\ML_agent_poly\\\\logs.log'\\).Length; \\(Get-Content 'C:\\\\Users\\\\fremo\\\\Desktop\\\\ML_agent_poly\\\\logs.log' | Measure-Object -Line\\).Lines\")"
+      "Bash(powershell -NoProfile -Command \"\\(Get-Item 'C:\\\\Users\\\\fremo\\\\Desktop\\\\ML_agent_poly\\\\logs.log'\\).Length; \\(Get-Content 'C:\\\\Users\\\\fremo\\\\Desktop\\\\ML_agent_poly\\\\logs.log' | Measure-Object -Line\\).Lines\")",
+      "Bash(cp /tmp/diag_down.py ./diag_down.py)",
+      "Bash(rm -f diag_down.py)",
+      "Bash(python -c \"import pandas as pd; d=pd.read_csv\\('logs/trading_runs.csv'\\); r=d.iloc[-1]; print\\(r[['run_at','team_bets','n_trades']].to_dict\\(\\)\\); print\\('down:', d.iloc[-1].get\\('n_trades'\\)\\)\")",
+      "Bash(python -c \"import pandas as pd; d=pd.read_csv\\('logs/trades.csv'\\); print\\(d['direction'].value_counts\\(\\).to_dict\\(\\)\\); print\\('total:', len\\(d\\)\\)\")"
     ]
   }
 }

@@ -1,0 +1,9 @@
+services:
+  live-team-mexc:
+    build: .
+    container_name: live-team-mexc
+    env_file: ./.env
+    volumes:
+      - ./logs:/app/logs          # cycles.csv + positions.csv + positions_state.json survivent aux rebuilds
+    tty: true                     # panneaux Rich
+    restart: unless-stopped

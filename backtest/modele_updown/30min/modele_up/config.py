@@ -217,4 +217,4 @@ XGB_SCALE_POS_WEIGHT = 1.03
 # (DOWN) pour annuler le decentrage et faire converger DOWN vers la meme zone
 # que UP. Test empirique : spw=1.30 -> p_mean=0.557, p_q95=0.600 (territoire UP).
 # spw=1.03 etait l'ancienne valeur "match UP" mais elle ignorait que UP est
-# naturellement avantage par le drift haussier.
+# naturellement avantage par le drift haussier.p
