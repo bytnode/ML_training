@@ -79,6 +79,9 @@ from config_main import (
     DOWN_TRAIL_ACTIVATE, DOWN_TRAIL_GAP, DOWN_TAKE_PROFIT, DOWN_STOP_LOSS, DOWN_STOP_LOSS_DEC,
     DOWN_SL_TIME_DECAY, DOWN_SL_START_DEC, DOWN_SL_END_DEC, DOWN_SL_FLOOR_DEC,
     MAKER, MAKER_FEE_PER_SIDE, MAKER_FILL_WINDOW_MIN,
+    DMI_FILTER_ENABLED, DMI_LENGTH, DMI_TIMEFRAME, DMI_SIDES,
+    UP_CONF_FILTER_ENABLED, UP_CONF_MIN, UP_DROP_HOURS, DOWN_CONF_DELTA,
+    UP_XMODEL_FILTER_ENABLED, UP_XMODEL_MAX_PDOWN,
 )
 
 
@@ -129,6 +132,115 @@ def build_team_bets(up_bets: pd.DataFrame, down_bets: pd.DataFrame) -> tuple[pd.
     if not team.empty:
         team = team.sort_values("timestamp").reset_index(drop=True)
     return team, len(cancelled)
+
+
+# ----------------------------------------------------------------------------
+#  Filtre DMI (Directional Movement Index) Wilder sur le TF 1h
+# ----------------------------------------------------------------------------
+def _wilder_dmi(high, low, close, n: int):
+    """+DI / -DI de Wilder (longueur n), alignes bougie a bougie sur les entrees.
+
+    +DI[i] / -DI[i] n'utilisent que les bougies <= i (high/low/close de i et i-1,
+    puis lissage recursif) -> connus a la cloture de la bougie i. Renvoie 2 arrays
+    (NaN sur les premieres bougies / le warmup). On ne compare que le SIGNE de
+    (+DI - -DI), donc le seed exact du lissage est sans incidence apres rodage.
+    """
+    h = np.asarray(high, dtype=float)
+    l = np.asarray(low, dtype=float)
+    cl = np.asarray(close, dtype=float)
+    m = len(h)
+    plus = np.full(m, np.nan)
+    minus = np.full(m, np.nan)
+    if m < 2:
+        return plus, minus
+    up_move = h[1:] - h[:-1]
+    down_move = l[:-1] - l[1:]
+    plus_dm = np.where((up_move > down_move) & (up_move > 0.0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0.0), down_move, 0.0)
+    prev_close = cl[:-1]
+    tr = np.maximum.reduce([h[1:] - l[1:],
+                            np.abs(h[1:] - prev_close),
+                            np.abs(l[1:] - prev_close)])
+
+    def _rma(x):  # lissage de Wilder = EMA recursive alpha=1/n (adjust=False)
+        return pd.Series(x).ewm(alpha=1.0 / n, adjust=False).mean().to_numpy()
+
+    atr = _rma(tr)
+    s_plus = _rma(plus_dm)
+    s_minus = _rma(minus_dm)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        plus[1:] = 100.0 * s_plus / atr
+        minus[1:] = 100.0 * s_minus / atr
+    return plus, minus
+
+
+def _load_dmi_1h() -> dict[int, tuple[float, float]]:
+    """Map open-time (ms) -> (+DI, -DI) du DMI Wilder(DMI_LENGTH) sur les bougies
+    DMI_TIMEFRAME (1h). OHLC reconstruit depuis la table `candles` du package
+    modele_down : close est absolu, et *_ret = (val - close_prev)/close_prev, donc
+        close_prev = close / (1 + close_ret)
+        high = close_prev*(1+high_ret) ; low = close_prev*(1+low_ret).
+    Couvre tout l'historique (la fenetre de test est un sous-ensemble)."""
+    down_dir = Path(api_down.__file__).resolve().parent
+    db_path = next((p for p in (down_dir / "db" / "btc_multi_tf.db",
+                                down_dir / "DB" / "btc_multi_tf.db") if p.exists()), None)
+    if db_path is None:
+        raise FileNotFoundError(
+            f"SQLite candles introuvable sous {down_dir} (db/ ou DB/). Lance data.py."
+        )
+    con = sqlite3.connect(str(db_path))
+    try:
+        c = pd.read_sql_query(
+            "SELECT timestamp_ms, close, close_ret, high_ret, low_ret "
+            "FROM candles WHERE timeframe=? ORDER BY timestamp_ms",
+            con, params=(DMI_TIMEFRAME,))
+    finally:
+        con.close()
+    c = c.dropna(subset=["close", "close_ret", "high_ret", "low_ret"]).reset_index(drop=True)
+    close = c["close"].to_numpy(dtype=float)
+    close_prev = close / (1.0 + c["close_ret"].to_numpy(dtype=float))
+    high = close_prev * (1.0 + c["high_ret"].to_numpy(dtype=float))
+    low = close_prev * (1.0 + c["low_ret"].to_numpy(dtype=float))
+    plus_di, minus_di = _wilder_dmi(high, low, close, DMI_LENGTH)
+    ts = c["timestamp_ms"].astype("int64").to_numpy()
+    return {int(t): (float(p), float(mi)) for t, p, mi in zip(ts, plus_di, minus_di)}
+
+
+def _apply_dmi_filter(team_bets: pd.DataFrame) -> tuple[pd.DataFrame, int, int]:
+    """Annule les paris dont le sens contredit le DMI 1h de la bougie de DECISION.
+        - pari DOWN annule si +DI > -DI ; pari UP annule si -DI > +DI.
+    +DI == -DI (egalite) ou warmup (NaN) ou bougie inconnue -> on GARDE le pari.
+    Renvoie (team_bets_filtre, n_removed_up, n_removed_down)."""
+    if not DMI_FILTER_ENABLED or team_bets.empty:
+        return team_bets, 0, 0
+    dmi_map = _load_dmi_1h()
+    keep = np.ones(len(team_bets), dtype=bool)
+    removed_up = removed_down = 0
+    for idx, b in enumerate(team_bets.itertuples(index=False)):
+        di = dmi_map.get(int(b.timestamp))
+        if di is None:
+            continue                                 # bougie inconnue -> pas d'info, on garde
+        pdi, mdi = di
+        if np.isnan(pdi) or np.isnan(mdi):
+            continue                                 # warmup -> on garde
+        if b.direction == "down" and "down" in DMI_SIDES and pdi > mdi:
+            keep[idx] = False
+            removed_down += 1
+        elif b.direction == "up" and "up" in DMI_SIDES and mdi > pdi:
+            keep[idx] = False
+            removed_up += 1
+    return team_bets[keep].reset_index(drop=True), removed_up, removed_down
+
+
+def _apply_conf_filter(team_bets: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Annule les paris UP dont la confiance P(up) < UP_CONF_MIN. DOWN inchange.
+    La colonne `confidence` (= P(direction)) est portee par chaque pari depuis
+    l'api du modele. Renvoie (team_bets_filtre, n_removed_up)."""
+    if not UP_CONF_FILTER_ENABLED or team_bets.empty:
+        return team_bets, 0
+    drop = (team_bets["direction"] == "up") & (team_bets["confidence"] < UP_CONF_MIN)
+    removed = int(drop.sum())
+    return team_bets[~drop].reset_index(drop=True), removed
 
 
 # ----------------------------------------------------------------------------
@@ -273,7 +385,10 @@ def simulate_trades(team_bets: pd.DataFrame, body_map: dict[int, float],
                     up_meta: dict[int, tuple] | None = None,
                     extremes: tuple | None = None) -> tuple[pd.DataFrame, dict]:
     """Un trade par pari pris. Entree open(i+1), sortie close(i+1).
-    gross = +body (UP/long) ou -body (DOWN/short) ; net = gross - 2*FEE_PER_SIDE.
+    gross = +body (UP/long) ou -body (DOWN/short) ; net = gross - (entry_fee + exit_fee).
+    L'ENTREE suit MAKER/TAKER (limite a P0, simulee via le fill intrabar) ; la SORTIE
+    (close/take_profit/trailing/stop_loss) est TOUJOURS TAKER : impossible de garantir
+    un fill maker sur une sortie declenchee par une condition (execution immediate requise).
 
     Si prices_intrabar est fourni, un STOP-LOSS (STOP_LOSS_PCT) est verifie tous
     les STOP_LOSS_CHECK_MIN min, UNIQUEMENT pour les sens dans STOP_LOSS_SIDES :
@@ -281,14 +396,15 @@ def simulate_trades(team_bets: pd.DataFrame, body_map: dict[int, float],
     sinon sortie a la cloture 1h (exit_reason='close')."""
     cols = ["timestamp", "ts_utc", "traded_ts", "direction", "label",
             "body_ret", "gross_ret", "net_ret", "win_net", "exit_reason"]
-    eff_fee = MAKER_FEE_PER_SIDE if MAKER else FEE_PER_SIDE
+    entry_fee = MAKER_FEE_PER_SIDE if MAKER else FEE_PER_SIDE   # entree : maker si rempli, sinon taker
+    exit_fee = FEE_PER_SIDE                                      # sortie : toujours taker
     low_by, high_by = extremes if (MAKER and extremes is not None) else (None, None)
     open_ib0 = prices_intrabar[0] if prices_intrabar is not None else None
     n_would_be = n_missed = missed_up = missed_down = 0
     if team_bets.empty:
         return (pd.DataFrame(columns=cols),
                 {"maker": MAKER, "n_would_be": 0, "n_missed": 0, "missed_up": 0,
-                 "missed_down": 0, "fill_rate": 1.0, "eff_fee": eff_fee})
+                 "missed_down": 0, "fill_rate": 1.0, "entry_fee": entry_fee, "exit_fee": exit_fee})
     rows = []
     for _, b in team_bets.iterrows():
         ts = int(b["timestamp"])
@@ -352,7 +468,7 @@ def simulate_trades(team_bets: pd.DataFrame, body_map: dict[int, float],
                         gross = pp
                         exit_reason = "stop_loss"
                         break
-        net = gross - 2.0 * eff_fee
+        net = gross - (entry_fee + exit_fee)
         rows.append({
             "timestamp": ts,
             "ts_utc": pd.Timestamp(ts, unit="ms", tz="UTC").strftime("%Y-%m-%d %H:%M"),
@@ -368,7 +484,7 @@ def simulate_trades(team_bets: pd.DataFrame, body_map: dict[int, float],
     fill_rate = (1.0 - n_missed / n_would_be) if n_would_be else 1.0
     maker_info = {"maker": MAKER, "n_would_be": n_would_be, "n_missed": n_missed,
                   "missed_up": missed_up, "missed_down": missed_down,
-                  "fill_rate": fill_rate, "eff_fee": eff_fee}
+                  "fill_rate": fill_rate, "entry_fee": entry_fee, "exit_fee": exit_fee}
     return pd.DataFrame(rows, columns=cols), maker_info
 
 
@@ -398,13 +514,18 @@ def trading_stats(trades: pd.DataFrame, initial: float = INITIAL_CAPITAL) -> dic
         net = sub["net_ret"].to_numpy() * EXPOSURE
         wins = net[net > 0]
         losses = net[net < 0]
+        wr = float((net > 0).mean())
+        lr = float((net < 0).mean())
+        aw_mag = float(wins.mean() * 100) if len(wins) else 0.0      # AvgWin magnitude (%)
+        al_mag = float(-losses.mean() * 100) if len(losses) else 0.0  # AvgLoss magnitude (%)
         return {"n": len(sub),
-                "wr": float((net > 0).mean()),
+                "wr": wr,
                 "net_pct": float((np.prod(1.0 + net) - 1.0) * 100),
                 "worst_pct": float(net.min() * 100),
                 "best_pct": float(net.max() * 100),
                 "avg_win_pct": float(wins.mean() * 100) if len(wins) else float("nan"),
-                "avg_loss_pct": float(losses.mean() * 100) if len(losses) else float("nan")}
+                "avg_loss_pct": float(losses.mean() * 100) if len(losses) else float("nan"),
+                "ev_pct": wr * aw_mag - lr * al_mag}  # EV = WR*AvgWin - LR*AvgLoss (%/trade)
 
     # --- P/L mensuel (USDC) : decoupe l'equity composee par mois calendaire ---
     # Les P/L $ mensuels se telescopent (somme = P/L total), donc moyenne = total / nb mois.
@@ -435,6 +556,18 @@ def trading_stats(trades: pd.DataFrame, initial: float = INITIAL_CAPITAL) -> dic
         "worst_month_pct": month_pct[worst_m],
     }
 
+    # --- EV (esperance) par trade : EV = WR*avg_win - LR*avg_loss (net de frais, x
+    #     levier). Mathematiquement = moyenne nette par trade ; on l'expose
+    #     decomposee (formule utilisateur) pour l'afficher sur le headline. ---
+    wins_all = net[net > 0]
+    losses_all = net[net < 0]
+    n_all = len(net)
+    wr_all = len(wins_all) / n_all if n_all else 0.0
+    lr_all = len(losses_all) / n_all if n_all else 0.0
+    avg_win_all = float(wins_all.mean()) if len(wins_all) else 0.0
+    avg_loss_all = float(-losses_all.mean()) if len(losses_all) else 0.0  # magnitude > 0
+    ev_per_trade_pct = (wr_all * avg_win_all - lr_all * avg_loss_all) * 100
+
     return {
         "n_trades": len(net),
         **monthly_stats,
@@ -444,6 +577,9 @@ def trading_stats(trades: pd.DataFrame, initial: float = INITIAL_CAPITAL) -> dic
         "pnl": final - initial,
         "fee_drag_pct": float((gross - net).sum() * 100),  # frais cumules reels (x levier, maker/taker) en pts
         "avg_net_per_trade_pct": float(net.mean() * 100),
+        "ev_per_trade_pct": float(ev_per_trade_pct),
+        "avg_win_pct_all": float(avg_win_all * 100),    # AvgWin magnitude (%) tous trades
+        "avg_loss_pct_all": float(avg_loss_all * 100),  # AvgLoss magnitude (%) tous trades
         "avg_gross_per_trade_pct": float(gross.mean() * 100),
         "wr_net": float((net > 0).mean()),
         "wr_dir": float((trades["label"] == 1).mean()),
@@ -485,9 +621,30 @@ def main() -> None:
     # Predictions per-bar des 2 modeles, puis paris d'equipe (regle de coherence).
     up_full = api_up.evaluate_full_on_slice(start_ms, end_ms)
     down_full = api_down.evaluate_full_on_slice(start_ms, end_ms)
+    # --- UP : drop des heures fragiles (campagne 500%/cote) : pas de long a ces heures UTC ---
+    if UP_DROP_HOURS:
+        up_full = up_full.copy()
+        up_full.loc[up_full["hour"].isin(UP_DROP_HOURS), "take"] = 0
+    # --- DOWN : selectivite (campagne 500%/cote) : short ssi P(down) >= seuil + DOWN_CONF_DELTA ---
+    if DOWN_CONF_DELTA:
+        down_full = down_full.copy()
+        down_full["take"] = (down_full["confidence"] >= down_full["threshold"] + DOWN_CONF_DELTA).astype(int)
     up_bets = _taken_bets(up_full, "up")
+    # --- UP : filtre CROSS-MODEL (Strategie 2) : long seulement si P(down) < UP_XMODEL_MAX_PDOWN
+    #     (le modele DOWN confirme l'absence de chute). down_full["confidence"] = P(down) par bar. ---
+    if UP_XMODEL_FILTER_ENABLED and not up_bets.empty:
+        _pdown = dict(zip(down_full["timestamp"].astype("int64"), down_full["confidence"]))
+        _keep = up_bets["timestamp"].map(lambda t: _pdown.get(int(t), 0.0) < UP_XMODEL_MAX_PDOWN)
+        up_bets = up_bets[_keep].reset_index(drop=True)
     down_bets = _taken_bets(down_full, "down")
     team_bets, cancelled = build_team_bets(up_bets, down_bets)
+
+    # --- Filtre DMI 1h : annule les paris dont le sens contredit le DMI de la
+    #     bougie de decision (+DI vs -DI ; pas de seuil ADX). ---
+    team_bets, dmi_removed_up, dmi_removed_down = _apply_dmi_filter(team_bets)
+
+    # --- Filtre de confiance UP : ne garde un pari UP que si P(up) >= UP_CONF_MIN. ---
+    team_bets, conf_removed_up = _apply_conf_filter(team_bets)
 
     # Meta par bar UP (volatility_state, is_weekend) pour le filtre d'entree UP.
     _uf = up_full[up_full["take"] == 1]
@@ -517,7 +674,8 @@ def main() -> None:
         "window_days": TEAM_TEST_DAYS,
         "window_start": _fmt_ms(start_ms),
         "window_end": _fmt_ms(end_ms),
-        "fee_per_side_pct": maker_info["eff_fee"] * 100,
+        "entry_fee_pct": maker_info["entry_fee"] * 100,
+        "exit_fee_pct": maker_info["exit_fee"] * 100,
         "initial_capital": INITIAL_CAPITAL,
         "position_fraction": POSITION_FRACTION,
         "leverage": LEVERAGE,
@@ -530,6 +688,12 @@ def main() -> None:
         "missed_down": maker_info["missed_down"],
         "team_bets": len(team_bets),
         "cancelled": cancelled,
+        "dmi_filter": DMI_FILTER_ENABLED,
+        "dmi_removed_up": dmi_removed_up,
+        "dmi_removed_down": dmi_removed_down,
+        "conf_filter": UP_CONF_FILTER_ENABLED,
+        "conf_min": UP_CONF_MIN,
+        "conf_removed_up": conf_removed_up,
         "coverage": round(coverage, 4),
         **{k: (round(v, 5) if isinstance(v, float) else v)
            for k, v in stats.items() if not isinstance(v, dict)},
@@ -561,10 +725,13 @@ def _render_report(summary: dict, stats: dict, coverage: float) -> None:
         (f"{summary['window_start']}  ->  {summary['window_end']}", "white"),
         (f"   ({summary['window_days']} days)", "dim"),
     )
+    round_trip_fee_pct = summary['entry_fee_pct'] + summary['exit_fee_pct']
     fees = Text.assemble(
         ("frais   ", "dim"),
-        (f"{summary['fee_per_side_pct']:.3f}% / cote", "white"),
-        (f"  (= {2*summary['fee_per_side_pct']:.3f}% aller-retour)", "dim"),
+        (f"entree {summary['entry_fee_pct']:.3f}%", "white"),
+        (" (maker)" if summary.get("maker") else " (taker)", "dim"),
+        (f"  /  sortie {summary['exit_fee_pct']:.3f}% (taker)", "white"),
+        (f"  (= {round_trip_fee_pct:.3f}% aller-retour)", "dim"),
         ("    capital initial ", "dim"),
         (f"{summary['initial_capital']:.0f}$", "white"),
     )
@@ -603,6 +770,13 @@ def _render_report(summary: dict, stats: dict, coverage: float) -> None:
                        style="bold red"))
     t.add_row("Check alignement signe/label",
               "n/a" if pd.isna(stats["align_check"]) else f"{stats['align_check']*100:.1f}%")
+    if summary.get("dmi_filter"):
+        t.add_row(f"Filtre DMI {DMI_TIMEFRAME} (len {DMI_LENGTH}) - paris annules",
+                  Text(f"{summary.get('dmi_removed_up', 0)} UP / "
+                       f"{summary.get('dmi_removed_down', 0)} DOWN", style="yellow"))
+    if summary.get("conf_filter"):
+        t.add_row(f"Filtre confiance UP (p_up >= {UP_CONF_MIN}) - paris annules",
+                  Text(f"{summary.get('conf_removed_up', 0)} UP", style="yellow"))
     t.add_row(f"Gestion UP (TP {UP_TAKE_PROFIT*100:.2f}% / SL -{UP_STOP_LOSS:.2f}% prix / trail {UP_TRAIL_GAP*100:.2f}% / max {UP_MAX_STEPS}min)",
               Text(f"SL = -{UP_STOP_LOSS:.2f}% du prix (sur la position, levier hors-jeu)", style="yellow"))
     t.add_row(f"Gestion DOWN (TP {DOWN_TAKE_PROFIT*100:.2f}% / SL -{DOWN_STOP_LOSS:.2f}% prix / trail {DOWN_TRAIL_GAP*100:.2f}% / max {DOWN_MAX_STEPS}min)",
@@ -673,6 +847,34 @@ def _render_report(summary: dict, stats: dict, coverage: float) -> None:
                   Text(worst, style="red"))
     console.print(d)
 
+    # --- Recap EV par trade (n / WR / AvgWin / AvgLoss / EV) ---
+    ev_tab = Table(title="EV par trade", title_style="bold cyan", border_style="cyan",
+                   header_style="bold", expand=False, show_lines=True)
+    ev_tab.add_column("", style="bold")
+    ev_tab.add_column("n", justify="right")
+    ev_tab.add_column("WR", justify="right")
+    ev_tab.add_column("AvgWin", justify="right")
+    ev_tab.add_column("AvgLoss", justify="right")
+    ev_tab.add_column("EV /trade", justify="right")
+    for name, key, style in (("UP", "up", "bright_blue"), ("DOWN", "down", "bright_red")):
+        s = stats[key]
+        if not s.get("n"):
+            continue
+        ev = s.get("ev_pct", 0.0)
+        ev_tab.add_row(
+            Text(name, style=style), f"{s['n']}", f"{s['wr']*100:.2f}%",
+            f"{abs(s.get('avg_win_pct', float('nan'))):.3f}%",
+            f"{abs(s.get('avg_loss_pct', float('nan'))):.3f}%",
+            Text(f"{ev:+.4f}%", style=_pnl_color(ev)))
+    ev_all = stats["ev_per_trade_pct"]
+    ev_tab.add_row(
+        Text("Tous (headline)", style="bold"), f"{stats['n_trades']}",
+        f"{stats['wr_net']*100:.2f}%",
+        f"{stats.get('avg_win_pct_all', float('nan')):.3f}%",
+        f"{stats.get('avg_loss_pct_all', float('nan')):.3f}%",
+        Text(f"{ev_all:+.4f}%", style=_pnl_color(ev_all)))
+    console.print(ev_tab)
+
     # --- Headline ---
     net = stats["net_total_pct"]
     headline = Text.assemble(
@@ -682,7 +884,9 @@ def _render_report(summary: dict, stats: dict, coverage: float) -> None:
         ("   sur ", "dim"),
         (f"{stats['n_trades']}", "bold"),
         (" trades, frais ", "dim"),
-        (f"{2*summary['fee_per_side_pct']:.2f}% A/R", "dim"),
+        (f"{(summary['entry_fee_pct'] + summary['exit_fee_pct']):.2f}% A/R", "dim"),
+        ("   EV ", "dim"),
+        (f"{stats['ev_per_trade_pct']:+.4f}%/trade", f"bold {_pnl_color(stats['ev_per_trade_pct'])}"),
     )
     console.print(Panel(headline, border_style=_pnl_color(net), padding=(0, 2)))
 

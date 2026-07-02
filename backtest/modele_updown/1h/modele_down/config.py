@@ -187,7 +187,7 @@ ADAPTIVE_BAD_DAY_DELTA = 0.015      # delta de seuil ajoute sur les pires jours 
 # Rationale (cf optimize/deep_analysis.py) : sur les 799 bets actuels,
 # p_up < 0.47 donne 66.4 % WR vs 58.4 % pour p_up >= 0.47 -- ecart de +8 pt
 # pour un seul filtre binaire. ASYM_MAX_P_UP = 1.0 desactive le filtre.
-ASYM_MAX_P_UP = 0.530              # CLONE de modele_up (meme valeur que son ASYM_MAX_P_DOWN ; ex-0.48).
+ASYM_MAX_P_UP = 0.53              # CLONE de modele_up (meme valeur que son ASYM_MAX_P_DOWN ; ex-0.48).
 # Path vers modele_up's test_predictions.csv (relatif au cwd au moment du
 # run -- train.py est suppose etre execute depuis 15min/modele_down/).
 ASYM_MODELE_UP_PREDS = "../modele_up/logs/test_predictions.csv"

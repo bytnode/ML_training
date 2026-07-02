@@ -15,13 +15,16 @@ packages; `modele_team` only consumes them through their standardized `api.py`
 ## Contents
 
 - `main.py` — the **TRADING backtest** orchestrator (real P/L net of fees, not just WR).
-  Pipeline: predict both models → team coherence rule → simulate each bet → Rich
-  report + CSVs. Writes `logs/trades.csv` + `logs/trading_runs.csv` and delegates the
-  detailed/full logs.
+  Pipeline: predict both models → team coherence rule → **DMI directional filter** →
+  **UP-confidence filter** → simulate each bet → Rich report (incl. an **EV-per-trade**
+  table + headline) + CSVs.
+  Writes `logs/trades.csv` + `logs/trading_runs.csv` and delegates the detailed/full logs.
 - `config_main.py` — **all** editable knobs of `main.py`. `main.py` imports it and
   holds no tunables of its own (only `__file__`-derived paths). This is where you
-  change anything: window, fees, capital/leverage/exposure, MAKER vs TAKER, and the
-  per-side UP/DOWN exit management. Read its inline comments — they record the sweep
+  change anything: window, fees, capital/leverage/exposure, MAKER vs TAKER, the
+  **DMI filter** (`DMI_FILTER_ENABLED` / `DMI_LENGTH` / `DMI_TIMEFRAME`), the **UP
+  confidence filter** (`UP_CONF_FILTER_ENABLED` / `UP_CONF_MIN`), and the per-side
+  UP/DOWN exit management. Read its inline comments — they record the sweep
   results behind each default.
 - `detailed_log.py` — the thin per-bar CSVs into `logs/` (shared `LOG_COLUMNS`).
 - `full_logs.py` — the wide per-bet CSVs into `logs/full_logs/`.
@@ -43,10 +46,13 @@ This is the non-obvious core. Per team bet at decision bar `i`:
 3. **Exit management** (per side, `_up_managed_exit` / `_down_managed_exit`) walks the
    1-min path from `DB_1m` and exits at the first of: `take_profit`, `trailing`
    (arms once peak ≥ `*_TRAIL_ACTIVATE`, exits on `*_TRAIL_GAP` giveback), `stop_loss`,
-   or `timestop` (`*_MAX_HOLD_MIN`, runs **past** the 1h close — UP 90 min, DOWN 105 min).
+   or `timestop` (`*_MAX_HOLD_MIN`, runs **past** the 1h close — UP 90 min, DOWN 150 min).
    Falls back to `close` (plain 1h-close exit) when `DB_1m` is missing. SHORT profit is
    `pp = 1 − close/entry` (mirror of LONG `close/entry − 1`).
-4. **P/L**: `net = gross − 2·fee`. Both `net` and the fees are multiplied by
+4. **P/L**: `net = gross − (entry_fee + exit_fee)`. The **entry** fee follows MAKER/TAKER
+   (below); the **exit** fee is **always taker** (`FEE_PER_SIDE`) — an exit is triggered by
+   a condition (`close`/`take_profit`/`trailing`/`stop_loss`) and needs guaranteed
+   execution, so it can never be simulated as a passive limit fill. Both `net` and the fees are multiplied by
    **`EXPOSURE = POSITION_FRACTION · LEVERAGE`** (notional = EXPOSURE · equity), then the
    equity is compounded (`np.cumprod`). So leverage amplifies fees too — that's the
    whole point of the trading backtest vs the old WR view.
@@ -61,14 +67,50 @@ This is the non-obvious core. Per team bet at decision bar `i`:
   (wide, at entry) toward `*_SL_END` (tight, at max_hold), floored at `*_SL_FLOOR`
   (`_sl_threshold`). Toggle off → constant `*_STOP_LOSS`.
 
-### MAKER mode (currently ON)
+### MAKER mode (currently ON) — ENTRY only
 
-`MAKER=True` posts a limit at `P0` (the `i+1` open) and **only fills if price comes
-back to touch it** within `MAKER_FILL_WINDOW_MIN` (LONG: a 1-min low < P0; SHORT: a
-1-min high > P0), using the 1-min highs/lows from `DB_1m`. Unfilled = a *missed
-opportunity* (counted, surfaced as a fill-rate in the report) — this isolates the cost
-of maker queueing. A filled maker trade has the identical P0 and exit path as taker;
-only the fee differs (`MAKER_FEE_PER_SIDE`). `MAKER=False` → taker at market on the open.
+`MAKER` only ever governs the **entry** leg; the **exit** leg is always taker (see
+*The trading engine* above). `MAKER=True` posts a limit at `P0` (the `i+1` open) and
+**only fills if price comes back to touch it** within `MAKER_FILL_WINDOW_MIN` (LONG: a
+1-min low < P0; SHORT: a 1-min high > P0), using the 1-min highs/lows from `DB_1m`.
+Unfilled = a *missed opportunity* (counted, surfaced as a fill-rate in the report) —
+this isolates the cost of maker queueing. A filled maker trade has the identical P0 and
+exit path as taker; only the entry fee differs (`MAKER_FEE_PER_SIDE` vs `FEE_PER_SIDE`).
+`MAKER=False` → entry is also taker at market on the open (both legs then pay
+`FEE_PER_SIDE`). `simulate_trades`'s `maker_info` dict carries `entry_fee` / `exit_fee`
+separately (was a single `eff_fee`); the report and `trading_runs.csv` show
+`entry_fee_pct` / `exit_fee_pct` (was one blended `fee_per_side_pct`).
+
+### The DMI directional filter (post-coherence, `DMI_FILTER_ENABLED`)
+
+After the coherence rule produces `team_bets`, `_apply_dmi_filter` **cancels** any bet
+whose side contradicts the Wilder DMI of the **decision** bar (never bar `i+1` → no
+lookahead): a DOWN bet is dropped when `+DI > −DI`, an UP bet when `−DI > +DI`. Only the
+**sign** of `+DI − −DI` matters — there is **no ADX/trend-strength threshold**. Equality
+(`+DI == −DI`), warmup NaNs, or an unknown bar all **keep** the bet.
+
+⚠️ **Naming drift:** the timeframe is `DMI_TIMEFRAME` in `config_main.py` and is currently
+**`"4h"`**, but the helpers (`_load_dmi_1h`) and several docstrings still say "1h". Trust
+the config value, not the names. The DMI OHLC is rebuilt from modele_down's SQLite
+`candles` table (`close` absolute + `*_ret`, so `close_prev = close/(1+close_ret)`) over the
+full history; `DMI_LENGTH` (default 7) sets both the DI window and the Wilder smoothing.
+The report shows how many UP / DOWN bets the filter removed.
+
+### The UP-confidence filter (post-DMI, `UP_CONF_FILTER_ENABLED`) — the fee-robustness lever
+
+The **second** entry filter, applied by `_apply_conf_filter` right after the DMI stage.
+It keeps an **UP** bet only when modele_up's confidence (`confidence` = `P(up)`) is
+`≥ UP_CONF_MIN` (default **0.65**). **DOWN bets are never touched** — DOWN's edge is
+robust across both window-halves, UP's is not. **Fee campaign 2026-07-01** (fees inside
+the sim loop, 0.02%/side): UP's per-trade EV in the *first* window-half is **negative at
+every threshold 0.59→0.64** — its whole edge sits in h2. Only at `≥0.65` does UP-h1 turn
+positive (≈93 UP trades/yr, the surest setups). Raising the threshold to 0.65 lifts the
+**team** from EV `+0.200`/trade (h1 `+0.086`) to `+0.287` (h1 `+0.221`), worst trade
+`−7.9%→−5.0%`, net `+331%→+296%` (527 vs 841 trades). `0.62` keeps more volume (675
+trades, net +340%) but h1 stays fragile (+0.092) — a volume/robustness trade-off. Set
+`UP_CONF_FILTER_ENABLED=False` for the bare behaviour (`n=504`, **not** fee-robust). The
+report shows how many UP bets it removed; `trading_runs.csv` carries `conf_filter` /
+`conf_min` / `conf_removed_up`.
 
 ## Window selection
 
@@ -102,6 +144,16 @@ All written into `logs/`. Per-bar/per-bet detail files **overwrite** each run;
 - `team_run.log` — run log. (`trailing_trades.csv` is a stale artifact from a removed
   `trailing_backtest.py`; nothing in the current package writes it.)
 
+### The Rich report's EV view
+
+The console report ends with an **"EV par trade"** table (one row per side + a "Tous /
+headline" row) and an **EV** figure on the headline panel. `EV = WR·AvgWin − LR·AvgLoss`
+where `LR = 1 − WR`, `AvgWin`/`AvgLoss` are **net-of-fees magnitudes ×leverage**. This is
+mathematically identical to the **average net % per trade** — it's surfaced decomposed
+because the user reasons in WR/AvgWin/AvgLoss terms. `ev_per_trade_pct` (headline) and the
+per-side `ev_pct` are persisted into `trading_runs.csv`. EV/trade > 0 is the real
+profitability bar (a high WR with a fat AvgLoss can still be EV-negative).
+
 ## Run
 
 ```powershell
@@ -118,3 +170,7 @@ down bets DN + up abstains    -> DOWN
 both bet                       -> CANCEL
 neither bet                    -> PASS
 ```
+
+The surviving `UP` / `DOWN` bets then pass through **two entry filters** — the **DMI
+directional filter** then the **UP-confidence filter** (both above) — before simulation,
+either of which can cancel still more.
