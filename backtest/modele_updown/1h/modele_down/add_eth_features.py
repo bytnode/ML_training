@@ -1,26 +1,23 @@
 """
-add_eth_features.py — patch ETH/USD pour le master 30m (parite features 15min).
+add_eth_features.py — patch ETH/USD pour le master 1h (parite features 15min).
 
 Porte le builder ETH du modele 15min (live/modele_15m/live_helpers/features_down.py
-:: _compute_eth_features) vers la base 30m. La seule difference : l'ETH 15m
-brut (eth_data/eth_15m.parquet) est d'abord RESAMPLE en bougies 30m
-(open=first, high=max, low=min, close=last, volume=sum) avant le calcul des
-features ef_*, de sorte qu'une bougie ETH 30m partage exactement l'open_time
-d'une bougie BTC 30m et ferme au meme instant T = open_30m + 30m (decision time).
+:: _compute_eth_features) vers la base 1h. Contrairement au patch d'origine (30m,
+qui resample un flux ETH 15m), cette base est deja 1h : le raw ETH/USD 1h vit
+dans DB/eth_1h.csv (fetch Bitstamp existant, memes colonnes que les debug CSV de
+data.py : timestamp_ms/open/high/low/close/volume, deja aligne sur les memes
+frontieres d'heure que le master BTC) — pas de resample necessaire.
 
-Les ef_* sont ensuite alignes NO-LOOKAHEAD sur chaque BTC 30m par join de
-TIMESTAMP EXACT (la bougie ETH 30m concurrente, fermee a T). Les BTC bars
-anterieurs a l'historique ETH recoivent NaN (XGBoost route NaN nativement).
-
-Le modele 30m n'utilise que 5 des features (ef_ret2, ef_ret8, ef_streak,
-ef_macd, ef_body — la whitelist FEATURE_WHITELIST), mais on produit les 14
-comme le 15min pour rester fidele au patch d'origine et permettre l'exploration.
+Les ef_* sont alignes NO-LOOKAHEAD sur chaque BTC 1h par join de TIMESTAMP EXACT
+(la bougie ETH 1h concurrente, fermee a T = open_1h + 1h = decision time). Les
+BTC bars anterieurs a l'historique ETH recoivent NaN (XGBoost route NaN
+nativement).
 
 Idempotent : garde un <parquet>.bak la premiere fois ; re-executer data.py
 reconstruit le parquet SANS les ef_*, donc relancer ce script ensuite.
 
 Usage :
-    cd backtest/modele_updown/30min/modele_down
+    cd backtest/modele_updown/1h/modele_down
     python data.py
     python add_eth_features.py
 """
@@ -35,7 +32,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parent
 MASTER_PARQUET = ROOT / "DB" / "btc_multi_tf_1h.parquet"
-ETH_PARQUET = ROOT / "eth_data" / "eth_15m.parquet"
+ETH_CSV = ROOT / "DB" / "eth_1h.csv"
 
 INTERVAL_1H_MS = 60 * 60 * 1000
 
@@ -59,26 +56,6 @@ def _eth_streak(close_ret: pd.Series) -> np.ndarray:
     grp = (s != s.shift()).cumsum()
     run = s.groupby(grp).cumcount().to_numpy() + 1
     return run * sign
-
-
-def resample_eth_to_30m(eth_15m: pd.DataFrame) -> pd.DataFrame:
-    """ETH 15m OHLCV -> bougies 30m (open=first/high=max/low=min/close=last/
-    volume=sum), keyees par l'open_time du bucket 30m (multiple de 30min).
-
-    Un bucket 30m d'open_time T agrege les bougies 15m d'open_time T et T+15m.
-    L'open_time du bucket 30m s'aligne EXACTEMENT sur l'open_time des BTC 30m.
-    """
-    eth = eth_15m.sort_values("timestamp_ms").reset_index(drop=True).copy()
-    eth["bucket"] = (eth["timestamp_ms"].to_numpy(dtype=np.int64)
-                     // INTERVAL_1H_MS) * INTERVAL_1H_MS
-    agg = eth.groupby("bucket", sort=True).agg(
-        open=("open", "first"),
-        high=("high", "max"),
-        low=("low", "min"),
-        close=("close", "last"),
-        volume=("volume", "sum"),
-    ).reset_index().rename(columns={"bucket": "timestamp_ms"})
-    return agg
 
 
 def compute_eth_features(eth: pd.DataFrame) -> pd.DataFrame:
@@ -131,13 +108,13 @@ def main() -> int:
         print(f"ERREUR : master parquet introuvable : {MASTER_PARQUET}")
         print("Lance d'abord : python data.py")
         return 1
-    if not ETH_PARQUET.exists():
-        print(f"ERREUR : ETH parquet introuvable : {ETH_PARQUET}")
+    if not ETH_CSV.exists():
+        print(f"ERREUR : ETH CSV introuvable : {ETH_CSV}")
         return 1
 
-    print(f"=== add_eth_features.py (30m) ===")
+    print(f"=== add_eth_features.py (1h) ===")
     master = pd.read_parquet(MASTER_PARQUET)
-    print(f"Master 30m : {len(master):,} rows x {len(master.columns)} cols")
+    print(f"Master 1h : {len(master):,} rows x {len(master.columns)} cols")
 
     # Si les ef_* sont deja presents (re-run sans rebuild), on les drop d'abord
     # pour reconstruire proprement.
@@ -152,14 +129,13 @@ def main() -> int:
             shutil.copy2(MASTER_PARQUET, bak)
             print(f"  backup : {bak.name}")
 
-    eth_15m = pd.read_parquet(ETH_PARQUET)
-    eth_30m = resample_eth_to_30m(eth_15m)
-    print(f"ETH 15m : {len(eth_15m):,} rows -> ETH 30m resample : {len(eth_30m):,} rows")
+    eth_1h = pd.read_csv(ETH_CSV)
+    print(f"ETH 1h : {len(eth_1h):,} rows (natif, pas de resample necessaire)")
 
-    eth_feat = compute_eth_features(eth_30m)
+    eth_feat = compute_eth_features(eth_1h)
 
-    # Join no-lookahead par TIMESTAMP EXACT : la bougie ETH 30m concurrente
-    # (meme open_time que la BTC 30m) ferme a T = open_30m + 30m = decision time.
+    # Join no-lookahead par TIMESTAMP EXACT : la bougie ETH 1h concurrente
+    # (meme open_time que la BTC 1h) ferme a T = open_1h + 1h = decision time.
     master_ts = master["timestamp_ms"].to_numpy(dtype=np.int64)
     eth_map = {int(ts): i for i, ts in enumerate(eth_feat["timestamp_ms"].to_numpy(dtype=np.int64))}
     idx = np.array([eth_map.get(int(ts), -1) for ts in master_ts])

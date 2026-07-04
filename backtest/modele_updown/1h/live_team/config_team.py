@@ -29,13 +29,32 @@ DAY_MS = 24 * 3600 * 1000
 INTERVAL_1H_MS = 60 * 60 * 1000
 
 # ============================================================
+#  Filtres d'ENTREE (DMI / confiance UP / cross-model / heures / DOWN)
+#  — miroir EXACT de modele_team/config_main.py (campagne 500%/cote 2026-07-01)
+# ============================================================
+DMI_FILTER_ENABLED = True
+DMI_LENGTH = 12
+DMI_TIMEFRAME = "4h"
+DMI_SIDES = ("down", "up")        # RESYNC 2026-07-04 : le DMI sur UP aide aussi maintenant (etait ("down",))
+
+UP_CONF_FILTER_ENABLED = True
+UP_CONF_MIN = 0.59                # RESYNC 2026-07-04 (etait 0.63) : long garde ssi P(up) >= ce seuil
+
+UP_DROP_HOURS = (23, 0, 1, 2, 3, 4, 10, 14, 20)   # RESYNC 2026-07-04 (etait (0,1,2,3,4,5)) : heures UTC ou on NE prend PAS de long
+
+UP_XMODEL_FILTER_ENABLED = True
+UP_XMODEL_MAX_PDOWN = 0.44        # long autorise ssi P(down) < ce seuil
+
+DOWN_CONF_DELTA = 0.03            # RESYNC 2026-07-04 (campagne STABILITE, TIER 2 -- etait 0.01) : short garde ssi P(down) >= seuil_sidecar + delta
+
+# ============================================================
 #  Gestion de sortie cote UP (long)  — miroir config_main.py
 # ============================================================
 UP_MGMT_ENABLED = True
-UP_MAX_HOLD_MIN = 90
-UP_TRAIL_ACTIVATE = 0.0035        # trailing armé quand le pic atteint +0.35%
-UP_TRAIL_GAP = 0.008              # sort si le profit retombe de 0.80% sous le pic
-UP_TAKE_PROFIT = 0.012            # take-profit +1.20% (décimal de prix)
+UP_MAX_HOLD_MIN = 240              # RESYNC 2026-07-04 (etait 150)
+UP_TRAIL_ACTIVATE = 0.003         # trailing armé quand le pic atteint +0.30%
+UP_TRAIL_GAP = 0.010               # RESYNC 2026-07-04 (etait 0.008)
+UP_TAKE_PROFIT = 0.006             # RESYNC 2026-07-04 (etait 0.012) : TP serre, verrouille vite les petits gains
 UP_STOP_LOSS = 0.60               # SL en % du PRIX (sur la position, levier hors-jeu ; utilisé si time-decay OFF)
 UP_CHECK_MIN = 1                  # intervalle de vérif (min) = monitoring 1-min
 # dérivés (ne pas éditer)
@@ -44,9 +63,9 @@ UP_MAX_STEPS = UP_MAX_HOLD_MIN // UP_CHECK_MIN
 UP_STOP_LOSS_DEC = -(UP_STOP_LOSS / 100.0)
 # SL temporel décroissant (START large -> END serré, borné par FLOOR), en % PRIX (sur la position)
 UP_SL_TIME_DECAY = True
-UP_SL_START = 1                   # SL à l'entrée (large), en % prix
-UP_SL_END = 0.60                  # SL à la clôture forcée (serré), en % prix
-UP_SL_FLOOR = 0.30                # SL le plus serré autorisé (plancher), en % prix
+UP_SL_START = 1.5                 # RESYNC 2026-07-04 (etait 1) : SL à l'entrée (large), en % prix
+UP_SL_END = 0.3                   # RESYNC 2026-07-04 (etait 0.60) : SL à la clôture forcée (serré), en % prix
+UP_SL_FLOOR = 0.1                 # RESYNC 2026-07-04 (etait 0.30) : SL le plus serré autorisé (plancher), en % prix
 UP_SL_START_DEC = -(UP_SL_START / 100.0)
 UP_SL_END_DEC = -(UP_SL_END / 100.0)
 UP_SL_FLOOR_DEC = -(UP_SL_FLOOR / 100.0)
@@ -55,20 +74,20 @@ UP_SL_FLOOR_DEC = -(UP_SL_FLOOR / 100.0)
 #  Gestion de sortie cote DOWN (short)  — miroir config_main.py
 # ============================================================
 DOWN_MGMT_ENABLED = True
-DOWN_MAX_HOLD_MIN = 105
-DOWN_TRAIL_ACTIVATE = 0.0025      # trailing short armé à +0.25%
-DOWN_TRAIL_GAP = 0.0050           # sort si le profit short retombe de 0.50% sous le pic
-DOWN_TAKE_PROFIT = 0.003          # take-profit short +0.30% (levier principal du WR)
-DOWN_STOP_LOSS = 0.60             # SL en % du PRIX (sur la position, levier hors-jeu ; utilisé si time-decay OFF)
+DOWN_MAX_HOLD_MIN = 720           # RESYNC 2026-07-04 (campagne STABILITE, TIER 2 -- etait 870)
+DOWN_TRAIL_ACTIVATE = 0.0015      # RESYNC 2026-07-04 (etait 0.0025)
+DOWN_TRAIL_GAP = 0.012            # sort si le profit short retombe de 1.2% sous le pic (trend-ride)
+DOWN_TAKE_PROFIT = 0.016          # RESYNC 2026-07-04 (etait 0.015)
+DOWN_STOP_LOSS = 0.1              # SL en % du PRIX (sur la position, levier hors-jeu ; utilisé si time-decay OFF)
 DOWN_CHECK_MIN = 1
 # dérivés (ne pas éditer)
 DOWN_STEP_MS = DOWN_CHECK_MIN * 60 * 1000
 DOWN_MAX_STEPS = DOWN_MAX_HOLD_MIN // DOWN_CHECK_MIN
 DOWN_STOP_LOSS_DEC = -(DOWN_STOP_LOSS / 100.0)
 DOWN_SL_TIME_DECAY = True
-DOWN_SL_START = 0.80              # SL à l'entrée (large), en % prix
-DOWN_SL_END = 0.30               # SL à la clôture forcée (serré), en % prix
-DOWN_SL_FLOOR = 0.15             # SL le plus serré autorisé (plancher), en % prix
+DOWN_SL_START = 1                 # SL à l'entrée (large), en % prix
+DOWN_SL_END = 0.4                 # RESYNC 2026-07-04 (campagne STABILITE, TIER 2 -- etait 0.5) : SL a la cloture forcee (serre), en % prix
+DOWN_SL_FLOOR = 0.15              # RESYNC 2026-07-04 (etait 0.2)
 DOWN_SL_START_DEC = -(DOWN_SL_START / 100.0)
 DOWN_SL_END_DEC = -(DOWN_SL_END / 100.0)
 DOWN_SL_FLOOR_DEC = -(DOWN_SL_FLOOR / 100.0)

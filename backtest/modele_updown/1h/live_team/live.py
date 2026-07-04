@@ -82,6 +82,7 @@ from position import PositionManager  # noqa: E402
 from live_helpers import fetch  # noqa: E402
 from live_helpers import notify  # noqa: E402
 from live_helpers import predict  # noqa: E402
+from live_helpers.logsetup import log_event, setup_logging  # noqa: E402
 
 logger = logging.getLogger("live_team")
 
@@ -428,6 +429,9 @@ class EntryManager:
             getattr(self.cfg, "ENTRY_ATTEMPT_SEC", 300)) * 1000
         logger.info("Entree %s : ordre maker poste #%d @ %.2f (vol=%d, oid=%s).",
                     a["side"], a["attempt"], limit, a["vol"], a["order_id"])
+        log_event("entry_order_posted", side=a["side"], attempt=a["attempt"],
+                  limit=round(limit, 2), vol=a["vol"], order_id=a["order_id"],
+                  market=round(market, 2))
 
         # En DRY_RUN l'ordre n'est pas reellement poste : on considere l'entree
         # comme remplie immediatement au prix limite (pas de poll possible).
@@ -478,6 +482,9 @@ class EntryManager:
                 logger.warning("Entree %s : fill PARTIEL %.4f/%d a l'expiration "
                                "-> adoption de la portion remplie (pas de repost).",
                                a["side"], last_deal_vol, int(a["vol"]))
+                log_event("entry_partial_fill", side=a["side"],
+                          filled_vol=filled_vol, requested_vol=int(a["vol"]),
+                          deal_px=round(last_deal_px, 2))
                 self._on_filled(last_deal_px or a["limit"], filled_vol,
                                 mexc_position_id=self._lookup_position_id(a["side"]))
                 return
@@ -490,6 +497,11 @@ class EntryManager:
         a = self._active
         if a is None:
             return
+        logger.info("Entree %s REMPLIE : entry=%.2f vol=%d (oid=%s) -> ouverture position.",
+                    a["side"], entry_price, vol, a.get("order_id"))
+        log_event("entry_filled", side=a["side"], entry=round(float(entry_price), 2),
+                  vol=int(vol), anchor_ts=int(a["anchor_ts"]),
+                  mexc_position_id=mexc_position_id, attempts=a.get("attempt"))
         try:
             self.pm.open_position(
                 side=a["side"],
@@ -513,6 +525,7 @@ class EntryManager:
         self._cancel_order_id(a.get("order_id"))
         logger.warning("Entree %s ABANDONNEE apres %d essais (non remplie).",
                        a["side"], a["attempt"])
+        log_event("entry_abandoned", side=a["side"], attempts=a["attempt"])
         send = getattr(self.notify, "send_entry_missed", None)
         if send is not None:
             try:
@@ -679,10 +692,10 @@ def bootstrap() -> tuple[MexcClient, PositionManager, EntryManager]:
 #  Boucle principale (tick 1-minute)
 # ============================================================
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    # Logging centralise : console INFO + fichier rotatif DEBUG (logs/live_team.log)
+    # + journal structure JSONL (logs/events.jsonl). Remplace basicConfig.
+    setup_logging()
+    log_event("daemon_start", symbol=SYMBOL, dry_run=cfg.DRY_RUN)
 
     mexc, pm, em = bootstrap()
 
@@ -703,14 +716,21 @@ def main() -> None:
         wait_until(boundary_s)
 
         t_start = time.perf_counter()
+        n_exits_this_tick = 0
         try:
             now_ms = int(time.time() * 1000)
+            logger.debug("tick start : now_ms=%d (%s) n_open=%d entry_busy=%s",
+                         now_ms,
+                         datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
+                         .strftime("%H:%M:%S"),
+                         pm.n_open(), em.is_busy())
 
             # --- 1) Gestion intrabar : close 1-min qui vient de fermer --------
             try:
                 kl_min1 = mexc.get_klines(SYMBOL, "Min1")
             except MexcError as e:
                 logger.error("get_klines(Min1) a echoue : %s", e)
+                log_event("min1_fetch_error", error=str(e))
                 kl_min1 = []
             if kl_min1:
                 # On ne rejoue QUE les bougies 1-min reellement FERMEES : la
@@ -718,12 +738,19 @@ def main() -> None:
                 # formation (open == minute courante non terminee) -> on l'exclut.
                 cur_min_open = (now_ms // 60_000) * 60_000
                 closed = [b for b in kl_min1 if int(b[0]) < cur_min_open]
+                logger.debug("Min1 : %d bougies recues, %d fermees a rejouer "
+                             "(derniere close=%s).", len(kl_min1), len(closed),
+                             closed[-1][4] if closed else "?")
                 try:
                     # Rejeu de toutes les bougies fermees depuis le dernier
                     # traitement (rattrape une minute sautee : redemarrage, stall,
                     # kline vide) ; chaque close est evalue avec j aligne sur le
                     # backtest (now_ms = OPEN de la bougie, cf. process_min1_bars).
-                    pm.process_min1_bars(closed)
+                    exits = pm.process_min1_bars(closed)
+                    n_exits_this_tick = len(exits)
+                    if exits:
+                        log_event("min1_exits", n=len(exits),
+                                  pos_ids=[e.get("pos_id") for e in exits])
                 except Exception as e:  # noqa: BLE001
                     logger.exception("PositionManager.process_min1_bars a echoue : %s", e)
 
@@ -742,6 +769,11 @@ def main() -> None:
                 last_decided_hour_open = cur_hour_open
                 _save_last_decided(cur_hour_open)
                 _run_hourly_decision(mexc, pm, em, stats, cur_hour_open, t_start)
+
+            log_event("tick", dur_s=round(time.perf_counter() - t_start, 3),
+                      n_open=pm.n_open(), entry_busy=em.is_busy(),
+                      exits=n_exits_this_tick, hour_decision=bool(
+                          at_hour_top and cur_hour_open == last_decided_hour_open))
 
         except KeyboardInterrupt:
             console.print("\n[bold red]Arret demande.[/bold red]")
@@ -762,6 +794,12 @@ def _run_hourly_decision(mexc: MexcClient, pm: PositionManager, em: EntryManager
     vient d'OUVRIR (open == cur_hour_open) -> anchor_ts = cur_hour_open.
     """
     just_closed_open = cur_hour_open - INTERVAL_1H_MS
+    bar_close_utc = pd.Timestamp(just_closed_open + INTERVAL_1H_MS, unit="ms",
+                                 tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
+    logger.info("=== Decision horaire : bougie 1h fermee %s (anchor trade=%d) ===",
+                bar_close_utc, cur_hour_open)
+    log_event("hourly_decision_start", bar_close_utc=bar_close_utc,
+              just_closed_open=just_closed_open, anchor_ts=cur_hour_open)
 
     # 1) Confirme que Bitstamp a bien publie la bougie 1h qui vient de fermer.
     buf_1h_key = ("btcusd", 3600)
@@ -771,8 +809,11 @@ def _run_hourly_decision(mexc: MexcClient, pm: PositionManager, em: EntryManager
             _CACHED_BUFFERS.get(buf_1h_key, []), max_tries=12)
         _CACHED_BUFFERS[buf_1h_key] = fetch.merge_klines(
             _CACHED_BUFFERS.get(buf_1h_key, []), updated)[-WARMUP[buf_1h_key]:]
+        logger.debug("freshness 1h OK : bougie cible %d confirmee chez Bitstamp.",
+                     just_closed_open)
     except TimeoutError as e:
         logger.error("freshness_retry 1h a echoue (%s) — cycle ignore.", e)
+        log_event("hourly_decision_skip", reason="freshness_timeout", error=str(e))
         return
 
     # 2+3) Refresh + Decide avec VALIDATION des donnees et re-essais.
@@ -799,12 +840,17 @@ def _run_hourly_decision(mexc: MexcClient, pm: PositionManager, em: EntryManager
         except Exception as e:  # noqa: BLE001
             logger.warning("predict.decide essai %d/%d a leve : %s",
                            attempt, max_retries, e)
+            log_event("predict_error", attempt=attempt, error=str(e))
             dec = None
             continue
         if dec.get("data_valid", True):
+            logger.debug("predict essai %d/%d OK : team=%s p_up=%.4f p_dn=%.4f",
+                         attempt, max_retries, dec["team"], dec["p_up"], dec["p_dn"])
             break  # donnees valides -> on poursuit le cycle normalement
         logger.warning("Donnees invalides essai %d/%d : %s", attempt, max_retries,
                        "; ".join(dec.get("invalid_reasons", [])) or "?")
+        log_event("data_invalid", attempt=attempt,
+                  reasons=dec.get("invalid_reasons", []))
     t_after_fetch = time.perf_counter()
     t_after_predict = t_after_fetch
 
@@ -817,6 +863,8 @@ def _run_hourly_decision(mexc: MexcClient, pm: PositionManager, em: EntryManager
                                  tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
         logger.error("Cycle %s ANNULE : donnees invalides apres %d essais — "
                      "AUCUNE prediction. Raison: %s", bar_close, max_retries, reason)
+        log_event("cycle_cancelled", bar_close_utc=bar_close, retries=max_retries,
+                  reason=reason)
         stats["cycles"] += 1
         append_cycle_row({
             "cycle_n": stats["cycles"],
@@ -830,6 +878,18 @@ def _run_hourly_decision(mexc: MexcClient, pm: PositionManager, em: EntryManager
 
     stats["cycles"] += 1
     n_open = pm.n_open()
+
+    logger.info("Decision : team=%s | p_up=%.4f>=th_up=%.4f? %s | "
+                "p_dn=%.4f>=th_dn=%.4f? %s | vol_state=%d wknd=%d hour=%d",
+                dec["team"], dec["p_up"], dec["th_up"], dec["take_up"],
+                dec["p_dn"], dec["th_dn"], dec["take_dn"],
+                dec["volatility_state"], dec["is_weekend"], dec["hour"])
+    log_event("decision", team=dec["team"], p_up=round(dec["p_up"], 6),
+              th_up=round(dec["th_up"], 6), take_up=dec["take_up"],
+              p_dn=round(dec["p_dn"], 6), th_dn=round(dec["th_dn"], 6),
+              take_dn=dec["take_dn"], volatility_state=dec["volatility_state"],
+              is_weekend=dec["is_weekend"], hour=dec["hour"], n_open=n_open,
+              bar_close_utc=bar_close_utc)
 
     # 4) Log cycles.csv (une ligne par cycle horaire).
     jc_bar = _find_bar(buffers.get("1h", []), just_closed_open)
@@ -860,16 +920,22 @@ def _run_hourly_decision(mexc: MexcClient, pm: PositionManager, em: EntryManager
         if n_open >= max_pos:
             logger.info("Decision %s ignoree : %d/%d positions deja ouvertes.",
                         dec["team"], n_open, max_pos)
+            log_event("entry_skipped", team=dec["team"], reason="max_positions",
+                      n_open=n_open, max_pos=max_pos)
         elif em.is_busy():
             logger.info("Decision %s ignoree : un cycle d'entree est deja en cours.",
                         dec["team"])
+            log_event("entry_skipped", team=dec["team"], reason="entry_busy")
         elif pm.has_open_side("up" if dec["team"] == "UP" else "down"):
             # En mode hedge, MEXC agrege tout le meme sens en UNE position : ouvrir
             # un 2e long (ou 2e short) ferait suivre 2 Position pour 1 reelle.
             logger.info("Decision %s ignoree : une position de meme sens est deja ouverte.",
                         dec["team"])
+            log_event("entry_skipped", team=dec["team"], reason="same_side_open")
         else:
             side = "up" if dec["team"] == "UP" else "down"
+            log_event("entry_decision", team=dec["team"], side=side,
+                      anchor_ts=cur_hour_open)
             em.start_entry(side, anchor_ts=cur_hour_open, decision_ctx=dec)
             stats["entries"] = em.entries_started
 

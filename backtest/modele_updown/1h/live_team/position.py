@@ -38,6 +38,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from live_helpers.logsetup import log_event
+
 logger = logging.getLogger("live_team.position")
 
 # Pas temporel des sous-bougies en live = 1 minute (comme DB_1m du backtest).
@@ -46,7 +48,9 @@ _MINUTE_MS = 60_000
 # Colonnes du journal logs/positions.csv (ordre fige, cf contrat).
 POSITIONS_COLUMNS = [
     "pos_id", "open_ts", "side", "entry", "vol", "leverage", "anchor_ts",
-    "exit_ts", "exit_price", "exit_reason", "pp", "fees", "pnl_usdc",
+    "exit_ts", "exit_price", "exit_reason", "pp",
+    "mfe_pp", "mae_pp", "mfe_usdc", "mae_usdc",
+    "fees", "pnl_usdc",
     "pnl_pct_equity", "balance_post", "external_oid",
 ]
 
@@ -91,6 +95,12 @@ class Position:
     vol: int
     anchor_ts: int
     peak: float = -9.0
+    # MFE / MAE de la position (excursions latentes en rendement-prix directionnel
+    # pp, relatives a l'entree = pp 0). PUREMENT INFORMATIF (jamais lu par
+    # check_exit) : `mfe` = plus haut profit atteint, `mae` = plus forte perte
+    # atteinte pendant la vie de la position. Persistes (survivent au redemarrage).
+    mfe: float = 0.0
+    mae: float = 0.0
     mexc_position_id: int | None = None
     external_oid: str = ""
     open_ts: int = 0
@@ -209,6 +219,8 @@ class PositionManager:
             tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
             tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             tmp.replace(self.state_path)
+            self.log.debug("Etat persiste : %d position(s), last_min1_open_ms=%s.",
+                           len(self.positions), self._last_min1_open_ms)
         except Exception as e:                              # noqa: BLE001
             # Solidite : un echec de persistance ne doit jamais tuer la boucle.
             self.log.error("Sauvegarde etat positions impossible : %s", e)
@@ -270,6 +282,15 @@ class PositionManager:
         else:
             pp = 1.0 - close_price / pos.entry
 
+        # MFE / MAE : suivi des excursions latentes de la position. MAJ AVANT tout
+        # `return` ci-dessous pour capter aussi la bougie de sortie (SL/TP/timestop).
+        # Purement informatif (jamais relu par la decision de sortie) -> aucun
+        # impact sur la parite backtest.
+        if pp > pos.mfe:
+            pos.mfe = pp
+        if pp < pos.mae:
+            pos.mae = pp
+
         # j = nombre de minutes ecoulees depuis l'ancre (open bougie 1h de decision).
         j = int((now_ms - pos.anchor_ts) // _MINUTE_MS)
         if j < 0:
@@ -284,11 +305,24 @@ class PositionManager:
                                  params["sl_end_dec"], params["sl_floor_dec"])
         else:
             sl_th = params["stop_loss_dec"]
+
+        # Trace exhaustive de l'evaluation minute-par-minute (fichier DEBUG).
+        self.log.debug(
+            "check_exit %s [%s] close=%.2f entry=%.2f pp=%+.4f%% j=%d/%d "
+            "sl_th=%+.4f%% tp=%+.4f%% peak=%+.4f%% trail_floor=%s",
+            pos.pos_id, pos.side, close_price, pos.entry, pp * 100, j, max_steps,
+            sl_th * 100, params["take_profit"] * 100, pos.peak * 100,
+            f"{pos.trail_floor * 100:+.4f}%" if pos.trail_floor is not None else "None")
+
         if pp <= sl_th:
+            self.log.info("check_exit %s -> STOP_LOSS (pp=%+.4f%% <= sl_th=%+.4f%%, j=%d).",
+                          pos.pos_id, pp * 100, sl_th * 100, j)
             return "stop_loss", pp
 
         # --- 2) TAKE-PROFIT ---
         if pp >= params["take_profit"]:
+            self.log.info("check_exit %s -> TAKE_PROFIT (pp=%+.4f%% >= tp=%+.4f%%).",
+                          pos.pos_id, pp * 100, params["take_profit"] * 100)
             return "take_profit", pp
 
         # --- 3) TRAILING ('let-run') : maj du pic puis du plancher arme ---
@@ -297,10 +331,15 @@ class PositionManager:
         if pos.peak >= params["trail_activate"]:
             pos.trail_floor = pos.peak - params["trail_gap"]
         if pos.trail_floor is not None and pp < pos.trail_floor:
+            self.log.info("check_exit %s -> TRAILING (pp=%+.4f%% < floor=%+.4f%%, "
+                          "peak=%+.4f%%).", pos.pos_id, pp * 100,
+                          pos.trail_floor * 100, pos.peak * 100)
             return "trailing", pp
 
         # --- 4) TIMESTOP : detention max atteinte -> sortie a la cloture ---
         if max_steps > 0 and j >= max_steps - 1:
+            self.log.info("check_exit %s -> TIMESTOP (j=%d >= max_steps-1=%d, pp=%+.4f%%).",
+                          pos.pos_id, j, max_steps - 1, pp * 100)
             return "timestop", pp
 
         return None, pp
@@ -354,6 +393,14 @@ class PositionManager:
         maker_attempts = int(getattr(cfg, "EXIT_MAKER_ATTEMPTS", 3))
         maker_wait = float(getattr(cfg, "EXIT_MAKER_WAIT_SEC", 20))
 
+        self.log.info("execute_exit %s [%s] reason=%s pp=%+.4f%% market=%.2f "
+                      "-> politique=%s (close_side=%d, vol=%d).",
+                      pos.pos_id, pos.side, reason, pp * 100, exit_price,
+                      "maker->taker" if pp > 0 else "taker_direct", close_side, vol)
+        log_event("exit_start", pos_id=pos.pos_id, side=pos.side, reason=reason,
+                  pp=round(pp, 6), market=round(exit_price, 2), vol=vol,
+                  policy="maker_first" if pp > 0 else "taker_direct")
+
         try:
             if pp > 0:
                 # --- Sortie gagnante : maker passif d'abord (economie de frais) ---
@@ -376,6 +423,8 @@ class PositionManager:
                         position_id=pos.mexc_position_id,
                     )
                     order_id = str(res.get("order_id"))
+                    self.log.debug("exit %s : maker post-only #%d @ %.2f (oid=%s).",
+                                   pos.pos_id, attempt + 1, limit_r, order_id)
                     if res.get("dry_run"):
                         # En DRY_RUN aucun fill reel : on considere la sortie maker
                         # comme effective au prix limite (pas de POST).
@@ -388,16 +437,24 @@ class PositionManager:
                         exit_price = deal[0] or limit_r
                         fee_side = self.fee_maker
                         filled = True
+                        self.log.info("exit %s : fill MAKER @ %.2f a l'essai #%d.",
+                                      pos.pos_id, exit_price, attempt + 1)
                         break
                     # Pas rempli dans la fenetre -> annuler avant le prochain essai.
+                    self.log.debug("exit %s : maker #%d non rempli en %.0fs -> annule.",
+                                   pos.pos_id, attempt + 1, maker_wait)
                     self._safe_cancel(order_id)
                 if not filled:
                     # Repli taker : market reduce-only.
+                    self.log.warning("exit %s : %d essais maker sans fill -> repli TAKER (market).",
+                                     pos.pos_id, maker_attempts)
                     filled, exit_price, order_id = self._market_close(
                         symbol, close_side, vol, pos, exit_price)
                     fee_side = self.fee_taker
             else:
                 # --- Sortie perdante / SL : market direct (taker) ---
+                self.log.info("exit %s : sortie perdante/SL -> market TAKER direct.",
+                              pos.pos_id)
                 filled, exit_price, order_id = self._market_close(
                     symbol, close_side, vol, pos, exit_price)
                 fee_side = self.fee_taker
@@ -405,6 +462,8 @@ class PositionManager:
             # Solidite : on journalise, on NE retire PAS la position (sera retentee
             # au prochain on_minute). Le caller voit closed=False.
             self.log.exception("execute_exit %s a echoue : %s", pos.pos_id, e)
+            log_event("exit_error", pos_id=pos.pos_id, side=pos.side,
+                      reason=reason, error=str(e))
             return {"pos_id": pos.pos_id, "side": pos.side, "reason": reason,
                     "pp": pp, "exit_price": exit_price, "vol_closed": 0,
                     "fee_side": fee_side, "fees": 0.0, "pnl_usdc": 0.0,
@@ -424,6 +483,11 @@ class PositionManager:
         # prix du bon signe : positif si gagnant). pnl net = brut - frais.
         pnl_gross = pp * notional_entry
         pnl_usdc = pnl_gross - fees
+        self.log.debug("exit %s : pnl breakdown notional_entry=%.2f pp=%+.4f%% "
+                       "gross=%+.4f fees=%.4f (entry_maker=%s, exit_%s) net=%+.4f USDC",
+                       pos.pos_id, notional_entry, pp * 100, pnl_gross, fees,
+                       pos.entry_is_maker,
+                       "maker" if fee_side == self.fee_maker else "taker", pnl_usdc)
 
         # --- Solde apres cloture + P/L en % de l'equity (best-effort) ---
         balance_post = None
@@ -440,6 +504,11 @@ class PositionManager:
         now_ms = int(time.time() * 1000)
         pos.status = "closed"
 
+        # --- Excursions latentes (MFE/MAE) en USDC brut (= pp_excursion x notionnel
+        #     d'entree, hors frais ; hypothetique « si on avait clos a ce point »). ---
+        mfe_usdc = pos.mfe * notional_entry
+        mae_usdc = pos.mae * notional_entry
+
         # --- Journalisation CSV + notification + retrait de l'etat ---
         self._append_csv_row({
             "pos_id": pos.pos_id,
@@ -453,6 +522,10 @@ class PositionManager:
             "exit_price": round(exit_price, 6),
             "exit_reason": reason,
             "pp": round(pp, 8),
+            "mfe_pp": round(pos.mfe, 8),
+            "mae_pp": round(pos.mae, 8),
+            "mfe_usdc": round(mfe_usdc, 6),
+            "mae_usdc": round(mae_usdc, 6),
             "fees": round(fees, 6),
             "pnl_usdc": round(pnl_usdc, 6),
             "pnl_pct_equity": round(pnl_pct_equity, 6) if pnl_pct_equity is not None else "",
@@ -460,7 +533,8 @@ class PositionManager:
             "external_oid": pos.external_oid,
         })
 
-        self._notify_closed(pos, reason, exit_price, pp, pnl_usdc, balance_post)
+        self._notify_closed(pos, reason, exit_price, pp, pnl_usdc, balance_post,
+                            mfe_usdc, mae_usdc)
 
         with self._lock:
             self.positions.pop(pos.pos_id, None)
@@ -469,6 +543,15 @@ class PositionManager:
         self.log.info("Position %s fermee (%s) pp=%.4f%% pnl=%.2f USDC fill=%s",
                       pos.pos_id, reason, pp * 100, pnl_usdc,
                       "maker" if fee_side == self.fee_maker else "taker")
+        log_event("position_closed", pos_id=pos.pos_id, side=pos.side,
+                  reason=reason, entry=round(pos.entry, 2),
+                  exit_price=round(exit_price, 2), pp=round(pp, 6),
+                  mfe_pp=round(pos.mfe, 6), mae_pp=round(pos.mae, 6),
+                  mfe_usdc=round(mfe_usdc, 4), mae_usdc=round(mae_usdc, 4),
+                  vol=vol, fees=round(fees, 4), pnl_usdc=round(pnl_usdc, 4),
+                  fill="maker" if fee_side == self.fee_maker else "taker",
+                  balance_post=round(balance_post, 2) if balance_post is not None else None,
+                  order_id=order_id)
 
         return {"pos_id": pos.pos_id, "side": pos.side, "reason": reason, "pp": pp,
                 "exit_price": exit_price, "vol_closed": vol, "fee_side": fee_side,
@@ -550,7 +633,8 @@ class PositionManager:
         return float(fallback)
 
     def _notify_closed(self, pos: Position, reason: str, exit_price: float, pp: float,
-                       pnl_usdc: float, balance_post: float | None) -> None:
+                       pnl_usdc: float, balance_post: float | None,
+                       mfe_usdc: float = 0.0, mae_usdc: float = 0.0) -> None:
         """Envoie la notification de cloture (best-effort, jamais bloquant)."""
         if self.notify is None:
             return
@@ -560,7 +644,9 @@ class PositionManager:
         try:
             send(side=pos.side, exit_reason=reason, entry=pos.entry,
                  exit_price=exit_price, pp=pp, pnl_usdc=pnl_usdc,
-                 balance=balance_post if balance_post is not None else 0.0)
+                 balance=balance_post if balance_post is not None else 0.0,
+                 mfe_pp=pos.mfe, mae_pp=pos.mae,
+                 mfe_usdc=mfe_usdc, mae_usdc=mae_usdc)
         except Exception as e:                              # noqa: BLE001
             self.log.warning("notify.send_position_closed a echoue : %s", e)
 
@@ -619,6 +705,12 @@ class PositionManager:
         if not bars:
             return results
 
+        n_open = sum(1 for p in self.positions.values() if p.status == "open")
+        if n_open == 0:
+            # Aucune position : rien a evaluer, on avance juste le curseur plus bas.
+            self.log.debug("process_min1_bars : %d bougie(s), aucune position ouverte.",
+                           len(bars))
+
         # Bougies triees ASC par open et dedupliquees (robustesse au format API).
         try:
             asc = sorted(bars, key=lambda b: int(b[0]))
@@ -654,7 +746,11 @@ class PositionManager:
                 continue
 
             # check_exit + execute_exit pour chaque position ouverte, sur CE close.
-            for pos in list(self.positions.values()):
+            open_now = [p for p in self.positions.values() if p.status == "open"]
+            if open_now:
+                self.log.debug("process_min1_bars : rejeu bougie open=%d close=%.2f "
+                               "sur %d position(s).", bar_open_ms, close_px, len(open_now))
+            for pos in open_now:
                 if pos.status != "open":
                     continue
                 try:
@@ -703,6 +799,10 @@ class PositionManager:
         notional = vol * self.contract_size * float(entry)
         self.log.info("Position %s ouverte : %s entry=%.2f vol=%d notional=%.2f",
                       pos.pos_id, side, entry, vol, notional)
+        log_event("position_opened", pos_id=pos.pos_id, side=side,
+                  entry=round(float(entry), 2), vol=int(vol),
+                  notional=round(notional, 2), anchor_ts=int(anchor_ts),
+                  mexc_position_id=mexc_position_id)
         if self.notify is not None:
             send = getattr(self.notify, "send_position_opened", None)
             if send is not None:
@@ -753,6 +853,8 @@ class PositionManager:
                 if pos.mexc_position_id and pos.mexc_position_id not in live_by_id:
                     self.log.warning("reconcile : position %s (mexc_id=%s) absente cote MEXC "
                                      "-> retiree de l'etat.", pos_id, pos.mexc_position_id)
+                    log_event("reconcile_drop", pos_id=pos_id,
+                              mexc_position_id=pos.mexc_position_id)
                     to_drop.append(pos_id)
             for pos_id in to_drop:
                 self.positions.pop(pos_id, None)
@@ -783,11 +885,15 @@ class PositionManager:
                 self.log.warning("reconcile : position MEXC inconnue adoptee %s "
                                  "(side=%s vol=%d entry=%.2f anchor=heure courante).",
                                  oid, side, vol, entry)
+                log_event("reconcile_adopt", pos_id=oid, side=side, vol=vol,
+                          entry=round(entry, 2), mexc_position_id=pid)
 
             self._save_state()
 
         self.log.info("reconcile termine : %d position(s) ouverte(s) suivie(s).",
                       len(self.positions))
+        log_event("reconcile_done", n_open=len(self.positions),
+                  pos_ids=list(self.positions.keys()))
 
     # ------------------------------------------------------------------
     #  Divers
@@ -813,6 +919,17 @@ class PositionManager:
         Protege par lock ; toute erreur d'I/O est journalisee sans interrompre."""
         with self._lock:
             try:
+                # Rotation de schema : si un positions.csv existe avec un en-tete
+                # different (ajout de colonnes), on l'archive en .old et on repart
+                # sur un fichier neuf au nouvel en-tete (comme cycles.csv.old).
+                if self.csv_path.exists():
+                    with self.csv_path.open("r", encoding="utf-8") as f:
+                        header = f.readline().strip()
+                    if header and header != ",".join(POSITIONS_COLUMNS):
+                        old = self.csv_path.with_suffix(".csv.old")
+                        self.csv_path.replace(old)
+                        self.log.warning("positions.csv : schema change -> ancien "
+                                         "fichier archive en %s, nouvel en-tete ecrit.", old.name)
                 new_file = not self.csv_path.exists()
                 with self.csv_path.open("a", newline="", encoding="utf-8") as f:
                     w = csv.DictWriter(f, fieldnames=POSITIONS_COLUMNS,

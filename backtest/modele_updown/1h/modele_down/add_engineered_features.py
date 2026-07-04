@@ -40,7 +40,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent
 DB_SQLITE = ROOT / "DB" / "btc_multi_tf.db"
 MASTER_PARQUET = ROOT / "DB" / "btc_multi_tf_1h.parquet"
-ETH_PARQUET = ROOT / "eth_data" / "eth_15m.parquet"
+ETH_CSV = ROOT / "DB" / "eth_1h.csv"
 
 INTERVAL_1H_MS = 60 * 60 * 1000
 TF_STEP_MS = {"1h": 60 * 60 * 1000, "4h": 4 * 60 * 60 * 1000, "1d": 24 * 60 * 60 * 1000}
@@ -302,20 +302,11 @@ def compute_htf(df30_times: np.ndarray, conn) -> dict:
 # ===========================================================================
 # Cross-asset ETH / BTC-ETH
 # ===========================================================================
-def _resample_eth_30m(eth_15m: pd.DataFrame) -> pd.DataFrame:
-    eth = eth_15m.sort_values("timestamp_ms").reset_index(drop=True).copy()
-    eth["bucket"] = (eth["timestamp_ms"].to_numpy(dtype=np.int64) // INTERVAL_1H_MS) * INTERVAL_1H_MS
-    agg = eth.groupby("bucket", sort=True).agg(
-        open=("open", "first"), high=("high", "max"), low=("low", "min"),
-        close=("close", "last"), volume=("volume", "sum"),
-    ).reset_index().rename(columns={"bucket": "timestamp_ms"})
-    return agg
-
-
 def compute_eth_cross(df30: pd.DataFrame) -> dict:
-    """ETH 30m -> oscillateurs ETH + divergence BTC-ETH, joins ts exact (concurrent)."""
-    eth15 = pd.read_parquet(ETH_PARQUET)
-    eth = _resample_eth_30m(eth15)
+    """ETH 1h (natif, DB/eth_1h.csv) -> oscillateurs ETH + divergence BTC-ETH,
+    joins ts exact (concurrent). Pas de resample : deja a la meme granularite
+    que le master BTC."""
+    eth = pd.read_csv(ETH_CSV)
     h, l, c, v = eth["high"].astype(float), eth["low"].astype(float), eth["close"].astype(float), eth["volume"].astype(float)
     cr = (c - c.shift(1)) / c.shift(1)
 
@@ -362,13 +353,13 @@ def main() -> int:
     if not DB_SQLITE.exists():
         print(f"ERREUR : SQLite introuvable : {DB_SQLITE}")
         return 1
-    if not ETH_PARQUET.exists():
-        print(f"ERREUR : ETH parquet introuvable : {ETH_PARQUET}")
+    if not ETH_CSV.exists():
+        print(f"ERREUR : ETH CSV introuvable : {ETH_CSV}")
         return 1
 
-    print("=== add_engineered_features.py (30m) ===")
+    print("=== add_engineered_features.py (1h) ===")
     master = pd.read_parquet(MASTER_PARQUET)
-    print(f"Master 30m : {len(master):,} rows x {len(master.columns)} cols")
+    print(f"Master 1h : {len(master):,} rows x {len(master.columns)} cols")
 
     present = [c for c in NEW_FEATURE_COLS if c in master.columns]
     if present:

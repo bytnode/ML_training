@@ -29,12 +29,15 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+
+logger = logging.getLogger("live_team.predict")
 
 # --------------------------------------------------------------------------- #
 # Chemins (ancres sur ce fichier, jamais sur le cwd)                          #
@@ -44,6 +47,12 @@ _HELPERS_DIR = Path(__file__).resolve().parent          # live_team/live_helpers
 _ROOT_DIR    = _HELPERS_DIR.parent                       # live_team/
 _UP_DIR      = _ROOT_DIR / "modele_up"
 _DOWN_DIR    = _ROOT_DIR / "modele_down"
+
+# config_team.py (filtres d'entree + gestion de sortie, miroir de config_main.py) :
+# live_team/ doit etre sur sys.path pour l'import a plat (meme pattern que live.py).
+if str(_ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(_ROOT_DIR))
+import config_team as _cfg_team
 
 _UP_MODEL    = _UP_DIR / "btc_updown_model.json"
 _UP_SIDECAR  = _UP_DIR / "btc_updown_model.thresholds.json"
@@ -399,12 +408,69 @@ def _pass_invalid(reasons: list[str], volatility_state: int, is_weekend: int,
         "p_dn": float("nan"), "th_dn": float("nan"), "take_dn": False,
         "volatility_state": int(volatility_state),
         "is_weekend": int(is_weekend), "hour": int(hour),
-        "team": "PASS", "data_valid": False, "invalid_reasons": list(reasons),
+        "team": "PASS", "filtered_reason": "data_invalid",
+        "data_valid": False, "invalid_reasons": list(reasons),
     }
 
 
 # --------------------------------------------------------------------------- #
-# decide — prediction + filtre cross-model + regle d'equipe                   #
+# DMI (Wilder) sur le buffer 4h — PORT A L'IDENTIQUE de modele_team/main.py    #
+# --------------------------------------------------------------------------- #
+
+def _wilder_dmi(high, low, close, n: int):
+    """+DI / -DI de Wilder (longueur n). Port bit-a-bit de main.py::_wilder_dmi."""
+    h = np.asarray(high, dtype=float)
+    l = np.asarray(low, dtype=float)
+    cl = np.asarray(close, dtype=float)
+    m = len(h)
+    plus = np.full(m, np.nan)
+    minus = np.full(m, np.nan)
+    if m < 2:
+        return plus, minus
+    up_move = h[1:] - h[:-1]
+    down_move = l[:-1] - l[1:]
+    plus_dm = np.where((up_move > down_move) & (up_move > 0.0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0.0), down_move, 0.0)
+    prev_close = cl[:-1]
+    tr = np.maximum.reduce([h[1:] - l[1:],
+                            np.abs(h[1:] - prev_close),
+                            np.abs(l[1:] - prev_close)])
+
+    def _rma(x):
+        return pd.Series(x).ewm(alpha=1.0 / n, adjust=False).mean().to_numpy()
+
+    atr = _rma(tr)
+    s_plus = _rma(plus_dm)
+    s_minus = _rma(minus_dm)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        plus[1:] = 100.0 * s_plus / atr
+        minus[1:] = 100.0 * s_minus / atr
+    return plus, minus
+
+
+def _dmi_at(buf_4h: list[list], ts_ms: int, length: int) -> tuple[float, float]:
+    """(+DI, -DI) de la bougie DMI_TIMEFRAME dont open_ms == ts_ms EXACTEMENT.
+
+    Port fidele de main.py::_apply_dmi_filter : le lookup backtest est un match
+    EXACT sur le timestamp (pas de forward-fill vers la derniere bougie 4h
+    close) -> le filtre ne peut donc s'appliquer que sur les decisions dont le
+    ts est aligne sur une cloture 4h (1 decision sur 4). On reproduit ce meme
+    comportement ici plutot que de "corriger" (l'objectif est la symetrie
+    stricte avec le backtest, pas une amelioration). ts inconnu -> (nan, nan).
+    """
+    if not buf_4h:
+        return float("nan"), float("nan")
+    arr = np.asarray(buf_4h, dtype=float)
+    opens = arr[:, 0].astype("int64")
+    idx = np.searchsorted(opens, ts_ms)
+    if idx >= len(opens) or opens[idx] != ts_ms:
+        return float("nan"), float("nan")
+    plus_di, minus_di = _wilder_dmi(arr[:, 2], arr[:, 3], arr[:, 4], length)
+    return float(plus_di[idx]), float(minus_di[idx])
+
+
+# --------------------------------------------------------------------------- #
+# decide — prediction + filtres d'entree (DMI/conf/xmodel/heures) + regle d'equipe #
 # --------------------------------------------------------------------------- #
 
 def decide(buffers: dict, target_open_ms: int) -> dict:
@@ -443,11 +509,17 @@ def decide(buffers: dict, target_open_ms: int) -> dict:
     buf_1d  = buffers.get("1d", [])
     buf_eth = buffers.get("eth_15m", [])
 
+    logger.debug("decide : target_open_ms=%d buffers={1h:%d, 5m:%d, 30m:%d, 4h:%d, "
+                 "1d:%d, eth_15m:%d}", ts_ms, len(buf_1h), len(buf_5m), len(buf_30m),
+                 len(buf_4h), len(buf_1d), len(buf_eth))
+
     # --- Buckets de calibration -------------------------------------------- #
     buckets = compute_buckets(buf_1h, ts_ms)
     volatility_state = buckets["volatility_state"]
     is_weekend = buckets["is_weekend"]
     hour = buckets["hour"]
+    logger.debug("decide : buckets vol_state=%d is_weekend=%d hour=%d isoweekday=%d",
+                 volatility_state, is_weekend, hour, buckets["isoweekday"])
 
     # --- Validation STRUCTURELLE (AVANT build_features ET predict_proba) ---- #
     # OHLC corrompu / troue / buffer trop court / bougie cible absente => on
@@ -455,7 +527,10 @@ def decide(buffers: dict, target_open_ms: int) -> dict:
     import validate as _validate  # live_helpers sur sys.path (cf _import_feature_builders)
     ok_struct, reasons = _validate.validate_structural(buf_1h, buf_eth, ts_ms)
     if not ok_struct:
+        logger.warning("decide : validation STRUCTURELLE echouee -> PASS. Raisons: %s",
+                       "; ".join(reasons))
         return _pass_invalid(reasons, volatility_state, is_weekend, hour)
+    logger.debug("decide : validation structurelle OK.")
 
     # --- Features (memes signatures que le contrat features_up/down) -------- #
     feats_up = feat_up_mod.build_features(
@@ -465,10 +540,15 @@ def decide(buffers: dict, target_open_ms: int) -> dict:
         buf_1h, buf_5m, buf_30m, buf_4h, buf_1d, buf_eth, ts_ms
     )
 
+    logger.debug("decide : features construites (up=%d, down=%d champs).",
+                 len(feats_up), len(feats_dn))
+
     # --- Validation des FEATURES (toutes finies, ef_* ETH compris) ---------- #
     # Une feature NaN/inf (ex: ETH manquant -> ef_*) => pas de prediction.
     ok_feat, reasons = _validate.validate_features(feats_up, feats_dn)
     if not ok_feat:
+        logger.warning("decide : validation FEATURES echouee -> PASS. Raisons: %s",
+                       "; ".join(reasons))
         return _pass_invalid(reasons, volatility_state, is_weekend, hour)
 
     X_up = _vectorize(feats_up, FEATURES_UP, "up")
@@ -477,6 +557,7 @@ def decide(buffers: dict, target_open_ms: int) -> dict:
     # --- Probabilites ------------------------------------------------------- #
     p_up = float(_model_up.predict_proba(X_up)[0, 1])
     p_dn = float(_model_down.predict_proba(X_dn)[0, 1])
+    logger.debug("decide : probas p_up=%.6f p_dn=%.6f", p_up, p_dn)
 
     # --- Seuils effectifs (chacun avec SON sidecar + SON cfg) --------------- #
     th_up = bucket_threshold(_sidecar_up, _cfg_up, volatility_state, is_weekend, ts_ms)
@@ -484,15 +565,35 @@ def decide(buffers: dict, target_open_ms: int) -> dict:
 
     take_up = bool(p_up >= th_up)
     take_dn = bool(p_dn >= th_dn)
+    logger.debug("decide : seuils th_up=%.6f (take_up=%s) th_dn=%.6f (take_dn=%s)",
+                 th_up, take_up, th_dn, take_dn)
 
-    # --- Filtre cross-model (sidecar DOWN) ---------------------------------- #
-    # Si le sidecar DOWN porte max_p_up_runtime < 1.0, on rejette le pari DOWN
-    # quand le p_up live depasse ce plafond (le modele UP "contredit" le DOWN).
-    max_p_up_rt = float(_sidecar_down.get("max_p_up_runtime", 1.0))
-    if max_p_up_rt < 1.0 and p_up >= max_p_up_rt:
-        take_dn = False
+    # ========================================================================
+    # Filtres d'ENTREE — PORT A L'IDENTIQUE de modele_team/main.py + config_team
+    # (campagne 500%/cote 2026-07-01). Meme ORDRE que le backtest :
+    #   1. UP_DROP_HOURS + DOWN_CONF_DELTA (niveau modele, PRE-coherence)
+    #   2. UP_XMODEL (PRE-coherence, sur le take_up deja filtre par 1.)
+    #   3. regle de coherence
+    #   4. DMI (POST-coherence, direction survivante uniquement)
+    #   5. UP_CONF_MIN (POST-coherence, UP seulement)
+    # ========================================================================
+    filtered_reason = None
 
-    # --- Regle de coherence d'equipe --------------------------------------- #
+    # --- 1a. UP : drop heures (session asiatique/overnight) ----------------- #
+    if take_up and hour in _cfg_team.UP_DROP_HOURS:
+        take_up = False
+        filtered_reason = "up_drop_hours"
+
+    # --- 1b. DOWN : selectivite (short ssi P(down) >= seuil + delta) -------- #
+    if _cfg_team.DOWN_CONF_DELTA:
+        take_dn = bool(p_dn >= th_dn + _cfg_team.DOWN_CONF_DELTA)
+
+    # --- 2. UP : filtre cross-model (long ssi P(down) < UP_XMODEL_MAX_PDOWN) #
+    if take_up and _cfg_team.UP_XMODEL_FILTER_ENABLED and p_dn >= _cfg_team.UP_XMODEL_MAX_PDOWN:
+        take_up = False
+        filtered_reason = "up_xmodel"
+
+    # --- 3. Regle de coherence d'equipe -------------------------------------- #
     if take_up and not take_dn:
         team = "UP"
     elif take_dn and not take_up:
@@ -501,6 +602,27 @@ def decide(buffers: dict, target_open_ms: int) -> dict:
         team = "CANCEL"
     else:
         team = "PASS"
+
+    # --- 4. DMI (Wilder, 4h) : annule la direction survivante si elle contredit
+    #        le DMI de la bougie de DECISION (match EXACT ts, cf _dmi_at). ---- #
+    if _cfg_team.DMI_FILTER_ENABLED and team in ("UP", "DOWN"):
+        plus_di, minus_di = _dmi_at(buf_4h, ts_ms, _cfg_team.DMI_LENGTH)
+        if not (np.isnan(plus_di) or np.isnan(minus_di)):
+            if team == "DOWN" and "down" in _cfg_team.DMI_SIDES and plus_di > minus_di:
+                team = "PASS"
+                filtered_reason = "dmi"
+            elif team == "UP" and "up" in _cfg_team.DMI_SIDES and minus_di > plus_di:
+                team = "PASS"
+                filtered_reason = "dmi"
+
+    # --- 5. UP : confiance minimale (P(up) >= UP_CONF_MIN) ------------------- #
+    if _cfg_team.UP_CONF_FILTER_ENABLED and team == "UP" and p_up < _cfg_team.UP_CONF_MIN:
+        team = "PASS"
+        filtered_reason = "up_conf_min"
+
+    logger.info("decide : team=%s (p_up=%.4f/th=%.4f, p_dn=%.4f/th=%.4f, "
+                "vol_state=%d, wknd=%d, hour=%d, filtered_reason=%s)", team, p_up, th_up,
+                p_dn, th_dn, volatility_state, is_weekend, hour, filtered_reason)
 
     return {
         "p_up": p_up,
@@ -513,6 +635,7 @@ def decide(buffers: dict, target_open_ms: int) -> dict:
         "is_weekend": is_weekend,
         "hour": hour,
         "team": team,
+        "filtered_reason": filtered_reason,
         "data_valid": True,
         "invalid_reasons": [],
     }

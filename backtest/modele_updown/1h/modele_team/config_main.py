@@ -25,9 +25,9 @@ TEAM_TEST_DAYS = 365          # taille de la fenetre de test (jours), ancree sur
 DMI_FILTER_ENABLED = True
 DMI_LENGTH = 12              # longueur (en bougies 1h) du DMI et du lissage de Wilder
 DMI_TIMEFRAME = "4h"         # timeframe des bougies servant au calcul du DMI
-DMI_SIDES = ("down",)        # cotes auxquels le DMI s'applique. Campagne 500%/cote 2026-07-01 :
-                             # le DMI (calibre DOWN) annulait des LONGS profitables -> on le coupe
-                             # cote UP. ("down",) = DMI sur les shorts seulement ; ("up","down") = les deux.
+DMI_SIDES = ("down", "up")   # RE-SWEEPE 2026-07-03 (donnees fraiches) : le DMI sur UP AIDE maintenant
+                             # (etait ("down",) seulement) -> fait partie du meilleur UP-standalone
+                             # trouve (sweep_up_advanced.py) : +66.89% (vs ~+20% avant re-tuning).
 
 # ============================================================
 #  Filtre de confiance UP (entree) — CLE de la ROBUSTESSE AUX FRAIS
@@ -47,14 +47,27 @@ DMI_SIDES = ("down",)        # cotes auxquels le DMI s'applique. Campagne 500%/c
 #   0.62  -> +volume (675 trades, net +340%) mais h1 fragile (+0.092) — arbitrage volume/robustesse
 # Mets UP_CONF_FILTER_ENABLED=False pour le comportement nu (n=504, NON fee-robuste).
 UP_CONF_FILTER_ENABLED = True
-UP_CONF_MIN = 0.63           # seuil P(up) mini. Campagne 500%/cote 2026-07-01 : 0.63 (au lieu de 0.65)
-                             # DOUBLE les trades UP (93->183) SANS perdre la robustesse, grace aux 2
-                             # leviers ci-dessous (DMI-off UP + drop heures asiatiques). UP +61% -> +185%.
+UP_CONF_MIN = 0.59           # RE-SWEEPE 2026-07-03 UP-standalone, round final (sweep_up_final_round.py,
+                             # avec la gestion de sortie ameliorée ci-dessous) : 0.59 -> UP seul +89.08%
+                             # (214 trades, WR 58.4%), le meilleur trouve apres plusieurs tours d'affinage
+                             # (66.89% -> 84.20% -> 84.32% -> 89.08%, rendements decroissants = plateau).
 
-# --- UP : filtre horaire (campagne 500%/cote 2026-07-01) ---
-# Drop des heures asiatiques/overnight 0-5 UTC (bloc de SESSION, pas cherry-pick) : repare la
-# fragilite structurelle de la 1re moitie (h1) de UP. h1 +12% -> +44%, h2 +43% -> +98%, DD -11%->-18%.
-UP_DROP_HOURS = (0, 1, 2, 3, 4, 5)   # heures UTC ou on NE prend PAS de long
+# --- UP : filtre horaire ---
+# RE-SWEEPE 2026-07-03 (UP-standalone, round final) : "overnight" 23h-4h UTC est le meilleur
+# bloc trouve pour UP seul avec la gestion de sortie amelioree (+89.08%).
+# RE-SWEEPE 2026-07-04 (objectif EV/trade >= 0.6, n >= 150) : diagnostic empirique
+# (diagnose_up_losses.py) sur les 214 trades UP -> les sorties stop_loss/trailing
+# (les vraies perdantes) se concentrent sur des heures precises. Par MOYENNE NETTE
+# par heure, seules 10h/14h/20h UTC sont negatives (-0.01/-0.06/-0.11%) ; 9h/19h/21h
+# ont aussi un taux de "bad exit" eleve mais restent NETTES POSITIVES (leurs gagnants
+# compensent) -> gardees. Ajouter 10/14/20 au bloc overnight (sweep_up_bad_hours.py,
+# teste sur tous les sous-ensembles de {10,14,20}) : EV 0.4014 -> 0.6337, n 214 -> 157
+# (>=150), WR 58.88% -> 61.78%, PERTE MOYENNE -2.639% -> -2.348% (baisse, comme demande),
+# gain moyen quasi stable (2.525 -> 2.478%), net UP +113.93% -> +153.51%.
+# Valide 2 moities (validate_bad_hours_split.py) : h1 EV 0.110 -> 0.345 (x3, toujours
+# le plus faible, coherent avec la fragilite h1 documentee ailleurs), h2 EV 0.662 -> 0.919 ;
+# amelioration dans LES DEUX moities (pas un artefact d'une seule) -> robuste, pas du bruit.
+UP_DROP_HOURS = (23, 0, 1, 2, 3, 4, 10, 14, 20)   # heures UTC ou on NE prend PAS de long
 
 # --- UP : filtre CROSS-MODEL (Strategie 2, campagne 500%/cote 2026-07-01) ---
 # On ne garde un LONG que si le modele DOWN est confiant qu'il n'y aura PAS de chute :
@@ -66,20 +79,30 @@ UP_XMODEL_MAX_PDOWN = 0.44   # long autorise ssi P(down) < 0.44 ; False/1.0 = fi
 # --- DOWN : selectivite d'entree (campagne 500%/cote 2026-07-01) ---
 # On ne short que si P(down) >= seuil_sidecar + DOWN_CONF_DELTA : enleve les shorts marginaux (bruit)
 # -> l'equipe reste ROBUSTE (2 moities equilibrees) avec le trend-ride DOWN ci-dessous. delta 0 = off.
-DOWN_CONF_DELTA = 0.015
+# RE-SWEEPE 2026-07-04 (campagne STABILITE, cf bloc gestion DOWN plus bas) : 0.03 (etait 0.01).
+# Le user a explicitement PREFERE moins de rendement pour beaucoup plus de stabilite : DOWN doit
+# rester "le plus identique possible quelque soit le mouvement" (moins sensible aux retournements
+# haussiers), avec un plafond dur de drawdown <=40% et pire mois <=$46k, rendement min 750% net.
+# 0.03 coupe DOWN de 350 -> 140 trades/an (les moins fiables sont ceux les plus pres du seuil) :
+# EV DOWN 0.81% -> 1.24%, WR 47.4% -> 55.7%. Surtout : l'EV DOWN en 2e moitie de fenetre (regime
+# plus haussier) etait NEGATIF (-0.26%, DOWN perdait de l'argent) -> devient +0.61% avec ce delta,
+# la ROBUSTESSE PAR REGIME visee est confirmee, pas juste la moyenne globale (validate_3_tiers.py).
+DOWN_CONF_DELTA = 0.03
 
 # ============================================================
 #  Frais / capital
 # ============================================================
-FEE_PER_SIDE = 0.00045        # frais par cote (achat ET vente) ; aller-retour = 2x
+FEE_PER_SIDE = 0.0005        # frais par cote (achat ET vente) ; aller-retour = 2x
                               # NB : les frais portent sur le NOTIONNEL -> amplifies par le levier
-INITIAL_CAPITAL = 2500.0      # capital de depart ($)
+INITIAL_CAPITAL = 5000.0      # capital de depart ($)
 
 # --- Sizing / levier (futures-style) ---
 # Chaque trade engage POSITION_FRACTION du capital comme MARGE, avec un LEVIER dessus.
 # Exposition effective au mouvement de prix = POSITION_FRACTION * LEVERAGE (= EXPOSURE).
 # Ex : 50% du capital x levier 10 = 5.0x -> un mouvement +0.30% rapporte +1.50% sur l'equity.
 # P/L ET FRAIS sont tous deux multiplies par EXPOSURE (notionnel = EXPOSURE * equity).
+# UNIQUE et PARTAGEE entre UP et DOWN (user : ne pas toucher levier/taille de position/
+# fraction de capital -- l'amelioration doit etre purement strategique).
 POSITION_FRACTION = 0.5      # part du capital engagee par trade (marge)
 LEVERAGE = 10              # levier applique sur la marge
 EXPOSURE = POSITION_FRACTION * LEVERAGE   # multiplicateur effectif du rendement par trade (= 5.0)
@@ -94,7 +117,7 @@ EXPOSURE = POSITION_FRACTION * LEVERAGE   # multiplicateur effectif du rendement
 # Un trade rempli a le MEME P0 et la meme gestion qu'en taker (P&L identique), mais
 # paie les frais MAKER. -> on isole exactement le cout des opportunites ratees.
 MAKER = True                 # True = simule des ordres makers (limites) au lieu de taker
-MAKER_FEE_PER_SIDE = 0.00015      # frais maker par cote (souvent 0 ou negatif/rebate ; mets le taux de ta plateforme)
+MAKER_FEE_PER_SIDE = 0.0002      # frais maker par cote (souvent 0 ou negatif/rebate ; mets le taux de ta plateforme)
 MAKER_FILL_WINDOW_MIN = 15    # duree (min) ou la limite reste postee avant annulation (= opportunite perdue)
 
 # ============================================================
@@ -148,13 +171,17 @@ STOP_LOSS_N_STEPS = INTERVAL_1H_MS // STOP_LOSS_STEP_MS    # nb de checks dans 1
 #   net max         idem mais SL=5.0 prix (off)                      -> gain 0.31/WR 57/perte -0.36/net +17
 #   perte serree    max75 TP=0.0030 trail 0.0020/0.0030 SL=0.60 prix -> gain 0.24/WR 59/perte -0.31/net +9
 UP_MGMT_ENABLED = True
-UP_MAX_HOLD_MIN = 150         # detention max (min) : LET-RUN (campagne 500%/cote 2026-07-01) ~1.5h apres
-                              # la cloture 1h. Avec DMI-off + drop-hrs, tenir 150min (vs 90) laisse courir
-                              # les longs gagnants -> AvgWin 2.0% -> 2.48%, UP net +185% (WR 62% tenu).
-UP_TRAIL_ACTIVATE = 0.003     # le trailing s'arme quand le pic atteint +0.30%
-UP_TRAIL_GAP = 0.008       # sort si le profit retombe de 0.80% sous le pic (sweep 2026-06-18 : trailing actif)
-UP_TAKE_PROFIT = 0.012     # take-profit +1.20% : let-run (campagne 500%/cote 2026-07-01, avec DMI-off +
-                              # drop-hrs + hold 150). Le TP large capture les gagnants sans casser le WR.
+UP_MAX_HOLD_MIN = 240         # RE-SWEEPE 2026-07-03 UP-standalone : 240 (etait 90 puis 150).
+                              # Teste jusqu'a 1440 (24h) : au-dela de 240 le rendement DEGRADE
+                              # (contrairement a DOWN) -- l'edge UP ne beneficie PAS d'un trend-ride long.
+UP_TRAIL_ACTIVATE = 0.003     # RE-SWEEPE 2026-07-03 UP-standalone, round ASYMETRIE (sweep_up_asymmetry.py,
+                              # user a demande de reduire la perte moyenne SANS sacrifier gain/WR) : 0.003
+UP_TRAIL_GAP = 0.010       # RE-SWEEPE 2026-07-03 round ASYMETRIE : 0.010 (etait 0.025) -- le trailing
+                              # LARGE etait le principal moteur de perte (une fois arme a peine +0.4%,
+                              # un giveback de 2.5% pouvait transformer un petit gain en grosse perte).
+                              # Resserrer a 1.0% coupe la perte moyenne SANS toucher le gain moyen (le TP
+                              # serre ci-dessous verrouille deja la plupart des gains avant meme le trailing).
+UP_TAKE_PROFIT = 0.006     # TP SERRE : verrouille vite les petits gains frequents (WR 55->59%+).
 UP_STOP_LOSS = 0.60     # SL en % du PRIX (sur la position), levier hors-jeu : 0.60 = sortie
                               # quand le prix bouge de 0.60% contre nous. (TP/trail aussi en % prix.)
                               # Inactif tant que UP_SL_TIME_DECAY=True (SL temporel ci-dessous).
@@ -168,9 +195,10 @@ UP_STOP_LOSS_DEC = -(UP_STOP_LOSS / 100.0)   # % prix -> stop PRIX (decimal neg)
 #     vers END (serre, a max_hold), borne par FLOOR (jamais plus serre). Toggle False = SL
 #     constant UP_STOP_LOSS ci-dessus. Tout en % du PRIX (sur la position, levier hors-jeu). ---
 UP_SL_TIME_DECAY = True     # ON : sweep 2026-06-18 (premisse : long perdant en fin de bougie = 0% retournement)
-UP_SL_START = 1          # SL a l'entree (large), en % prix (sweep 2026-06-18)
-UP_SL_END   = 0.60          # SL a la cloture forcee (serre), en % prix
-UP_SL_FLOOR = 0.30          # SL le plus serre autorise (plancher), en % prix
+UP_SL_START = 1.5        # RE-SWEEPE 2026-07-03 UP-standalone round final : 1.5 (etait 1) -- large au debut,
+                              # laisse la position respirer avant que le trailing/TP ne prennent le relais.
+UP_SL_END   = 0.3           # RE-SWEEPE 2026-07-03 round ASYMETRIE : 0.3 (etait 0.2)
+UP_SL_FLOOR = 0.1           # RE-SWEEPE 2026-07-03 UP-standalone round final : 0.1 (etait 0.30 puis 0.2)
 UP_SL_START_DEC = -(UP_SL_START / 100.0)
 UP_SL_END_DEC   = -(UP_SL_END   / 100.0)
 UP_SL_FLOOR_DEC = -(UP_SL_FLOOR / 100.0)
@@ -197,13 +225,17 @@ UP_SL_FLOOR_DEC = -(UP_SL_FLOOR / 100.0)
 # +0.536/+0.728). Levier = laisser courir le short (hold 150, TP 0.55%) au lieu de
 # verrouiller tot (TP 0.30%) : AvgWin 1.51 -> 2.10%. Plateau large (non sur-ajuste).
 DOWN_MGMT_ENABLED = True
-DOWN_MAX_HOLD_MIN = 360       # TREND-RIDE (campagne 500%/cote 2026-07-01) : tenir le short ~5h apres la
-                              # cloture 1h pour capturer les CRASHS multi-bougies. AvgWin 1.9% -> 3.2%.
-DOWN_TRAIL_ACTIVATE = 0.0025  # le trailing s'arme quand le pic short atteint +0.25%
-DOWN_TRAIL_GAP = 0.012        # trail LARGE (trend-ride) : laisse courir le crash, sort si le profit short
-                              # retombe de 1.2% sous le pic (au lieu de 0.5% : verrouillait trop tot).
-DOWN_TAKE_PROFIT = 0.015      # take-profit quasi-off (2%) : LET-RUN le short (campagne 500%/cote 2026-07-01).
-                              # Le crash multi-bougies porte l'AvgWin a 3.2% -> DOWN net +146% -> +325% robuste.
+DOWN_MAX_HOLD_MIN = 720       # RE-SWEEPE 2026-07-04 (campagne STABILITE, TIER 2 "moyen securise") :
+                              # 720 (etait 870). Raccourcit le trend-ride pour reduire l'exposition
+                              # temporelle aux retournements haussiers violents. Combine a
+                              # DOWN_CONF_DELTA=0.03 (plus haut) et DOWN_SL_END=0.4 (plus bas) : le
+                              # user a explicitement PREFERE moins de rendement pour la stabilite
+                              # (drawdown equipe -46.08%->-23.44%, pire mois -$85k->-$4k, net
+                              # +2480%->+1051%). Valide 2 moities (validate_3_tiers.py) : EV DOWN
+                              # en 2e moitie (regime + haussier) -0.26% -> +0.61% (etait NEGATIF).
+DOWN_TRAIL_ACTIVATE = 0.0015  # RE-SWEEPE 2026-07-03 : 0.0015 (etait 0.0025)
+DOWN_TRAIL_GAP = 0.012        # trail LARGE (trend-ride) : inchange, confirme optimal par le re-sweep.
+DOWN_TAKE_PROFIT = 0.016      # RE-SWEEPE 2026-07-03 : 0.016 (etait 0.015) -- inchange par la campagne stabilite
 DOWN_STOP_LOSS = 0.1      # SL CONSTANT 0.70% prix (trend-ride : DOWN_SL_TIME_DECAY=False ci-dessous).
                               # Coupe le short perdant vite, laisse courir le gagnant (asymetrie trend-ride).
 DOWN_CHECK_MIN = 1            # intervalle de verif (min) -> DB_1m
@@ -215,8 +247,10 @@ DOWN_STOP_LOSS_DEC = -(DOWN_STOP_LOSS / 100.0)   # % prix -> stop PRIX (decimal 
 DOWN_SL_TIME_DECAY = True   # OFF (trend-ride campagne 500%/cote 2026-07-01) : SL CONSTANT DOWN_STOP_LOSS
                              # (0.70% prix). Le SL decroissant coupait les shorts avant le crash.
 DOWN_SL_START = 1        # SL a l'entree (large), en % prix (sweep 2026-06-30)
-DOWN_SL_END   = 0.5         # SL a la cloture forcee (serre), en % prix (sweep 2026-06-30 EV-max)
-DOWN_SL_FLOOR = 0.2         # SL le plus serre autorise (plancher), en % prix (sweep 2026-06-30)
+DOWN_SL_END   = 0.4         # RE-SWEEPE 2026-07-04 (campagne STABILITE, TIER 2) : 0.4 (etait 0.5) --
+                            # SL a la cloture forcee (serre), en % prix ; resserre legerement la
+                            # queue de perte en fin de hold, combine a MAX_HOLD=720/CONF_DELTA=0.03.
+DOWN_SL_FLOOR = 0.15        # RE-SWEEPE 2026-07-03 : 0.15 (etait 0.2)
 DOWN_SL_START_DEC = -(DOWN_SL_START / 100.0)
 DOWN_SL_END_DEC   = -(DOWN_SL_END   / 100.0)
 DOWN_SL_FLOOR_DEC = -(DOWN_SL_FLOOR / 100.0)

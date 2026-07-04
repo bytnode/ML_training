@@ -68,13 +68,18 @@ def send_position_opened(side, entry, vol, notional):
     )
 
 
-def send_position_closed(side, exit_reason, entry, exit_price, pp, pnl_usdc, balance):
+def send_position_closed(side, exit_reason, entry, exit_price, pp, pnl_usdc, balance,
+                         mfe_pp=0.0, mae_pp=0.0, mfe_usdc=0.0, mae_usdc=0.0):
     sign = "✅" if pnl_usdc >= 0 else "❌"
     arrow = "LONG" if side == "up" else "SHORT"
     _send_main(
         f"{sign} <b>{arrow} fermée</b> — <i>{exit_reason}</i>\n"
         f"entrée <code>{entry:.2f}</code> → sortie <code>{exit_price:.2f}</code>\n"
         f"mouvement: <b>{pp * 100:+.3f}%</b> prix\n"
+        f"📈 plus haut profit atteint: <b>{mfe_pp * 100:+.3f}%</b> "
+        f"(<b>{mfe_usdc:+.2f} USDT</b>)\n"
+        f"📉 plus forte perte atteinte: <b>{mae_pp * 100:+.3f}%</b> "
+        f"(<b>{mae_usdc:+.2f} USDT</b>)\n"
         f"PnL: <b>{pnl_usdc:+.2f} USDT</b>\n"
         f"solde: <b>{balance:.2f} USDT</b>"
     )

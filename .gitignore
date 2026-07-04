@@ -1,17 +1,6 @@
 # ============================================================
-#  Model artifacts (regenerable via train.py)
-# ============================================================
-btc_reversal_model.json
-btc_reversal_model.thresholds.json
-btc_updown_model.json
-btc_updown_model.thresholds.json
-aure.json
-aure.thresholds.json
-
-# ============================================================
 #  Datasets, logs, databases (regenerable or big)
 # ============================================================
-*.csv
 *.parquet
 *.db
 *.sqlite
