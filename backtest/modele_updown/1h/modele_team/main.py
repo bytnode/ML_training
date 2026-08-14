@@ -57,8 +57,11 @@ if _PKG_PARENT not in sys.path:
 
 from modele_up import api as api_up
 from modele_down import api as api_down
+from regime import config_regime as cfg_regime
 import detailed_log
 import full_logs
+import filters
+import okx_fees
 
 ROOT = Path(__file__).resolve().parent
 LOGS_DIR = ROOT / "logs"
@@ -69,19 +72,29 @@ TRADES_CSV = LOGS_DIR / "trades.csv"
 from config_main import (
     TEAM_TEST_DAYS, DAY_MS, INTERVAL_1H_MS,
     FEE_PER_SIDE, INITIAL_CAPITAL, POSITION_FRACTION, LEVERAGE, EXPOSURE,
-    STOP_LOSS_ENABLED, STOP_LOSS_PCT, STOP_LOSS_SIDES,
-    STOP_LOSS_CHECK_MIN, STOP_LOSS_STEP_MS, STOP_LOSS_N_STEPS,
     UP_MGMT_ENABLED, UP_MAX_STEPS, UP_STEP_MS, UP_CHECK_MIN,
-    UP_TRAIL_ACTIVATE, UP_TRAIL_GAP, UP_TAKE_PROFIT, UP_STOP_LOSS, UP_STOP_LOSS_DEC,
-    UP_SL_TIME_DECAY, UP_SL_START_DEC, UP_SL_END_DEC, UP_SL_FLOOR_DEC,
-    UP_SKIP_BUCKETS,
+    UP_TRAIL_ACTIVATE, UP_TRAIL_GAP, UP_TAKE_PROFIT,
+    UP_SL_START_DEC, UP_SL_END_DEC, UP_SL_FLOOR_DEC,
+    UP_SL_START_PCT, UP_SL_END_PCT, UP_SL_FLOOR_PCT,
     DOWN_MGMT_ENABLED, DOWN_MAX_STEPS, DOWN_STEP_MS,
-    DOWN_TRAIL_ACTIVATE, DOWN_TRAIL_GAP, DOWN_TAKE_PROFIT, DOWN_STOP_LOSS, DOWN_STOP_LOSS_DEC,
-    DOWN_SL_TIME_DECAY, DOWN_SL_START_DEC, DOWN_SL_END_DEC, DOWN_SL_FLOOR_DEC,
+    DOWN_TRAIL_ACTIVATE, DOWN_TRAIL_GAP, DOWN_TAKE_PROFIT,
+    DOWN_SL_START_DEC, DOWN_SL_END_DEC, DOWN_SL_FLOOR_DEC,
+    DOWN_SL_START_PCT, DOWN_SL_END_PCT, DOWN_SL_FLOOR_PCT,
     MAKER, MAKER_FEE_PER_SIDE, MAKER_FILL_WINDOW_MIN,
     DMI_FILTER_ENABLED, DMI_LENGTH, DMI_TIMEFRAME, DMI_SIDES,
     UP_CONF_FILTER_ENABLED, UP_CONF_MIN, UP_DROP_HOURS, DOWN_CONF_DELTA,
     UP_XMODEL_FILTER_ENABLED, UP_XMODEL_MAX_PDOWN,
+    MAX_CONCURRENT_POSITIONS, MAX_CONCURRENT_POSITIONS_PER_SIDE,
+    WIDEN_ON_PROFIT_ENABLED,
+    UP_WIDEN_TP_MULT, UP_WIDEN_TRAIL_GAP_MULT, UP_WIDEN_MAX_HOLD_MULT,
+    DOWN_WIDEN_TP_MULT, DOWN_WIDEN_TRAIL_GAP_MULT, DOWN_WIDEN_MAX_HOLD_MULT,
+    UP_RATCHET_STEPS, DOWN_RATCHET_STEPS, RATCHET_SCALES_WITH_WIDEN,
+    UP_RATCHET_PROP, DOWN_RATCHET_PROP,
+    DOWN_TPEXT_ENABLED, DOWN_TPEXT_REGIMES, DOWN_TPEXT_MAX_ER,
+    DOWN_TPEXT_SWING_P, DOWN_TPEXT_HARD_GUARD_DEC,
+    CHOP_SCALP_ENABLED, CHOP_DOWN_TP, CHOP_DOWN_MAX_STEPS, CHOP_DOWN_TRAIL_GAP,
+    CHOP_DOWN_TRAIL_ACTIVATE, CHOP_UP_SL_START_DEC, CHOP_UP_SL_FLOOR_DEC,
+    CHOP_DOWN_ENABLED, DOWN_WIDEN_ENABLED,
 )
 
 
@@ -116,131 +129,7 @@ def _taken_bets(full: pd.DataFrame, direction: str) -> pd.DataFrame:
     return taken[cols].reset_index(drop=True)
 
 
-def build_team_bets(up_bets: pd.DataFrame, down_bets: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    """Apply the coherence rule. Returns (team_bets, cancelled_count)."""
-    up_ts = set(up_bets["timestamp"]) if not up_bets.empty else set()
-    down_ts = set(down_bets["timestamp"]) if not down_bets.empty else set()
-
-    cancelled = up_ts & down_ts
-    coherent_up_ts = up_ts - down_ts
-    coherent_down_ts = down_ts - up_ts
-
-    kept_up = up_bets[up_bets["timestamp"].isin(coherent_up_ts)]
-    kept_down = down_bets[down_bets["timestamp"].isin(coherent_down_ts)]
-
-    team = pd.concat([kept_up, kept_down], ignore_index=True)
-    if not team.empty:
-        team = team.sort_values("timestamp").reset_index(drop=True)
-    return team, len(cancelled)
-
-
-# ----------------------------------------------------------------------------
-#  Filtre DMI (Directional Movement Index) Wilder sur le TF 1h
-# ----------------------------------------------------------------------------
-def _wilder_dmi(high, low, close, n: int):
-    """+DI / -DI de Wilder (longueur n), alignes bougie a bougie sur les entrees.
-
-    +DI[i] / -DI[i] n'utilisent que les bougies <= i (high/low/close de i et i-1,
-    puis lissage recursif) -> connus a la cloture de la bougie i. Renvoie 2 arrays
-    (NaN sur les premieres bougies / le warmup). On ne compare que le SIGNE de
-    (+DI - -DI), donc le seed exact du lissage est sans incidence apres rodage.
-    """
-    h = np.asarray(high, dtype=float)
-    l = np.asarray(low, dtype=float)
-    cl = np.asarray(close, dtype=float)
-    m = len(h)
-    plus = np.full(m, np.nan)
-    minus = np.full(m, np.nan)
-    if m < 2:
-        return plus, minus
-    up_move = h[1:] - h[:-1]
-    down_move = l[:-1] - l[1:]
-    plus_dm = np.where((up_move > down_move) & (up_move > 0.0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0.0), down_move, 0.0)
-    prev_close = cl[:-1]
-    tr = np.maximum.reduce([h[1:] - l[1:],
-                            np.abs(h[1:] - prev_close),
-                            np.abs(l[1:] - prev_close)])
-
-    def _rma(x):  # lissage de Wilder = EMA recursive alpha=1/n (adjust=False)
-        return pd.Series(x).ewm(alpha=1.0 / n, adjust=False).mean().to_numpy()
-
-    atr = _rma(tr)
-    s_plus = _rma(plus_dm)
-    s_minus = _rma(minus_dm)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        plus[1:] = 100.0 * s_plus / atr
-        minus[1:] = 100.0 * s_minus / atr
-    return plus, minus
-
-
-def _load_dmi_1h() -> dict[int, tuple[float, float]]:
-    """Map open-time (ms) -> (+DI, -DI) du DMI Wilder(DMI_LENGTH) sur les bougies
-    DMI_TIMEFRAME (1h). OHLC reconstruit depuis la table `candles` du package
-    modele_down : close est absolu, et *_ret = (val - close_prev)/close_prev, donc
-        close_prev = close / (1 + close_ret)
-        high = close_prev*(1+high_ret) ; low = close_prev*(1+low_ret).
-    Couvre tout l'historique (la fenetre de test est un sous-ensemble)."""
-    down_dir = Path(api_down.__file__).resolve().parent
-    db_path = next((p for p in (down_dir / "db" / "btc_multi_tf.db",
-                                down_dir / "DB" / "btc_multi_tf.db") if p.exists()), None)
-    if db_path is None:
-        raise FileNotFoundError(
-            f"SQLite candles introuvable sous {down_dir} (db/ ou DB/). Lance data.py."
-        )
-    con = sqlite3.connect(str(db_path))
-    try:
-        c = pd.read_sql_query(
-            "SELECT timestamp_ms, close, close_ret, high_ret, low_ret "
-            "FROM candles WHERE timeframe=? ORDER BY timestamp_ms",
-            con, params=(DMI_TIMEFRAME,))
-    finally:
-        con.close()
-    c = c.dropna(subset=["close", "close_ret", "high_ret", "low_ret"]).reset_index(drop=True)
-    close = c["close"].to_numpy(dtype=float)
-    close_prev = close / (1.0 + c["close_ret"].to_numpy(dtype=float))
-    high = close_prev * (1.0 + c["high_ret"].to_numpy(dtype=float))
-    low = close_prev * (1.0 + c["low_ret"].to_numpy(dtype=float))
-    plus_di, minus_di = _wilder_dmi(high, low, close, DMI_LENGTH)
-    ts = c["timestamp_ms"].astype("int64").to_numpy()
-    return {int(t): (float(p), float(mi)) for t, p, mi in zip(ts, plus_di, minus_di)}
-
-
-def _apply_dmi_filter(team_bets: pd.DataFrame) -> tuple[pd.DataFrame, int, int]:
-    """Annule les paris dont le sens contredit le DMI 1h de la bougie de DECISION.
-        - pari DOWN annule si +DI > -DI ; pari UP annule si -DI > +DI.
-    +DI == -DI (egalite) ou warmup (NaN) ou bougie inconnue -> on GARDE le pari.
-    Renvoie (team_bets_filtre, n_removed_up, n_removed_down)."""
-    if not DMI_FILTER_ENABLED or team_bets.empty:
-        return team_bets, 0, 0
-    dmi_map = _load_dmi_1h()
-    keep = np.ones(len(team_bets), dtype=bool)
-    removed_up = removed_down = 0
-    for idx, b in enumerate(team_bets.itertuples(index=False)):
-        di = dmi_map.get(int(b.timestamp))
-        if di is None:
-            continue                                 # bougie inconnue -> pas d'info, on garde
-        pdi, mdi = di
-        if np.isnan(pdi) or np.isnan(mdi):
-            continue                                 # warmup -> on garde
-        if b.direction == "down" and "down" in DMI_SIDES and pdi > mdi:
-            keep[idx] = False
-            removed_down += 1
-        elif b.direction == "up" and "up" in DMI_SIDES and mdi > pdi:
-            keep[idx] = False
-            removed_up += 1
-    return team_bets[keep].reset_index(drop=True), removed_up, removed_down
-
-
-def _apply_conf_filter(team_bets: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    """Annule les paris UP dont la confiance P(up) < UP_CONF_MIN. DOWN inchange.
-    La colonne `confidence` (= P(direction)) est portee par chaque pari depuis
-    l'api du modele. Renvoie (team_bets_filtre, n_removed_up)."""
-    if not UP_CONF_FILTER_ENABLED or team_bets.empty:
-        return team_bets, 0
-    drop = (team_bets["direction"] == "up") & (team_bets["confidence"] < UP_CONF_MIN)
-    removed = int(drop.sum())
-    return team_bets[~drop].reset_index(drop=True), removed
+build_team_bets = filters.build_team_bets
 
 
 # ----------------------------------------------------------------------------
@@ -271,10 +160,11 @@ def _load_body_returns() -> dict[int, float]:
 
 
 def _load_intrabar_prices():
-    """Renvoie (open_by_ts, close_by_ts) des sous-bougies pour verifier le SL a
-    chaque STOP_LOSS_CHECK_MIN minutes. Source : DB_<m>m/btc_<m>m.parquet (OHLCV
-    brut, m = STOP_LOSS_CHECK_MIN). None si absent (SL ignore, sortie classique)."""
-    m = STOP_LOSS_CHECK_MIN
+    """Renvoie (open_by_ts, close_by_ts) des sous-bougies pour les sorties gerees
+    UP/DOWN (TP/trailing/SL temporel). Source : DB_<m>m/btc_<m>m.parquet (OHLCV
+    brut, m = UP_CHECK_MIN = DOWN_CHECK_MIN = 1). None si absent (sortie classique
+    a la cloture 1h)."""
+    m = UP_CHECK_MIN
     fp = ROOT / f"DB_{m}m" / f"btc_{m}m.parquet"
     if not fp.exists():
         return None
@@ -289,7 +179,7 @@ def _load_intrabar_extremes():
     """Renvoie (low_by, high_by) des sous-bougies 1-min pour le test de remplissage
     MAKER (une limite a P0 est remplie si le prix vient la toucher). Meme source que
     _load_intrabar_prices : DB_1m/btc_1m.parquet. None si absent."""
-    m = STOP_LOSS_CHECK_MIN
+    m = UP_CHECK_MIN
     fp = ROOT / f"DB_{m}m" / f"btc_{m}m.parquet"
     if not fp.exists():
         return None
@@ -300,112 +190,342 @@ def _load_intrabar_extremes():
     return low_by, high_by
 
 
-def _sl_threshold(j, max_steps, start_dec, end_dec, floor_dec):
-    """SL TEMPOREL lineaire : seuil prix (decimal neg) de start_dec (large, j=0) vers
-    end_dec (serre, j=max_steps), jamais plus serre (plus proche de 0) que floor_dec."""
-    if max_steps <= 0:
-        return start_dec
-    s = start_dec + (end_dec - start_dec) * (j / max_steps)
-    return min(s, floor_dec)
+def _load_swing_pivots(p: int):
+    """Pivots HAUTS confirmes du 1-min (p barres de chaque cote, confirme p barres
+    plus tard -- AUCUN lookahead : au moment t on ne connait que les pivots deja
+    confirmes). Renvoie {ts_ms: (niveau_px, ts_naissance_ms)} pour la sortie
+    structure de l'extension TP DOWN (config DOWN_TPEXT_*). None si pas de 1-min."""
+    m = UP_CHECK_MIN
+    fp = ROOT / f"DB_{m}m" / f"btc_{m}m.parquet"
+    if not fp.exists():
+        return None
+    df = pd.read_parquet(fp)
+    ts = df["timestamp_ms"].astype("int64").to_numpy()
+    hi = df["high"].astype(float).to_numpy()
+    hh = pd.Series(hi)
+    left = hh.rolling(p).max().shift(1).to_numpy()
+    right = hh.shift(-p).rolling(p).max().to_numpy()
+    isp = (hi > np.nan_to_num(left, nan=-1.0)) & (hi >= np.nan_to_num(right, nan=-1.0))
+    out = {}
+    cur_lvl, cur_born = float("nan"), -1
+    for i in range(len(ts)):
+        b = i - p
+        if b >= 0 and isp[b]:
+            cur_lvl, cur_born = hi[b], int(ts[b])
+        out[int(ts[i])] = (cur_lvl, cur_born)
+    return out
 
 
-def _up_managed_exit(prices_intrabar, traded_ts):
+_sl_threshold = filters.sl_threshold
+_ratchet_floor = filters.ratchet_floor
+
+# Cliquet de gain (campagne SECURISATION 2026-08-11) : paliers EFFECTIFS lus a
+# CHAQUE appel des sorties gerees. Variables de MODULE (pas des constantes
+# importees) pour que les sweeps puissent les surcharger sans recharger
+# config_main -- cf optimize/sweep_ratchet.py. Valeurs par defaut = config.
+UP_RATCHET = UP_RATCHET_STEPS
+DOWN_RATCHET = DOWN_RATCHET_STEPS
+UP_RATCHET_P = UP_RATCHET_PROP
+DOWN_RATCHET_P = DOWN_RATCHET_PROP
+
+# Pivots hauts 1-min pour l'extension TP DOWN (charges une fois au premier
+# simulate_trades ; None si DB_1m absent ou extension desactivee).
+_SWING_PIVOTS: dict | None = None
+
+
+def _widened_ratchet(steps, prop, tp_mult):
+    """Paliers apres elargissement sur profit. RATCHET_SCALES_WITH_WIDEN=False
+    (defaut) -> inchanges : le gain deja verrouille le reste au meme niveau.
+    Le palier PROPORTIONNEL est intrinsequement relatif au pic -- seul son seuil
+    d'armement est mis a l'echelle, jamais la fraction."""
+    if not RATCHET_SCALES_WITH_WIDEN:
+        return steps, prop
+    steps = tuple((p * tp_mult, f * tp_mult) for p, f in steps) if steps else steps
+    prop = (prop[0] * tp_mult, prop[1]) if prop is not None else None
+    return steps, prop
+
+
+def _up_managed_exit(prices_intrabar, traded_ts, widen_candidates: set | None = None,
+                     take_profit: float | None = None,
+                     sl_override: tuple[float, float] | None = None):
     # Sortie geree UNIFORME d'un trade UP (long) : take-profit + trailing 'let-run'
     # (verrouillent le gain -> remontent le WR) + stop-loss dur large (cape la perte
-    # sans whipsaw). Verifie chaque UP_CHECK_MIN min sur au plus UP_MAX_STEPS pas.
-    # Renvoie (gross, reason) ; (None, "close") si pas de 1min.
+    # sans whipsaw). Verifie chaque UP_CHECK_MIN min sur au plus UP_MAX_STEPS pas
+    # (ELARGI a UP_MAX_STEPS*UP_WIDEN_MAX_HOLD_MULT si elargissement declenche,
+    # cf widen_candidates ci-dessous).
+    # Renvoie (gross, reason, exit_ts, widened_at_ts) ; (None, "close", traded_ts+1h,
+    # None) si pas de 1min.
+    # exit_ts (campagne symetrie 2026-07-09) sert au plafond de concurrence de
+    # simulate_trades (MAX_CONCURRENT_POSITIONS) -- meme role que la fermeture de
+    # position cote live/ (voir live/position.py).
+    #
+    # widen_candidates (test 2026-07-10) : ensemble des traded_ts (ms) des futurs
+    # signaux UP bloques par MAX_CONCURRENT_POSITIONS_PER_SIDE pendant que CETTE
+    # position est ouverte. Des qu'un de ces instants est atteint par la marche ET
+    # que le profit courant est POSITIF, on elargit UNE SEULE FOIS take_profit /
+    # trail_gap / max_steps (SL jamais elargi -- reste borne a l'horizon ORIGINAL
+    # UP_MAX_STEPS, cf sl_j ci-dessous). None/vide/WIDEN_ON_PROFIT_ENABLED=False
+    # -> comportement exactement inchange.
     open_ib, close_ib = prices_intrabar
     entry = open_ib.get(traded_ts)
     if entry is None:
-        return None, "close"
+        return None, "close", traded_ts + INTERVAL_1H_MS, None
     peak = -9.0
     floor = None
     last = None
-    for j in range(UP_MAX_STEPS):
-        cl = close_ib.get(traded_ts + j * UP_STEP_MS)
+    last_j = 0
+    # take_profit (param, MODE DEFENSIF CHOP 2026-08-11) : TP override de la barre
+    # (chop scalp / macro-bull), None = UP_TAKE_PROFIT config. base_tp sert de
+    # reference au widen (le TP elargi suit le TP effectif, pas la constante).
+    base_tp = take_profit if take_profit is not None else UP_TAKE_PROFIT
+    take_profit, trail_gap, max_steps = base_tp, UP_TRAIL_GAP, UP_MAX_STEPS
+    ratchet, ratchet_p = UP_RATCHET, UP_RATCHET_P
+    # sl_override (MODE DEFENSIF CHOP, campagne POINTS-FAIBLES 2026-08-11) :
+    # (start_dec, floor_dec) du SL temporel en chop ; END jamais modifie.
+    sl_start, sl_floor = sl_override if sl_override is not None \
+        else (UP_SL_START_DEC, UP_SL_FLOOR_DEC)
+    widened_at_ts = None
+    j = 0
+    while j < max_steps:
+        t = traded_ts + j * UP_STEP_MS
+        cl = close_ib.get(t)
         if cl is None:
             break
         pp = cl / entry - 1.0
         last = pp
-        sl_th = (_sl_threshold(j, UP_MAX_STEPS, UP_SL_START_DEC, UP_SL_END_DEC, UP_SL_FLOOR_DEC)
-                 if UP_SL_TIME_DECAY else UP_STOP_LOSS_DEC)
+        last_j = j
+        if (WIDEN_ON_PROFIT_ENABLED and widened_at_ts is None and widen_candidates
+                and pp > 0.0 and t in widen_candidates):
+            take_profit = base_tp * UP_WIDEN_TP_MULT
+            trail_gap = UP_TRAIL_GAP * UP_WIDEN_TRAIL_GAP_MULT
+            max_steps = int(UP_MAX_STEPS * UP_WIDEN_MAX_HOLD_MULT)
+            ratchet, ratchet_p = _widened_ratchet(ratchet, ratchet_p, UP_WIDEN_TP_MULT)
+            widened_at_ts = t
+        sl_j = min(j, UP_MAX_STEPS - 1)     # SL jamais elargi -- horizon ORIGINAL toujours
+        sl_th = _sl_threshold(sl_j, UP_MAX_STEPS, sl_start, UP_SL_END_DEC, sl_floor)
         if pp <= sl_th:
-            return pp, "stop_loss"
-        if pp >= UP_TAKE_PROFIT:
-            return pp, "take_profit"
+            return pp, "stop_loss", t, widened_at_ts
+        if pp >= take_profit:
+            return pp, "take_profit", t, widened_at_ts
         if pp > peak:
             peak = pp
+        # Plancher effectif = max(trailing classique, cliquet de gain). Les deux
+        # sont monotones croissants (peak l'est), donc le plancher l'est aussi.
         if peak >= UP_TRAIL_ACTIVATE:
-            floor = peak - UP_TRAIL_GAP
+            floor = peak - trail_gap
+        rf = _ratchet_floor(peak, ratchet, ratchet_p)
+        if rf is not None and (floor is None or rf > floor):
+            floor = rf
         if floor is not None and pp < floor:
-            return pp, "trailing"
+            return pp, "trailing", t, widened_at_ts
+        j += 1
     if last is None:
-        return None, "close"
-    return last, "timestop"
+        return None, "close", traded_ts + INTERVAL_1H_MS, widened_at_ts
+    return last, "timestop", traded_ts + last_j * UP_STEP_MS, widened_at_ts
 
 
-def _down_managed_exit(prices_intrabar, traded_ts):
+_effective_down_exit_params = filters.effective_down_exit_params
+
+
+def _down_managed_exit(prices_intrabar, traded_ts, max_steps=None, trail_gap=None,
+                       widen_candidates: set | None = None, regime: str = "neutral",
+                       swing_pivots: dict | None = None,
+                       take_profit: float | None = None,
+                       trail_activate: float | None = None,
+                       ratchet_extra: tuple | None = None):
     # Sortie geree UNIFORME d'un trade DOWN (short), calque exact de _up_managed_exit
     # mais sur le profit SHORT pp = 1 - close/entry (un short gagne quand le prix baisse).
     # take-profit + trailing 'let-run' (verrouillent le gain) + stop-loss dur large
-    # (cape la perte sans whipsaw). Verifie chaque DOWN_CHECK_MIN min sur <= DOWN_MAX_STEPS pas.
-    # Renvoie (gross_short, reason) ; (None, "close") si pas de 1min.
+    # (cape la perte sans whipsaw). Verifie chaque DOWN_CHECK_MIN min sur <= max_steps pas.
+    # max_steps/trail_gap (parametres d'entree) : override regime-conditionnel
+    # (REGIME_EXIT_OVERRIDES, cf _effective_down_exit_params) ; None (defaut) =
+    # DOWN_MAX_STEPS/DOWN_TRAIL_GAP de config_main.py, comportement inchange. Ce
+    # sont ces valeurs EFFECTIVES (deja regime-ajustees) qui servent de BASE a
+    # l'elargissement sur profit ci-dessous, pas les constantes brutes.
+    # Renvoie (gross_short, reason, exit_ts, widened_at_ts) ; (None, "close",
+    # traded_ts+1h, None) si pas de 1min.
+    # exit_ts (campagne symetrie 2026-07-09) sert au plafond de concurrence de
+    # simulate_trades (MAX_CONCURRENT_POSITIONS).
+    #
+    # widen_candidates (test 2026-07-10) : cf _up_managed_exit, meme mecanisme
+    # cote DOWN. SL jamais elargi -- reste borne a l'horizon EFFECTIF (regime-
+    # ajuste mais non-widened) sl_max_steps ci-dessous.
+    sl_max_steps = max_steps if max_steps is not None else DOWN_MAX_STEPS
+    if max_steps is None:
+        max_steps = DOWN_MAX_STEPS
+    if trail_gap is None:
+        trail_gap = DOWN_TRAIL_GAP
+    # take_profit (param, MODE DEFENSIF CHOP 2026-08-11) : TP override de la barre
+    # (chop scalp), None = DOWN_TAKE_PROFIT config. base_tp sert de reference au
+    # widen ET au plancher dur tpext (le TP effectif, pas la constante).
+    base_tp = take_profit if take_profit is not None else DOWN_TAKE_PROFIT
+    take_profit = base_tp
+    # trail_activate (MODE DEFENSIF CHOP, campagne POINTS-FAIBLES 2026-08-11) :
+    # seuil d'armement du trailing en chop (le short doit prouver un profit
+    # avant que le trailing puisse le sortir) ; None = DOWN_TRAIL_ACTIVATE config.
+    trail_act = trail_activate if trail_activate is not None else DOWN_TRAIL_ACTIVATE
+    # ratchet_extra (campagne WR-DOWN 2026-08-11) : palier supplementaire hors
+    # bear installe (cf filters.dn_ratchet_extra), fusionne avec les paliers de
+    # securite ; None = paliers production inchanges.
+    ratchet = DOWN_RATCHET if ratchet_extra is None \
+        else tuple(sorted(DOWN_RATCHET + (ratchet_extra,)))
+    ratchet_p = DOWN_RATCHET_P
+    # Extension conditionnelle du TP en bear (campagne ADAPTATIVITE 2026-08-11,
+    # cf bloc DOWN_TPEXT_* de config_main.py) : etat + suivi du chemin pour le
+    # gate ER (grinders only).
+    tpext_armed = (DOWN_TPEXT_ENABLED and regime in DOWN_TPEXT_REGIMES
+                   and swing_pivots is not None)
+    extended = False
+    ext_t = None
+    path_len = 0.0
+    prev_pp = 0.0
     open_ib, close_ib = prices_intrabar
     entry = open_ib.get(traded_ts)
     if entry is None:
-        return None, "close"
+        return None, "close", traded_ts + INTERVAL_1H_MS, None
     peak = -9.0
     floor = None
     last = None
-    for j in range(DOWN_MAX_STEPS):
-        cl = close_ib.get(traded_ts + j * DOWN_STEP_MS)
+    last_j = 0
+    widened_at_ts = None
+    j = 0
+    while j < max_steps:
+        t = traded_ts + j * DOWN_STEP_MS
+        cl = close_ib.get(t)
         if cl is None:
             break
         pp = 1.0 - cl / entry            # profit directionnel d'un short
+        if j > 0:
+            path_len += abs(pp - prev_pp)
+        prev_pp = pp
         last = pp
-        sl_th = (_sl_threshold(j, DOWN_MAX_STEPS, DOWN_SL_START_DEC, DOWN_SL_END_DEC, DOWN_SL_FLOOR_DEC)
-                 if DOWN_SL_TIME_DECAY else DOWN_STOP_LOSS_DEC)
+        last_j = j
+        if (WIDEN_ON_PROFIT_ENABLED and widened_at_ts is None and widen_candidates
+                and pp > 0.0 and t in widen_candidates):
+            take_profit = base_tp * DOWN_WIDEN_TP_MULT
+            trail_gap = trail_gap * DOWN_WIDEN_TRAIL_GAP_MULT
+            max_steps = int(max_steps * DOWN_WIDEN_MAX_HOLD_MULT)
+            ratchet, ratchet_p = _widened_ratchet(ratchet, ratchet_p, DOWN_WIDEN_TP_MULT)
+            widened_at_ts = t
+            extended = False               # le widen (TP x4) prime sur l'extension
+        sl_j = min(j, sl_max_steps - 1)   # SL jamais elargi -- horizon EFFECTIF (non-widened)
+        sl_th = _sl_threshold(sl_j, sl_max_steps, DOWN_SL_START_DEC, DOWN_SL_END_DEC, DOWN_SL_FLOOR_DEC)
         if pp <= sl_th:
-            return pp, "stop_loss"
-        if pp >= DOWN_TAKE_PROFIT:
-            return pp, "take_profit"
+            return pp, "stop_loss", t, widened_at_ts
+        # --- Armement de l'extension TP (bear + grinder) au franchissement du TP ---
+        if (not extended and tpext_armed and widened_at_ts is None
+                and pp >= take_profit):
+            er = pp / max(path_len, 1e-9)
+            if er <= DOWN_TPEXT_MAX_ER:
+                extended = True
+                ext_t = t                  # les pivots nes avant ne comptent pas
+            else:
+                return pp, "take_profit", t, widened_at_ts
+        if not extended and pp >= take_profit:
+            return pp, "take_profit", t, widened_at_ts
         if pp > peak:
             peak = pp
-        if peak >= DOWN_TRAIL_ACTIVATE:
-            floor = peak - DOWN_TRAIL_GAP
+        # Plancher effectif = max(trailing classique, cliquet de gain), cf _up_managed_exit.
+        if peak >= trail_act:
+            floor = peak - trail_gap
+        rf = _ratchet_floor(peak, ratchet, ratchet_p)
+        if rf is not None and (floor is None or rf > floor):
+            floor = rf
+        if extended:
+            # Sortie STRUCTURE : cassure du dernier pivot haut confirme forme
+            # PENDANT l'extension ; plancher dur TP - HARD_GUARD sinon.
+            hard = base_tp - DOWN_TPEXT_HARD_GUARD_DEC
+            sfloor = hard
+            piv = swing_pivots.get(t)
+            if piv is not None and piv[1] >= ext_t:
+                lvl_pp = 1.0 - piv[0] / entry
+                if lvl_pp > sfloor:
+                    sfloor = lvl_pp
+            if floor is None or sfloor > floor:
+                floor = sfloor
         if floor is not None and pp < floor:
-            return pp, "trailing"
+            return pp, "trailing", t, widened_at_ts
+        j += 1
     if last is None:
-        return None, "close"
-    return last, "timestop"
+        return None, "close", traded_ts + INTERVAL_1H_MS, widened_at_ts
+    return last, "timestop", traded_ts + last_j * DOWN_STEP_MS, widened_at_ts
 
 
 def simulate_trades(team_bets: pd.DataFrame, body_map: dict[int, float],
                     prices_intrabar: tuple | None = None,
                     up_meta: dict[int, tuple] | None = None,
-                    extremes: tuple | None = None) -> tuple[pd.DataFrame, dict]:
+                    extremes: tuple | None = None,
+                    regime_map: dict[int, str] | None = None,
+                    fee_override: dict | None = None,
+                    trend_ctx: dict | None = None) -> tuple[pd.DataFrame, dict]:
     """Un trade par pari pris. Entree open(i+1), sortie close(i+1).
     gross = +body (UP/long) ou -body (DOWN/short) ; net = gross - (entry_fee + exit_fee).
     L'ENTREE suit MAKER/TAKER (limite a P0, simulee via le fill intrabar) ; la SORTIE
     (close/take_profit/trailing/stop_loss) est TOUJOURS TAKER : impossible de garantir
     un fill maker sur une sortie declenchee par une condition (execution immediate requise).
 
-    Si prices_intrabar est fourni, un STOP-LOSS (STOP_LOSS_PCT) est verifie tous
-    les STOP_LOSS_CHECK_MIN min, UNIQUEMENT pour les sens dans STOP_LOSS_SIDES :
-    au 1er pas ou le profit <= STOP_LOSS_PCT on sort la (exit_reason='stop_loss'),
-    sinon sortie a la cloture 1h (exit_reason='close')."""
+    Si prices_intrabar est fourni, la sortie est geree minute par minute par
+    _up_managed_exit/_down_managed_exit (TP / trailing / SL temporel / timestop) ;
+    sinon sortie a la cloture 1h (exit_reason='close').
+
+    fee_override (campagne symetrie 2026-07-09, cf okx_fees.py) : {"maker": float,
+    "taker": float} recupere en LIVE depuis l'API OKX (taux reel du compte, pas
+    une estimation) ; None (defaut) = comportement inchange, MAKER_FEE_PER_SIDE/
+    FEE_PER_SIDE de config_main.py.
+
+    trend_ctx (MODE DEFENSIF CHOP, campagne TOUT-TERRAIN 2026-08-11) : map de
+    filters.load_trend_context(). Quand la barre de decision est en chop
+    (filters.chop_mode), les SORTIES passent en scalp mean-reversion : TP UP/DOWN
+    courts, gap/hold DOWN serres (config CHOP_*), tpext et override regime bear
+    coupes ; hors chop, TP UP serre en macro-bull (MBULL_UP_TP). Les ENTREES ne
+    changent jamais. None (defaut) = comportement strictement inchange."""
     cols = ["timestamp", "ts_utc", "traded_ts", "direction", "label",
-            "body_ret", "gross_ret", "net_ret", "win_net", "exit_reason"]
-    entry_fee = MAKER_FEE_PER_SIDE if MAKER else FEE_PER_SIDE   # entree : maker si rempli, sinon taker
-    exit_fee = FEE_PER_SIDE                                      # sortie : toujours taker
+            "body_ret", "gross_ret", "net_ret", "win_net", "exit_reason", "exit_ts"]
+    maker_fee_rate = fee_override["maker"] if fee_override else MAKER_FEE_PER_SIDE
+    taker_fee_rate = fee_override["taker"] if fee_override else FEE_PER_SIDE
+    entry_fee = maker_fee_rate if MAKER else taker_fee_rate    # entree : maker si rempli, sinon taker
+    exit_fee = taker_fee_rate                                    # sortie : toujours taker
     low_by, high_by = extremes if (MAKER and extremes is not None) else (None, None)
     open_ib0 = prices_intrabar[0] if prices_intrabar is not None else None
     n_would_be = n_missed = missed_up = missed_down = 0
+    n_concurrency_skipped = up_concurrency_skipped = down_concurrency_skipped = 0
+    n_widened_up = n_widened_down = 0
     if team_bets.empty:
         return (pd.DataFrame(columns=cols),
                 {"maker": MAKER, "n_would_be": 0, "n_missed": 0, "missed_up": 0,
-                 "missed_down": 0, "fill_rate": 1.0, "entry_fee": entry_fee, "exit_fee": exit_fee})
+                 "missed_down": 0, "fill_rate": 1.0, "entry_fee": entry_fee, "exit_fee": exit_fee,
+                 "n_concurrency_skipped": 0, "up_concurrency_skipped": 0, "down_concurrency_skipped": 0,
+                 "n_widened_up": 0, "n_widened_down": 0})
+    global _SWING_PIVOTS
+    if DOWN_TPEXT_ENABLED and _SWING_PIVOTS is None and prices_intrabar is not None:
+        _SWING_PIVOTS = _load_swing_pivots(DOWN_TPEXT_SWING_P)
     rows = []
+    # Elargissement sur profit (test 2026-07-10) : traded_ts (ms) de TOUS les paris
+    # UP/DOWN de team_bets, tries -- sert a batir, pour chaque position ouverte, la
+    # liste des futurs signaux du meme sens qui pourraient la declencher (cf
+    # widen_candidates dans _up_managed_exit/_down_managed_exit). Un seul passage
+    # np.searchsorted par position ouverte, pas de cout notable.
+    _up_ts_all = np.sort((team_bets.loc[team_bets["direction"] == "up", "timestamp"].to_numpy()
+                          + INTERVAL_1H_MS)) if WIDEN_ON_PROFIT_ENABLED else None
+    _down_ts_all = np.sort((team_bets.loc[team_bets["direction"] == "down", "timestamp"].to_numpy()
+                            + INTERVAL_1H_MS)) if WIDEN_ON_PROFIT_ENABLED else None
+
+    def _later_same_dir_candidates(traded_ts_now: int, up_side: bool) -> set | None:
+        if not WIDEN_ON_PROFIT_ENABLED:
+            return None
+        arr = _up_ts_all if up_side else _down_ts_all
+        idx = np.searchsorted(arr, traded_ts_now, side="right")
+        return set(int(t) for t in arr[idx:])
+    # exit_ts (ms) des positions actuellement "ouvertes", purge chronologiquement au
+    # fil des trades (team_bets est trie par timestamp -> traded_ts est croissant).
+    # Symetrie avec live_team (position.py::n_open + config_team.MAX_CONCURRENT_POSITIONS,
+    # has_open_side retire) : plafond sur le compte TOTAL, tous sens confondus.
+    open_slots: list[int] = []
+    # Plafond PAR SENS (symetrie live/, campagne OKX 2026-07-10) : mirroir de la
+    # contrainte OKX mode HEDGE (1 seule position suivable par sens, cf
+    # MAX_CONCURRENT_POSITIONS_PER_SIDE dans config_main.py).
+    up_open_slots: list[int] = []
+    down_open_slots: list[int] = []
     for _, b in team_bets.iterrows():
         ts = int(b["timestamp"])
         traded_ts = ts + INTERVAL_1H_MS          # bougie i+1 = celle qu'on trade
@@ -413,11 +533,6 @@ def simulate_trades(team_bets: pd.DataFrame, body_map: dict[int, float],
         if body is None:
             continue                               # pas de bougie suivante connue -> skip
         up = b["direction"] == "up"
-        vol, wknd = (up_meta or {}).get(ts, (-1, -1)) if up else (-1, -1)
-        # --- Filtre d'entree UP (gestion des pertes) : on NE PREND PAS le pari dans
-        #     les buckets pourris (volatility_state, is_weekend) de UP_SKIP_BUCKETS ---
-        if up and UP_MGMT_ENABLED and (vol, wknd) in UP_SKIP_BUCKETS:
-            continue
         n_would_be += 1
         # --- Mode MAKER : limite postee a P0 (open i+1) ; remplie SEULEMENT si le prix
         #     revient la toucher (long: un low 1-min < P0 ; short: un high 1-min > P0).
@@ -443,31 +558,72 @@ def simulate_trades(team_bets: pd.DataFrame, body_map: dict[int, float],
                     else:
                         missed_down += 1
                     continue
+
+        # --- Plafond de concurrence (MAX_CONCURRENT_POSITIONS, tous sens confondus,
+        #     PUIS MAX_CONCURRENT_POSITIONS_PER_SIDE, par sens) : purge d'abord les
+        #     slots deja clos avant CETTE entree (traded_ts), puis n'ouvre que si un
+        #     slot est libre des DEUX cotes. Seuls les trades REELLEMENT REMPLIS
+        #     (apres le filtre MAKER ci-dessus) consomment un slot -- symetrie avec
+        #     live/ ou seul un fill reel ouvre une Position. ---
+        open_slots = [e for e in open_slots if e > traded_ts]
+        up_open_slots = [e for e in up_open_slots if e > traded_ts]
+        down_open_slots = [e for e in down_open_slots if e > traded_ts]
+        side_slots = up_open_slots if up else down_open_slots
+        if (len(open_slots) >= MAX_CONCURRENT_POSITIONS
+                or len(side_slots) >= MAX_CONCURRENT_POSITIONS_PER_SIDE):
+            n_concurrency_skipped += 1
+            if up:
+                up_concurrency_skipped += 1
+            else:
+                down_concurrency_skipped += 1
+            continue
+
         gross = body if up else -body
         exit_reason = "close"                      # defaut : sortie a la cloture 1h
+        exit_ts = traded_ts + INTERVAL_1H_MS
         # --- Gestion de sortie geree par sens (let-run + TP + SL backstop) ; sinon SL simple ---
+        # MODE DEFENSIF CHOP (2026-08-11) : sorties scalp quand la barre de
+        # decision est en chop scalpable (ER bas + bear non installe).
+        _chop = trend_ctx is not None and filters.chop_mode(trend_ctx, ts)
         if up and UP_MGMT_ENABLED and prices_intrabar is not None:
-            g2, exit_reason = _up_managed_exit(prices_intrabar, traded_ts)
+            widen_cands = _later_same_dir_candidates(traded_ts, True)
+            _up_tp = filters.up_tp_override(trend_ctx, ts) if trend_ctx is not None else None
+            _up_sl = (CHOP_UP_SL_START_DEC, CHOP_UP_SL_FLOOR_DEC) if _chop else None
+            g2, exit_reason, exit_ts, widened_at = _up_managed_exit(
+                prices_intrabar, traded_ts, widen_cands, take_profit=_up_tp,
+                sl_override=_up_sl)
             if g2 is not None:
                 gross = g2
+            if widened_at is not None:
+                n_widened_up += 1
         elif (not up) and DOWN_MGMT_ENABLED and prices_intrabar is not None:
-            g2, exit_reason = _down_managed_exit(prices_intrabar, traded_ts)
+            # RETOUR DOWN AU COMMIT ecb04f8 (2026-08-14) : DOWN_WIDEN_ENABLED=False
+            # -> aucun candidat d'elargissement cote DOWN (le commit n'avait pas
+            # de widen) ; CHOP_DOWN_ENABLED=False -> jamais de sorties scalp DOWN.
+            widen_cands = (_later_same_dir_candidates(traded_ts, False)
+                           if DOWN_WIDEN_ENABLED else None)
+            if _chop and CHOP_DOWN_ENABLED:
+                # scalp : TP/hold/gap serres, trailing arme sur profit prouve,
+                # tpext et override regime bear coupes
+                max_steps_eff, trail_gap_eff = CHOP_DOWN_MAX_STEPS, CHOP_DOWN_TRAIL_GAP
+                _regime, _dn_tp = "neutral", CHOP_DOWN_TP
+                _dn_act = CHOP_DOWN_TRAIL_ACTIVATE
+            else:
+                max_steps_eff, trail_gap_eff = _effective_down_exit_params(ts, regime_map)
+                _regime = regime_map.get(ts, "neutral") if regime_map else "neutral"
+                _dn_tp = _dn_act = None
+            _dn_rx = filters.dn_ratchet_extra(trend_ctx, ts) if trend_ctx is not None else None
+            g2, exit_reason, exit_ts, widened_at = _down_managed_exit(
+                prices_intrabar, traded_ts, max_steps_eff, trail_gap_eff, widen_cands,
+                _regime, _SWING_PIVOTS, take_profit=_dn_tp, trail_activate=_dn_act,
+                ratchet_extra=_dn_rx)
             if g2 is not None:
                 gross = g2
-        elif (STOP_LOSS_ENABLED and b["direction"] in STOP_LOSS_SIDES
-                and prices_intrabar is not None):
-            open_ib, close_ib = prices_intrabar
-            entry = open_ib.get(traded_ts)
-            if entry is not None:
-                for j in range(STOP_LOSS_N_STEPS):
-                    cl = close_ib.get(traded_ts + j * STOP_LOSS_STEP_MS)
-                    if cl is None:
-                        continue
-                    pp = (cl / entry - 1.0) if up else (1.0 - cl / entry)
-                    if pp <= STOP_LOSS_PCT:
-                        gross = pp
-                        exit_reason = "stop_loss"
-                        break
+            if widened_at is not None:
+                n_widened_down += 1
+
+        open_slots.append(exit_ts)
+        side_slots.append(exit_ts)
         net = gross - (entry_fee + exit_fee)
         rows.append({
             "timestamp": ts,
@@ -480,11 +636,18 @@ def simulate_trades(team_bets: pd.DataFrame, body_map: dict[int, float],
             "net_ret": net,
             "win_net": bool(net > 0),
             "exit_reason": exit_reason,
+            # exit_ts (2026-08-11) : deja calcule pour le plafond de concurrence ;
+            # persiste dans trades.csv (duree reelle de chaque position).
+            "exit_ts": int(exit_ts),
         })
     fill_rate = (1.0 - n_missed / n_would_be) if n_would_be else 1.0
     maker_info = {"maker": MAKER, "n_would_be": n_would_be, "n_missed": n_missed,
                   "missed_up": missed_up, "missed_down": missed_down,
-                  "fill_rate": fill_rate, "entry_fee": entry_fee, "exit_fee": exit_fee}
+                  "fill_rate": fill_rate, "entry_fee": entry_fee, "exit_fee": exit_fee,
+                  "n_concurrency_skipped": n_concurrency_skipped,
+                  "up_concurrency_skipped": up_concurrency_skipped,
+                  "down_concurrency_skipped": down_concurrency_skipped,
+                  "n_widened_up": n_widened_up, "n_widened_down": n_widened_down}
     return pd.DataFrame(rows, columns=cols), maker_info
 
 
@@ -596,13 +759,119 @@ def trading_stats(trades: pd.DataFrame, initial: float = INITIAL_CAPITAL) -> dic
     }
 
 
+def _agg_side(net: np.ndarray, gross: np.ndarray, contrib: np.ndarray) -> dict:
+    """Metriques du bloc "Profit / Perte" sur un sous-ensemble de trades
+    (une tranche, un sens, ou les deux). `contrib` = P/L $ reel de chaque trade
+    dans l'equity globale (equity - equity_prev), de sorte que la somme
+    UP + DOWN d'une tranche retombe exactement sur le P/L $ de la tranche."""
+    if not len(net):
+        return dict(n=0, gross_pct=0.0, net_pct=0.0, wr=float("nan"),
+                    avg_win_pct=0.0, avg_loss_pct=0.0, ev_pct=0.0,
+                    avg_gross_pct=0.0, best_pct=0.0, worst_pct=0.0,
+                    dd_pct=0.0, fee_pts=0.0, pnl_usd=0.0)
+    eq = np.cumprod(1.0 + net)
+    peak = np.maximum.accumulate(eq)
+    wins, losses = net[net > 0], net[net < 0]
+    wr = float((net > 0).mean())
+    lr = float((net < 0).mean())
+    aw = float(wins.mean()) if len(wins) else 0.0
+    al = float(-losses.mean()) if len(losses) else 0.0
+    return dict(n=int(len(net)),
+                gross_pct=float((np.prod(1.0 + gross) - 1.0) * 100),
+                net_pct=float((eq[-1] - 1.0) * 100),
+                wr=wr * 100,
+                avg_win_pct=aw * 100,
+                avg_loss_pct=al * 100,
+                ev_pct=(wr * aw - lr * al) * 100,
+                avg_gross_pct=float(gross.mean() * 100),
+                best_pct=float(net.max() * 100),
+                worst_pct=float(net.min() * 100),
+                dd_pct=float(((eq - peak) / peak).min() * 100),
+                fee_pts=float((gross - net).sum() * 100),
+                pnl_usd=float(contrib.sum()))
+
+
+def yearly_stats(trades: pd.DataFrame, start_ms: int, end_ms: int,
+                 initial: float = INITIAL_CAPITAL) -> list[dict]:
+    """Decoupe la fenetre en tranches de 365 jours depuis le DEBUT (la derniere
+    tranche prend le reliquat) et agrege chaque tranche : n, net compose (%),
+    WR, EV, pire trade, drawdown intra-tranche, P/L $ (equity courante --
+    les P/L $ des tranches se telescopent, somme = P/L total).
+    Ajoute 2026-08-11 (demande user apres le test 720j) : rend visible la
+    dependance a l'annee de calibration au lieu d'un seul chiffre compose."""
+    if trades.empty:
+        return []
+    year_ms = 365 * DAY_MS
+    bounds = []
+    t0 = start_ms
+    while t0 < end_ms:
+        t1 = min(t0 + year_ms, end_ms)
+        if end_ms - t1 < 30 * DAY_MS:          # reliquat < 30j -> fusionne
+            t1 = end_ms
+        bounds.append((t0, t1))
+        t0 = t1
+    tr_ts = trades["traded_ts"].to_numpy(dtype="int64")
+    dir_all = trades["direction"].to_numpy()
+    net_all = trades["net_ret"].to_numpy(dtype=float) * EXPOSURE
+    gross_all = trades["gross_ret"].to_numpy(dtype=float) * EXPOSURE
+    equity = initial * np.cumprod(1.0 + net_all)
+    equity_prev = np.concatenate(([initial], equity[:-1]))
+    contrib_all = equity - equity_prev      # P/L $ de chaque trade dans l'equity globale
+    out = []
+    for k, (a, b) in enumerate(bounds, 1):
+        m = (tr_ts >= a) & (tr_ts < b)
+        net = net_all[m]
+        gross = gross_all[m]
+        # capital courant a la fin de la tranche (equity globale, meme si la
+        # tranche est vide : on reprend la derniere equity anterieure)
+        before = tr_ts < b
+        eq_end = float(equity[before][-1]) if before.any() else float(initial)
+        d = {"idx": k, "start": _fmt_ms(a), "end": _fmt_ms(b),
+             "days": round((b - a) / DAY_MS), "n": int(m.sum())}
+        # perfs par sens de la tranche (memes formules, trades du sens seulement)
+        for _s in ("up", "down"):
+            _ms = m & (dir_all == _s)
+            d[_s] = _agg_side(net_all[_ms], gross_all[_ms], contrib_all[_ms])
+        if not len(net):
+            d.update(net_pct=0.0, wr=float("nan"), ev_pct=0.0, worst_pct=0.0,
+                     dd_pct=0.0, pnl_usd=0.0, avg_win_pct=0.0, avg_loss_pct=0.0,
+                     gross_pct=0.0, fee_pts=0.0, avg_gross_pct=0.0,
+                     best_pct=0.0, eq_end=eq_end)
+            out.append(d)
+            continue
+        eq = np.cumprod(1.0 + net)
+        peak = np.maximum.accumulate(eq)
+        wins, losses = net[net > 0], net[net < 0]
+        wr = float((net > 0).mean())
+        lr = float((net < 0).mean())
+        aw = float(wins.mean()) if len(wins) else 0.0
+        al = float(-losses.mean()) if len(losses) else 0.0
+        d.update(net_pct=float((eq[-1] - 1.0) * 100),
+                 wr=wr * 100,
+                 avg_win_pct=aw * 100,
+                 avg_loss_pct=al * 100,
+                 ev_pct=(wr * aw - lr * al) * 100,
+                 worst_pct=float(net.min() * 100),
+                 dd_pct=float(((eq - peak) / peak).min() * 100),
+                 pnl_usd=float(equity[m][-1] - equity_prev[m][0]),
+                 # miroir du bloc "Profit / Perte" par tranche (memes formules
+                 # que trading_stats, restreintes aux trades de la tranche)
+                 gross_pct=float((np.prod(1.0 + gross) - 1.0) * 100),
+                 fee_pts=float((gross - net).sum() * 100),
+                 avg_gross_pct=float(gross.mean() * 100),
+                 best_pct=float(net.max() * 100),
+                 eq_end=eq_end)
+        out.append(d)
+    return out
+
+
 def _fmt_ms(ts_ms: int) -> str:
     return pd.Timestamp(ts_ms, unit="ms", tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
 
 
 def append_run(stats: dict) -> None:
     """Append one summary row to logs/trading_runs.csv (append-only history)."""
-    flat = {k: v for k, v in stats.items() if not isinstance(v, (dict, np.ndarray))}
+    flat = {k: v for k, v in stats.items() if not isinstance(v, (dict, list, np.ndarray))}
     new_row = pd.DataFrame([flat])
     if TRADING_RUNS_CSV.exists():
         existing = pd.read_csv(TRADING_RUNS_CSV)
@@ -615,36 +884,72 @@ def append_run(stats: dict) -> None:
     combined.to_csv(TRADING_RUNS_CSV, index=False)
 
 
-def main() -> None:
+def _prepare_predictions() -> dict:
+    """Partie couteuse et INDEPENDANTE du regime : predictions des 2 modeles +
+    tout ce qui ne varie jamais selon le regime (UP_DROP_HOURS, DMI map, body
+    returns, prix intrabar). Reutilisable telle quelle par compare_regime_variants.py
+    pour eviter de re-predire/recharger a chaque variante de regime testee."""
     start_ms, end_ms = compute_window()
 
-    # Predictions per-bar des 2 modeles, puis paris d'equipe (regle de coherence).
     up_full = api_up.evaluate_full_on_slice(start_ms, end_ms)
     down_full = api_down.evaluate_full_on_slice(start_ms, end_ms)
     # --- UP : drop des heures fragiles (campagne 500%/cote) : pas de long a ces heures UTC ---
     if UP_DROP_HOURS:
         up_full = up_full.copy()
         up_full.loc[up_full["hour"].isin(UP_DROP_HOURS), "take"] = 0
-    # --- DOWN : selectivite (campagne 500%/cote) : short ssi P(down) >= seuil + DOWN_CONF_DELTA ---
-    if DOWN_CONF_DELTA:
+
+    dmi_map = filters.load_dmi_map() if DMI_FILTER_ENABLED else None
+    body_map = _load_body_returns()
+    prices_intrabar = _load_intrabar_prices()
+    extremes = _load_intrabar_extremes() if MAKER else None
+
+    return {
+        "start_ms": start_ms, "end_ms": end_ms,
+        "up_full": up_full, "down_full": down_full,
+        "dmi_map": dmi_map, "body_map": body_map,
+        "prices_intrabar": prices_intrabar, "extremes": extremes,
+    }
+
+
+def run_backtest(prepared: dict, regime_map: dict[int, str] | None = None,
+                 fee_override: dict | None = None):
+    """Partie legere et regime-CONDITIONNELLE : selectivite DOWN/UP -> coherence ->
+    filtre DMI -> filtre de confiance -> simulation -> stats. Reutilise les
+    predictions deja calculees dans `prepared` (cf _prepare_predictions).
+    regime_map=None (defaut) = comportement EXACTEMENT identique a avant ce refactor
+    (seuils scalaires DOWN_CONF_DELTA / UP_CONF_MIN de config_main.py, partout).
+    fee_override=None (defaut) = frais statiques config_main.py, inchange ; sinon
+    taux reel OKX (cf okx_fees.py). Renvoie (summary, stats, trades, coverage, per_bar)."""
+    up_full = prepared["up_full"]
+    down_full = prepared["down_full"]
+
+    # MODE DEFENSIF CHOP (2026-08-11) : contexte de tendance longue (ER + age
+    # bear + macro), cache module dans filters -> une seule lecture SQLite.
+    # Charge ICI (avant la selectivite DOWN) car le bump de delta en chop
+    # (campagne DOWN-ANNEE-1, meme jour) en a besoin des l'entree.
+    trend_ctx = filters.load_trend_context() if CHOP_SCALP_ENABLED else None
+
+    # --- DOWN : selectivite (campagne 500%/cote), regime-conditionnelle si regime_map fourni,
+    #     renforcee en chop (CHOP_DOWN_CONF_DELTA_BUMP) si trend_ctx fourni ---
+    eff_delta = filters.effective_down_delta(down_full["timestamp"].to_numpy(), regime_map,
+                                             trend_ctx)
+    if regime_map is not None or DOWN_CONF_DELTA:
         down_full = down_full.copy()
-        down_full["take"] = (down_full["confidence"] >= down_full["threshold"] + DOWN_CONF_DELTA).astype(int)
+        down_full["take"] = (down_full["confidence"] >= down_full["threshold"] + eff_delta).astype(int)
     up_bets = _taken_bets(up_full, "up")
     # --- UP : filtre CROSS-MODEL (Strategie 2) : long seulement si P(down) < UP_XMODEL_MAX_PDOWN
     #     (le modele DOWN confirme l'absence de chute). down_full["confidence"] = P(down) par bar. ---
-    if UP_XMODEL_FILTER_ENABLED and not up_bets.empty:
-        _pdown = dict(zip(down_full["timestamp"].astype("int64"), down_full["confidence"]))
-        _keep = up_bets["timestamp"].map(lambda t: _pdown.get(int(t), 0.0) < UP_XMODEL_MAX_PDOWN)
-        up_bets = up_bets[_keep].reset_index(drop=True)
+    up_bets = filters.apply_xmodel_filter(up_bets, down_full)
     down_bets = _taken_bets(down_full, "down")
     team_bets, cancelled = build_team_bets(up_bets, down_bets)
 
     # --- Filtre DMI 1h : annule les paris dont le sens contredit le DMI de la
     #     bougie de decision (+DI vs -DI ; pas de seuil ADX). ---
-    team_bets, dmi_removed_up, dmi_removed_down = _apply_dmi_filter(team_bets)
+    team_bets, dmi_removed_up, dmi_removed_down = filters.apply_dmi_filter(team_bets, prepared.get("dmi_map"))
 
-    # --- Filtre de confiance UP : ne garde un pari UP que si P(up) >= UP_CONF_MIN. ---
-    team_bets, conf_removed_up = _apply_conf_filter(team_bets)
+    # --- Filtre de confiance UP : ne garde un pari UP que si P(up) >= seuil effectif
+    #     (+ CHOP_UP_CONF_MIN_BUMP sur les barres en chop, campagne UP-PERTES 2026-08-11). ---
+    team_bets, conf_removed_up = filters.apply_conf_filter(team_bets, regime_map, trend_ctx)
 
     # Meta par bar UP (volatility_state, is_weekend) pour le filtre d'entree UP.
     _uf = up_full[up_full["take"] == 1]
@@ -653,29 +958,59 @@ def main() -> None:
                 int(r["is_weekend"]) if pd.notna(r["is_weekend"]) else -1)
                for _, r in _uf.iterrows()}
 
-    LOGS_DIR.mkdir(exist_ok=True)
-
     # Logs detailles par bougie (inchanges : team_all_bars / team_skipped / team_taken).
     per_bar = detailed_log.build_per_bar_table(up_full, down_full)
-    detailed_log.write_detailed_logs(per_bar, LOGS_DIR)
-    full_logs.write_full_logs(per_bar, api_up, api_down, LOGS_DIR)
 
-    # --- Simulation de trading ---
-    body_map = _load_body_returns()
-    prices_intrabar = _load_intrabar_prices()
-    extremes = _load_intrabar_extremes() if MAKER else None
-    trades, maker_info = simulate_trades(team_bets, body_map, prices_intrabar, up_meta, extremes)
+    # --- Simulation de trading --- (trend_ctx charge plus haut, avant la selectivite)
+    trades, maker_info = simulate_trades(team_bets, prepared["body_map"], prepared["prices_intrabar"],
+                                         up_meta, prepared["extremes"], regime_map, fee_override,
+                                         trend_ctx)
     coverage = (maker_info["n_would_be"] / len(team_bets)) if len(team_bets) else 0.0
-    trades.to_csv(TRADES_CSV, index=False)
 
+    # (Le gouverneur d'equity qui filtrait ici les trades a ete supprime le
+    # 2026-08-14 — decision user, parite prod. Tous les candidats s'executent.)
     stats = trading_stats(trades)
+    stats["years"] = yearly_stats(trades, prepared["start_ms"], prepared["end_ms"])
+    for _y in stats["years"]:
+        _k = f"y{_y['idx']}"
+        stats[f"{_k}_net_pct"] = _y["net_pct"]
+        stats[f"{_k}_n"] = _y["n"]
+        stats[f"{_k}_wr"] = _y["wr"]
+        stats[f"{_k}_avg_win_pct"] = _y["avg_win_pct"]
+        stats[f"{_k}_avg_loss_pct"] = _y["avg_loss_pct"]
+        stats[f"{_k}_ev_pct"] = _y["ev_pct"]
+        stats[f"{_k}_dd_pct"] = _y["dd_pct"]
+        stats[f"{_k}_pnl_usd"] = _y["pnl_usd"]
+        stats[f"{_k}_gross_pct"] = _y["gross_pct"]
+        stats[f"{_k}_fee_pts"] = _y["fee_pts"]
+        stats[f"{_k}_avg_gross_pct"] = _y["avg_gross_pct"]
+        stats[f"{_k}_best_pct"] = _y["best_pct"]
+        stats[f"{_k}_eq_end"] = _y["eq_end"]
+        for _s, _tag in (("up", "up"), ("down", "dn")):
+            stats[f"{_k}_{_tag}_n"] = _y[_s]["n"]
+            stats[f"{_k}_{_tag}_net_pct"] = _y[_s]["net_pct"]
+            stats[f"{_k}_{_tag}_wr"] = _y[_s]["wr"]
+            stats[f"{_k}_{_tag}_ev_pct"] = _y[_s]["ev_pct"]
+            stats[f"{_k}_{_tag}_pnl_usd"] = _y[_s]["pnl_usd"]
+    # perfs par sens sur la fenetre entiere (lignes TOTAL UP / TOTAL DOWN de la
+    # table par tranche) -- memes formules _agg_side que les tranches
+    if not trades.empty:
+        _dirs = trades["direction"].to_numpy()
+        _net = trades["net_ret"].to_numpy(dtype=float) * EXPOSURE
+        _gross = trades["gross_ret"].to_numpy(dtype=float) * EXPOSURE
+        _eq = INITIAL_CAPITAL * np.cumprod(1.0 + _net)
+        _contrib = _eq - np.concatenate(([INITIAL_CAPITAL], _eq[:-1]))
+        for _s in ("up", "down"):
+            _m = _dirs == _s
+            stats[f"total_{_s}"] = _agg_side(_net[_m], _gross[_m], _contrib[_m])
     summary = {
         "run_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "window_days": TEAM_TEST_DAYS,
-        "window_start": _fmt_ms(start_ms),
-        "window_end": _fmt_ms(end_ms),
+        "window_start": _fmt_ms(prepared["start_ms"]),
+        "window_end": _fmt_ms(prepared["end_ms"]),
         "entry_fee_pct": maker_info["entry_fee"] * 100,
         "exit_fee_pct": maker_info["exit_fee"] * 100,
+        "fee_source": "okx_api" if fee_override else "config_fallback",
         "initial_capital": INITIAL_CAPITAL,
         "position_fraction": POSITION_FRACTION,
         "leverage": LEVERAGE,
@@ -694,10 +1029,45 @@ def main() -> None:
         "conf_filter": UP_CONF_FILTER_ENABLED,
         "conf_min": UP_CONF_MIN,
         "conf_removed_up": conf_removed_up,
+        "max_concurrent_positions": MAX_CONCURRENT_POSITIONS,
+        "max_concurrent_positions_per_side": MAX_CONCURRENT_POSITIONS_PER_SIDE,
+        "concurrency_skipped": maker_info["n_concurrency_skipped"],
+        "concurrency_skipped_up": maker_info["up_concurrency_skipped"],
+        "concurrency_skipped_down": maker_info["down_concurrency_skipped"],
+        "widen_on_profit": WIDEN_ON_PROFIT_ENABLED,
+        "widened_up": maker_info["n_widened_up"],
+        "widened_down": maker_info["n_widened_down"],
         "coverage": round(coverage, 4),
+        "regime_wrapper": regime_map is not None,
         **{k: (round(v, 5) if isinstance(v, float) else v)
            for k, v in stats.items() if not isinstance(v, dict)},
     }
+    return summary, stats, trades, coverage, per_bar
+
+
+def main() -> None:
+    prepared = _prepare_predictions()
+    regime_map = filters.load_regime_map() if cfg_regime.REGIME_WRAPPER_ENABLED else None
+
+    # Frais reels OKX (campagne symetrie 2026-07-09) : jamais silencieux -- si
+    # OKX_API_KEY/OKX_API_SECRET/OKX_API_PASSPHRASE sont absentes ou l'appel echoue,
+    # on retombe sur les constantes de config_main.py mais on le dit clairement (peut etre perime).
+    fee_override = okx_fees.fetch_real_fee_rate()
+    if fee_override:
+        print(f"  frais OKX reels (API) : maker={fee_override['maker']*100:.4f}%  "
+              f"taker={fee_override['taker']*100:.4f}%")
+    else:
+        print(f"  frais OKX reels indisponibles (OKX_API_KEY/OKX_API_SECRET/OKX_API_PASSPHRASE "
+              f"absentes de l'environnement, ou appel API en echec) -> fallback config_main.py : "
+              f"maker={MAKER_FEE_PER_SIDE*100:.4f}%  taker={FEE_PER_SIDE*100:.4f}%  "
+              f"(PEUT ETRE PERIME, verifie contre https://www.okx.com/fees)")
+
+    summary, stats, trades, coverage, per_bar = run_backtest(prepared, regime_map, fee_override)
+
+    LOGS_DIR.mkdir(exist_ok=True)
+    detailed_log.write_detailed_logs(per_bar, LOGS_DIR)
+    full_logs.write_full_logs(per_bar, api_up, api_down, LOGS_DIR)
+    trades.to_csv(TRADES_CSV, index=False)
     append_run(summary)
 
     _render_report(summary, stats, coverage)
@@ -777,10 +1147,20 @@ def _render_report(summary: dict, stats: dict, coverage: float) -> None:
     if summary.get("conf_filter"):
         t.add_row(f"Filtre confiance UP (p_up >= {UP_CONF_MIN}) - paris annules",
                   Text(f"{summary.get('conf_removed_up', 0)} UP", style="yellow"))
-    t.add_row(f"Gestion UP (TP {UP_TAKE_PROFIT*100:.2f}% / SL -{UP_STOP_LOSS:.2f}% prix / trail {UP_TRAIL_GAP*100:.2f}% / max {UP_MAX_STEPS}min)",
-              Text(f"SL = -{UP_STOP_LOSS:.2f}% du prix (sur la position, levier hors-jeu)", style="yellow"))
-    t.add_row(f"Gestion DOWN (TP {DOWN_TAKE_PROFIT*100:.2f}% / SL -{DOWN_STOP_LOSS:.2f}% prix / trail {DOWN_TRAIL_GAP*100:.2f}% / max {DOWN_MAX_STEPS}min)",
-              Text(f"SL = -{DOWN_STOP_LOSS:.2f}% du prix (sur la position, levier hors-jeu)", style="yellow"))
+    t.add_row(f"Plafond concurrence (max {summary.get('max_concurrent_positions', MAX_CONCURRENT_POSITIONS)} positions tous sens / "
+              f"max {summary.get('max_concurrent_positions_per_side', MAX_CONCURRENT_POSITIONS_PER_SIDE)} par sens) - signaux sautes",
+              Text(f"{summary.get('concurrency_skipped', 0)} "
+                   f"({summary.get('concurrency_skipped_up', 0)} UP / "
+                   f"{summary.get('concurrency_skipped_down', 0)} DOWN)", style="yellow"))
+    if summary.get("widen_on_profit"):
+        t.add_row(f"Elargissement sur profit (UP x{UP_WIDEN_TP_MULT:.1f}/{UP_WIDEN_TRAIL_GAP_MULT:.1f}/{UP_WIDEN_MAX_HOLD_MULT:.1f} "
+                  f"DOWN x{DOWN_WIDEN_TP_MULT:.1f}/{DOWN_WIDEN_TRAIL_GAP_MULT:.1f}/{DOWN_WIDEN_MAX_HOLD_MULT:.1f}) - positions elargies",
+                  Text(f"{summary.get('widened_up', 0)} UP / {summary.get('widened_down', 0)} DOWN",
+                       style="bold magenta"))
+    t.add_row(f"Gestion UP (TP {UP_TAKE_PROFIT*100:.2f}% / SL temporel -{UP_SL_START_PCT:.2f}%->-{UP_SL_END_PCT:.2f}% / trail {UP_TRAIL_GAP*100:.2f}% / max {UP_MAX_STEPS}min)",
+              Text(f"SL temporel -{UP_SL_START_PCT:.2f}% -> -{UP_SL_END_PCT:.2f}% (floor -{UP_SL_FLOOR_PCT:.2f}%), % du prix, levier hors-jeu", style="yellow"))
+    t.add_row(f"Gestion DOWN (TP {DOWN_TAKE_PROFIT*100:.2f}% / SL temporel -{DOWN_SL_START_PCT:.2f}%->-{DOWN_SL_END_PCT:.2f}% / trail {DOWN_TRAIL_GAP*100:.2f}% / max {DOWN_MAX_STEPS}min)",
+              Text(f"SL temporel -{DOWN_SL_START_PCT:.2f}% -> -{DOWN_SL_END_PCT:.2f}% (floor -{DOWN_SL_FLOOR_PCT:.2f}%), % du prix, levier hors-jeu", style="yellow"))
     t.add_row("Sorties gerees (tous sens : TP / SL / trail)",
               f"{stats.get('n_take_profit', 0)} / {stats.get('n_stop_loss', 0)} / {stats.get('n_trailing', 0)}")
     console.print(t)
@@ -807,73 +1187,100 @@ def _render_report(summary: dict, stats: dict, coverage: float) -> None:
     console.print(p)
 
     # --- Bloc mensuel (USDC) ---
-    mtab = Table(title="Par mois (USDC)", title_style="bold cyan", border_style="cyan",
-                 header_style="bold", expand=False)
-    mtab.add_column("Metrique", style="bold")
-    mtab.add_column("Valeur", justify="right")
-    mtab.add_row("USDC gagne au total",
-                 Text(f"{stats['usdc_total']:+,.2f}$", style=_pnl_color(stats['usdc_total'])))
-    mtab.add_row(f"Moyenne gagnee / mois ({stats['n_months']} mois)",
-                 Text(f"{stats['usdc_avg_per_month']:+,.2f}$", style=_pnl_color(stats['usdc_avg_per_month'])))
-    mtab.add_row(f"Meilleur mois ({stats['best_month']})",
-                 Text(f"{stats['best_month_usdc']:+,.2f}$   ({stats['best_month_pct']:+.1f}%)",
-                      style="bold bright_green"))
-    mtab.add_row(f"Pire mois ({stats['worst_month']})",
-                 Text(f"{stats['worst_month_usdc']:+,.2f}$   ({stats['worst_month_pct']:+.1f}%)",
-                      style="red"))
-    console.print(mtab)
+    # --- Par tranche de 365 jours (si fenetre > 1 an) ---
+    years = stats.get("years") or []
+    if len(years) >= 2:
+        # colonnes = les metriques du bloc "Profit / Perte" ventilees par tranche
+        # (ajout 2026-08-11 a la demande du user), en plus des colonnes WR/EV.
+        ty = Table(title="Par tranche de 365 jours", show_lines=True)
+        ty.add_column("Periode")
+        ty.add_column("Trades", justify="right")
+        ty.add_column("Brut", justify="right")
+        ty.add_column("Net compose", justify="right")
+        ty.add_column("WR net", justify="right")
+        ty.add_column("AvgWin", justify="right")
+        ty.add_column("AvgLoss", justify="right")
+        ty.add_column("EV/trade", justify="right")
+        ty.add_column("Moy brut/tr", justify="right")
+        ty.add_column("Meilleur", justify="right")
+        ty.add_column("Pire trade", justify="right")
+        ty.add_column("Max DD", justify="right")
+        ty.add_column("Frais", justify="right")
+        ty.add_column("P/L $", justify="right")
+        ty.add_column("Capital fin", justify="right")
+        def _side_row(label, s):
+            # ligne UP ou DOWN (tranche ou total) : memes colonnes, "Capital fin"
+            # vide (l'equity est globale, elle ne se decompose pas par sens)
+            return [
+                Text(label, style="bold blue" if "UP" in label else "bold magenta"),
+                str(s["n"]),
+                Text(f"{s['gross_pct']:+.2f}%", style=_pnl_color(s["gross_pct"])),
+                Text(f"{s['net_pct']:+.2f}%", style=_pnl_color(s["net_pct"])),
+                f"{s['wr']:.2f}%" if s["n"] else "n/a",
+                f"{s['avg_win_pct']:.3f}%",
+                f"{s['avg_loss_pct']:.3f}%",
+                Text(f"{s['ev_pct']:+.4f}%", style=_pnl_color(s["ev_pct"])),
+                f"{s['avg_gross_pct']:+.4f}%",
+                f"{s['best_pct']:+.2f}%",
+                f"{s['worst_pct']:+.2f}%",
+                f"{s['dd_pct']:+.2f}%",
+                Text(f"-{s['fee_pts']:.2f} pts", style="red"),
+                Text(f"{s['pnl_usd']:+,.2f}$", style=_pnl_color(s["pnl_usd"])),
+                "",
+            ]
 
-    # --- Par sens ---
-    d = Table(title="Par sens", title_style="bold cyan", border_style="cyan",
-              header_style="bold", expand=False)
-    d.add_column("Sens", style="bold")
-    d.add_column("Trades", justify="right")
-    d.add_column("WR net", justify="right")
-    d.add_column("Rendement net", justify="right")
-    d.add_column("Gain moyen", justify="right")
-    d.add_column("Perte moyenne", justify="right")
-    d.add_column("Pire trade", justify="right")
-    for name, key, style in (("LONG (up)", "up", "bright_blue"),
-                             ("SHORT (down)", "down", "bright_red")):
-        s = stats[key]
-        wr = "n/a" if pd.isna(s["wr"]) else f"{s['wr']*100:.2f}%"
-        worst = "n/a" if not s.get("n") else f"{s['worst_pct']:+.2f}%"
-        awin = "n/a" if not s.get("n") or pd.isna(s.get("avg_win_pct", float("nan"))) else f"{s['avg_win_pct']:+.3f}%"
-        aloss = "n/a" if not s.get("n") or pd.isna(s.get("avg_loss_pct", float("nan"))) else f"{s['avg_loss_pct']:+.3f}%"
-        d.add_row(Text(name, style=style), f"{s['n']}", wr,
-                  Text(f"{s['net_pct']:+.2f}%", style=_pnl_color(s["net_pct"])),
-                  Text(awin, style="bright_green"),
-                  Text(aloss, style="red"),
-                  Text(worst, style="red"))
-    console.print(d)
+        for y in years:
+            ty.add_row(
+                f"annee {y['idx']}  {y['start'][:10]} -> {y['end'][:10]} ({y['days']}j)",
+                str(y["n"]),
+                Text(f"{y['gross_pct']:+.2f}%", style=_pnl_color(y["gross_pct"])),
+                Text(f"{y['net_pct']:+.2f}%", style=_pnl_color(y["net_pct"])),
+                f"{y['wr']:.2f}%",
+                f"{y['avg_win_pct']:.3f}%",
+                f"{y['avg_loss_pct']:.3f}%",
+                Text(f"{y['ev_pct']:+.4f}%", style=_pnl_color(y["ev_pct"])),
+                f"{y['avg_gross_pct']:+.4f}%",
+                f"{y['best_pct']:+.2f}%",
+                f"{y['worst_pct']:+.2f}%",
+                f"{y['dd_pct']:+.2f}%",
+                Text(f"-{y['fee_pts']:.2f} pts", style="red"),
+                Text(f"{y['pnl_usd']:+,.2f}$", style=_pnl_color(y["pnl_usd"])),
+                f"{y['eq_end']:.2f}",
+            )
+            ty.add_row(*_side_row(f"  annee {y['idx']} UP", y["up"]))
+            ty.add_row(*_side_row(f"  annee {y['idx']} DOWN", y["down"]))
+        # ligne TOTAL : memes definitions que le rapport global (stats), pour
+        # comparer chaque annee a l'ensemble sans changer de table.
+        ty.add_row(
+            Text("TOTAL", style="bold"),
+            Text(str(stats["n_trades"]), style="bold"),
+            Text(f"{stats['gross_total_pct']:+.2f}%",
+                 style=f"bold {_pnl_color(stats['gross_total_pct'])}"),
+            Text(f"{stats['net_total_pct']:+.2f}%",
+                 style=f"bold {_pnl_color(stats['net_total_pct'])}"),
+            Text(f"{stats['wr_net'] * 100:.2f}%", style="bold"),
+            Text(f"{stats['avg_win_pct_all']:.3f}%", style="bold"),
+            Text(f"{stats['avg_loss_pct_all']:.3f}%", style="bold"),
+            Text(f"{stats['ev_per_trade_pct']:+.4f}%",
+                 style=f"bold {_pnl_color(stats['ev_per_trade_pct'])}"),
+            Text(f"{stats['avg_gross_per_trade_pct']:+.4f}%", style="bold"),
+            Text(f"{stats['best_pct']:+.2f}%", style="bold"),
+            Text(f"{stats['worst_pct']:+.2f}%", style="bold"),
+            Text(f"{stats['max_drawdown_pct']:+.2f}%", style="bold"),
+            Text(f"-{stats['fee_drag_pct']:.2f} pts", style="bold red"),
+            Text(f"{stats['pnl']:+,.2f}$", style=f"bold {_pnl_color(stats['pnl'])}"),
+            Text(f"{stats['final_equity']:.2f}", style="bold"),
+        )
+        if stats.get("total_up") and stats.get("total_down"):
+            ty.add_row(*_side_row("  TOTAL UP", stats["total_up"]))
+            ty.add_row(*_side_row("  TOTAL DOWN", stats["total_down"]))
+        console.print(ty)
 
-    # --- Recap EV par trade (n / WR / AvgWin / AvgLoss / EV) ---
-    ev_tab = Table(title="EV par trade", title_style="bold cyan", border_style="cyan",
-                   header_style="bold", expand=False, show_lines=True)
-    ev_tab.add_column("", style="bold")
-    ev_tab.add_column("n", justify="right")
-    ev_tab.add_column("WR", justify="right")
-    ev_tab.add_column("AvgWin", justify="right")
-    ev_tab.add_column("AvgLoss", justify="right")
-    ev_tab.add_column("EV /trade", justify="right")
-    for name, key, style in (("UP", "up", "bright_blue"), ("DOWN", "down", "bright_red")):
-        s = stats[key]
-        if not s.get("n"):
-            continue
-        ev = s.get("ev_pct", 0.0)
-        ev_tab.add_row(
-            Text(name, style=style), f"{s['n']}", f"{s['wr']*100:.2f}%",
-            f"{abs(s.get('avg_win_pct', float('nan'))):.3f}%",
-            f"{abs(s.get('avg_loss_pct', float('nan'))):.3f}%",
-            Text(f"{ev:+.4f}%", style=_pnl_color(ev)))
-    ev_all = stats["ev_per_trade_pct"]
-    ev_tab.add_row(
-        Text("Tous (headline)", style="bold"), f"{stats['n_trades']}",
-        f"{stats['wr_net']*100:.2f}%",
-        f"{stats.get('avg_win_pct_all', float('nan')):.3f}%",
-        f"{stats.get('avg_loss_pct_all', float('nan')):.3f}%",
-        Text(f"{ev_all:+.4f}%", style=_pnl_color(ev_all)))
-    console.print(ev_tab)
+    # (Tables 'Par mois (USDC)', 'Par sens' et 'EV par trade' SUPPRIMEES du
+    #  rapport 2026-08-11 a la demande du user -- les stats sous-jacentes restent
+    #  calculees (trading_runs.csv + g.py) ; seule la table par tranche de 365j
+    #  et le bloc P/L subsistent a l'affichage.)
+
 
     # --- Headline ---
     net = stats["net_total_pct"]

@@ -1,0 +1,92 @@
+{
+  "strategy": "asym_wknd_excl_hour_boost",
+  "thresholds_per_wknd": {
+    "0": 0.53,
+    "1": 0.53
+  },
+  "skip_cells": [
+    [
+      2,
+      0
+    ],
+    [
+      2,
+      1
+    ]
+  ],
+  "hour_boost": {
+    "good_hours": [],
+    "delta": 0.0125
+  },
+  "bad_hours": [
+    17,
+    1,
+    12,
+    8,
+    14,
+    16,
+    3,
+    21,
+    23,
+    0
+  ],
+  "bad_hours_soft": [
+    7,
+    5,
+    13,
+    4,
+    22,
+    11,
+    10,
+    15,
+    18,
+    9
+  ],
+  "bad_days": [
+    5,
+    7,
+    3
+  ],
+  "max_p_up_runtime": 0.53,
+  "metadata": {
+    "trained_at": "2026-07-03T18:06:08+00:00",
+    "test_days": 365,
+    "model_kind": "down_only",
+    "calib_method": "quantile",
+    "vol_frac_weekday": 0.0225,
+    "vol_frac_weekend": 0.07,
+    "use_full_val": true,
+    "hour_boost_good_hours": [],
+    "hour_boost_delta": 0.0125,
+    "bad_hours": [
+      17,
+      1,
+      12,
+      8,
+      14,
+      16,
+      3,
+      21,
+      23,
+      0
+    ],
+    "bad_hours_soft": [
+      7,
+      5,
+      13,
+      4,
+      22,
+      11,
+      10,
+      15,
+      18,
+      9
+    ],
+    "bad_days": [
+      5,
+      7,
+      3
+    ],
+    "max_p_up_runtime": 0.53
+  }
+}

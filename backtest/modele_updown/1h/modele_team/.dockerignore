@@ -1,0 +1,39 @@
+# Lu lors du build de live/Dockerfile (build context = modele_team/, cf.
+# live/docker-compose.yml). AUTONOMIE (2026-07-10) : live/ embarque ses
+# propres copies de modele_up/, modele_down/, regime/ (live/modele_up/, etc.)
+# -- ce fichier remplace l'ancien 1h/.dockerignore (context = 1h/, obsolete
+# maintenant que le contexte ne remonte plus jusque-la).
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git/
+.gitignore
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Datasets / DB regenerables (gros, jamais necessaires au runtime live -- les
+# features live viennent de Bitstamp via calcule_feature.py, pas du parquet).
+*.parquet
+*.db
+*.sqlite
+*.csv
+DB/
+DB_1m/
+DB_5m/
+DB_15m/
+eth_data/
+
+# Logs (backtest ET live -- live/logs/ est monte en volume au runtime).
+logs/
+
+# Scripts d'exploration, jamais executes en prod.
+optimize/
+analyse/
+
+# Secrets : charges via env_file de compose, jamais copies dans l'image.
+.env
+.env.*
