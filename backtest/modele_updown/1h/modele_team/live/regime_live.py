@@ -47,8 +47,10 @@ import pandas as pd
 logger = logging.getLogger("live.regime_live")
 
 _LIVE_DIR = Path(__file__).resolve().parent
-if str(_LIVE_DIR) not in sys.path:
-    sys.path.insert(0, str(_LIVE_DIR))
+_TEAM_DIR = _LIVE_DIR.parent
+for _p in (str(_LIVE_DIR), str(_TEAM_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 # AUTONOMIE (2026-07-10) : live/regime/ est une copie embarquee (live/regime/),
 # plus le package sibling de 1h/regime/ -- cf calcule_feature.py, meme campagne.

@@ -265,3 +265,32 @@ AJOUTAIT ~11 pts car il élaguait les vraies mauvaises périodes). Décision use
 **suppression complète du code** (config, filters.apply_governor, main.py,
 rapport) — parité prod totale. Sans gouverneur, 720j : UP a1 +32.98% (83
 trades, WR 63.9%), UP a2 +176.89%, DOWN inchangé.
+
+### Réactivation du contexte sur les DEUX sens + SMA 365j (2026-08-14, décision finale du jour)
+
+Sur la base "prod alignée sans gouverneur", test demandé par le user :
+CHOP_DOWN_ENABLED=True (exp_dnsma.py) → total +1564.89 → +2271.76%, DD −54.18
+→ −31.87%, année 1 −3.17 → +101.79% (DOWN a1 −27.19 → +51.75%), coût assumé
+année 2 (DOWN a2 +521 → +324). Sweep SMA (exp_dnsma2/3.py, config UP+DOWN) :
+120j total +2100/dd −41.8 (casse le plancher), 180j +2024/−31.9,
+200j +2272/−31.9 (meilleur total), 365j +2203/−31.9 (meilleure année 1
++115.72 et meilleur UP a1 +42.15). Sensibilité INVERSE entre les sens :
+l'UP veut une SMA lente (mbull stable), le DOWN a1 profite d'une SMA courte
+(bear age reset → plus de chop détecté) mais au prix du DD (120j) ou de
+l'année 2. Choix user : **SMA 365j, contexte actif sur les deux sens**.
+Validation main.py 720j, reproduction exacte de l'A/B : total +2202.99%,
+DD −31.87%, a1 +115.72% (UP +42.15 / DOWN +51.75), a2 +967.60%
+(UP +176.64 / DOWN +285.91), 400 trades, EV +0.8973%/trade. Piste non testée :
+contexte hybride SMA365-UP / SMA180-DOWN (deux SMA à maintenir).
+
+### Campagne ALIGNEMENT LIVE (2026-08-14, suite et fin de journée)
+
+Audit workflow 31 agents (5 dimensions, 25 findings confirmés adversarialement,
+1 réfuté) puis port complet — détails dans live/CLAUDE.md et la section
+Backtest/live de modele_team/CLAUDE.md. Découverte centrale : le live IMPORTE
+config_main.py/filters.py du backtest (les « copies indépendantes » de la doc
+n'ont jamais existé) → le nettoyage du 2026-08-11 l'avait cassé à l'import.
+Réparé + porté : contexte SMA365/ER (buffer 1h 800→10300), cliquet, chop/mbull
+(entrées + sorties, figés à la décision), cross-model pré-cohérence, maker
+statique sans bascule taker (bug de sur-exposition x1.8 supprimé), état
+atomique. Refactor filters.load_trend_context prouvé bit-identique (hash).

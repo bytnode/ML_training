@@ -7,8 +7,14 @@ modele_down (ni pour le DMI par-trade, ni pour le regime) une fois demarre.
 Buffers maintenus, tous en memoire (jamais persistes sur disque -- un redemarrage
 refait un fetch initial complet, rapide) :
   - buf_btc_1h  : features des 2 modeles (calcule_feature.py) + axe tendance/
-                  momentum du regime (regime_live.py). Profondeur >= LOOKBACK
-                  regime (720h=30j) + marge warmup features -> 800 bars.
+                  momentum du regime (regime_live.py) + CONTEXTE DE TENDANCE
+                  SMA/ER (alignement live 2026-08-14 : filters.
+                  trend_context_from_series, meme math que le backtest).
+                  Profondeur dimensionnee par la SMA CHOP_SMA_DAYS (365j =
+                  8760 bars) + une fenetre de mesure d'age du bear >= 2x
+                  CHOP_BEAR_AGE_MAX_DAYS (60j = 1440 bars ; un bear plus vieux
+                  que la fenetre est sous-estime mais reste > 30j, donc bien
+                  classe "installe") + marge -> 10300 bars (~14 mois).
   - buf_btc_4h  : filtre DMI PAR-TRADE (config_main.DMI_FILTER_ENABLED, via
                   filters._wilder_dmi) ET axe DMI du regime (regime_live, instance
                   SEPAREE mais MEME buffer source -- juste 2 appels Wilder distincts
@@ -29,8 +35,10 @@ from pathlib import Path
 import numpy as np
 
 _LIVE_DIR = Path(__file__).resolve().parent
-if str(_LIVE_DIR) not in sys.path:
-    sys.path.insert(0, str(_LIVE_DIR))
+_TEAM_DIR = _LIVE_DIR.parent
+for _p in (str(_LIVE_DIR), str(_TEAM_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import calcule_feature  # noqa: E402
 import filters  # noqa: E402
@@ -44,7 +52,7 @@ INTERVAL_1H_MS = 60 * 60 * 1000
 INTERVAL_4H_MS = 4 * 60 * 60 * 1000
 
 # Profondeur des buffers -- cf docstring ci-dessus pour la justification de chaque valeur.
-BTC_1H_BARS = 800
+BTC_1H_BARS = 10300   # etait 800 ; agrandi 2026-08-14 pour la SMA365j du contexte de tendance
 BTC_4H_BARS = 300
 ETH_1H_BARS = 400
 REFRESH_TAIL_BARS = 5   # nb de bougies recentes re-fetchees + mergees a chaque cycle (incremental)
@@ -57,6 +65,7 @@ class LiveMarketData:
         self.buf_btc_4h: list = []
         self.buf_eth_1h: list = []
         self.regime_state: dict | None = None
+        self._trend_cache: tuple[int, dict | None] | None = None
 
     # -- Fetch initial complet (une fois, au lancement) -----------------------
     def bootstrap(self) -> None:
@@ -162,6 +171,31 @@ class LiveMarketData:
         plus_di, minus_di = filters._wilder_dmi(high, low, close, DMI_LENGTH)
         dmi_map = {int(t): (float(p), float(m)) for t, p, m in zip(ts, plus_di, minus_di)}
         return filters.dmi_blocks_direction(direction, dmi_map, decision_ts)
+
+    # -- Contexte de tendance SMA/ER (alignement live 2026-08-14) --------------
+    def trend_ctx(self) -> dict | None:
+        """Map open-time 1h -> (er, age_bear_h, is_mbull) construite depuis
+        buf_btc_1h via filters.trend_context_from_series -- la MEME math que le
+        backtest (load_trend_context), seule la source change (buffer Bitstamp
+        au lieu de SQLite). Recalculee a la demande, cachee par derniere barre
+        du buffer (une fois par cycle en pratique). None si le buffer est trop
+        court pour la SMA (warmup au premier lancement avec un buffer reduit) :
+        les appelants retombent alors sur le comportement sans contexte
+        (= jamais en mode scalp), exactement comme les barres warmup backtest."""
+        if not self.buf_btc_1h:
+            return None
+        last_ts = int(self.buf_btc_1h[-1][0])
+        if self._trend_cache is not None and self._trend_cache[0] == last_ts:
+            return self._trend_cache[1]
+        ts = [b[0] for b in self.buf_btc_1h]
+        cl = [b[4] for b in self.buf_btc_1h]
+        ctx = filters.trend_context_from_series(ts, cl)
+        if not ctx:
+            logger.warning(f"trend_ctx : buffer 1h trop court ({len(cl)} bars) pour la "
+                           f"SMA{filters.CHOP_SMA_DAYS}j -- contexte indisponible (mode trend partout).")
+            ctx = None
+        self._trend_cache = (last_ts, ctx)
+        return ctx
 
     # -- Regime map (contrat inchange cote filters.py : regime_map.get(ts, "neutral")) --
     def current_regime_map(self) -> "_ConstantRegimeMap | None":

@@ -3,10 +3,13 @@
 Tous les parametres editables de main.py vivent ici ; main.py les importe.
 (Les chemins de fichiers restent dans main.py car derives de __file__.)
 
-DEPUIS 2026-08-03 (campagne autonomie complete live/), `live/config_main.py`
-est une COPIE INDEPENDANTE de ce fichier (plus un import partage) -- si tu
-changes un seuil ici, recopie-le manuellement dans live/config_main.py pour
-que le live suive (cf live/CLAUDE.md).
+⚠️ CE FICHIER EST PARTAGE AVEC LE LIVE (verite retablie 2026-08-14) : il
+n'existe AUCUN live/config_main.py -- live/{live,position,market_data,
+config_live}.py importent CE fichier via sys.path (et le Dockerfile le COPY
+dans l'image). Toute suppression/renommage ici peut donc CASSER le daemon a
+l'import (c'est arrive : le nettoyage du 2026-08-11 a supprime 4 noms que
+position.py importait -> crash, repare par l'alignement du 2026-08-14).
+L'ancienne mention "copie independante 2026-08-03" etait fausse.
 
 CONVENTION D'UNITES (2026-08-11, AUCUN changement de comportement) : tous les
 seuils de prix EDITABLES portent le suffixe _PCT et sont en POURCENT du mouvement
@@ -21,7 +24,7 @@ reporting/equity dans trading_stats() -- il n'entre JAMAIS dans un seuil.
 # ============================================================
 #  Fenetre de backtest
 # ============================================================
-TEAM_TEST_DAYS = 720          # taille de la fenetre de test (jours), ancree sur la
+TEAM_TEST_DAYS = 700          # taille de la fenetre de test (jours), ancree sur la
                               # derniere bougie commune aux 2 modeles
 
 # ============================================================
@@ -189,9 +192,15 @@ DOWN_WIDEN_ENABLED = True
 # ⚠️ SEUL endroit du fichier ou le levier existe : EXPOSURE n'est applique QU'A la
 # toute fin, dans trading_stats() (equity / rapport / logs). AUCUN seuil TP/SL/trail
 # ci-dessous n'en depend -- ils sont tous compares au mouvement de prix NU.
-POSITION_FRACTION = 0.5      # part du capital engagee par trade (marge)
+POSITION_FRACTION = 0.1      # part du capital engagee par trade (marge)
+                             # DECISION USER 2026-08-23 : 0.5 -> 0.1 (exposition 5.0 -> 1.0).
+                             # Applique ICI et pas dans live/.env pour que backtest et live
+                             # restent alignes (live/ importe ce fichier ; OKX_POSITION_FRACTION
+                             # reste vide dans .env, donc il retombe sur cette valeur).
+                             # ⚠️ Tous les resultats de campagne ecrits dans CLAUDE.md ont ete
+                             # mesures a 0.5 -- ils ne sont plus reproductibles tels quels.
 LEVERAGE = 10              # levier applique sur la marge
-EXPOSURE = POSITION_FRACTION * LEVERAGE   # multiplicateur effectif du rendement par trade (= 5.0)
+EXPOSURE = POSITION_FRACTION * LEVERAGE   # multiplicateur effectif du rendement par trade (= 1.0)
 
 # --- Mode MAKER (ordres limites) vs TAKER (ordres marche) ---
 # TAKER (defaut) : on entre AU MARCHE a l'open de la bougie i+1 (= P0), frais taker.
@@ -339,9 +348,9 @@ INTERVAL_1H_MS = 60 * 60 * 1000
 #   net max         idem mais SL=5% (off)                     -> gain 0.31/WR 57/perte -0.36/net +17
 #   perte serree    max75 TP=0.30% trail 0.20%/0.30% SL=0.60% -> gain 0.24/WR 59/perte -0.31/net +9
 UP_MGMT_ENABLED = True
-UP_MAX_HOLD_MIN = 240         # Valeur en place : 360. (Le re-sweep 2026-07-03 UP-standalone avait
-                              # retenu 240 -- etait 90 puis 150 ; la copie live/ est restee a 240,
-                              # divergence backtest/live REELLE.)
+UP_MAX_HOLD_MIN = 240         # RE-SWEEPE 2026-07-03 UP-standalone : 240 (etait 90 puis 150).
+                              # (Note "copie live divergente" supprimee 2026-08-14 : le live
+                              # importe CE fichier, il n'y a pas de copie.)
                               # Teste jusqu'a 1440 (24h) : au-dela de 240 le rendement DEGRADE
                               # (contrairement a DOWN) -- l'edge UP ne beneficie PAS d'un trend-ride long.
 UP_TRAIL_ACTIVATE_PCT = 0.30   # RE-SWEEPE 2026-08-11 (campagne SECURISATION, conjoint avec le
@@ -380,7 +389,8 @@ UP_SL_START_PCT = 1.5    # SL a l'entree : -1.50% prix (large). RE-SWEEPE 2026-0
 UP_SL_END_PCT   = 0.3       # SL a max_hold : -0.30% prix. RE-SWEEPE 2026-07-03 round ASYMETRIE (etait 0.2)
 UP_SL_FLOOR_PCT = 0.7       # jamais plus serre que -0.70% prix. NB : un ancien commentaire disait "0.1"
                               # mais la VALEUR en place etait 0.7 -- la valeur fait foi, conservee.
-                              # ⚠️ live/config_main.py a lui 0.1 (=0.10% prix) : divergence backtest/live REELLE.
+                              # (Note "live/config_main.py a 0.1" supprimee 2026-08-14 : pas de copie,
+                              # le live importe CE fichier -- aucune divergence possible sur les valeurs.)
 # derives (ne pas editer)
 UP_SL_START_DEC = -(UP_SL_START_PCT / 100.0)
 UP_SL_END_DEC   = -(UP_SL_END_PCT   / 100.0)
@@ -532,17 +542,26 @@ DOWN_SL_FLOOR_DEC = -(DOWN_SL_FLOOR_PCT / 100.0)
 # skip DOWN en macro-bull (tue les shorts gagnants de l'annee 2), skip DOWN
 # en bull profond >= +10% SMA200 (retire plus de gagnants que de perdants).
 CHOP_SCALP_ENABLED = True
-# RETOUR DOWN AU COMMIT ecb04f8 (decision user 2026-08-14) : le mode chop ne
-# s'applique plus qu'a l'UP. False = TOUTES les adaptations DOWN au contexte
-# sont coupees : sorties scalp DOWN (CHOP_DOWN_TP/HOLD/TRAIL_*), bump d'entree
-# CHOP_DOWN_CONF_DELTA_BUMP, et palier de cliquet chop/mbull
-# (CHOP_DOWN_RATCHET_*). Les knobs CHOP_DOWN_* ci-dessous restent documentes
-# mais INACTIFS tant que ce flag est False. L'UP garde tout (TP/SL chop, bump
-# de confiance, mbull).
-CHOP_DOWN_ENABLED = False
+# ACTIVE SUR LES DEUX SENS (decision user 2026-08-14, apres A/B
+# optimize/exp_dnsma*.py) : True = les adaptations DOWN au contexte tournent
+# aussi — sorties scalp DOWN (CHOP_DOWN_TP/HOLD/TRAIL_*), bump d'entree
+# CHOP_DOWN_CONF_DELTA_BUMP, palier de cliquet chop/mbull (CHOP_DOWN_RATCHET_*).
+# Sur la base DOWN prod (widen x4 + regime bear, sans gouverneur/tpext/verrou),
+# l'A/B 720j donnait : total +1564.89 -> +2271.76% (SMA200) et DD -54.18 ->
+# -31.87%, annee 1 -3.17 -> +101.79%. (Il avait ete a False quelques heures
+# le meme jour, phase "retour commit"/"parite prod".)
+CHOP_DOWN_ENABLED = True
 CHOP_ER_DAYS = 30             # lookback de l'ER (jours, pas quotidiens)
 CHOP_ER_MAX = 0.25            # ER < 0.25 = chemin inefficient (chop)
-CHOP_SMA_DAYS = 200           # SMA de reference du regime macro (jours)
+CHOP_SMA_DAYS = 365           # SMA de reference du regime macro (jours).
+                              # SWEEPE 2026-08-14 (exp_dnsma2/3.py, config UP+DOWN, 720j) :
+                              #   120j -> total +2100 dd -41.8 (casse le plancher de DD)
+                              #   180j -> total +2024 dd -31.9
+                              #   200j -> total +2272 dd -31.9 (meilleur total)
+                              #   365j -> total +2203 dd -31.9, MEILLEURE annee 1 (+115.72)
+                              #           et meilleur UP a1 (+42.15) — CHOISI par le user
+                              # (etait 200). Sensibilite INVERSEE entre les sens : l'UP
+                              # prefere lent (365), le DOWN a1 court — cf RAPPORT.
 CHOP_BEAR_AGE_MAX_DAYS = 30   # au-dela : bear installe -> on trend-ride, jamais scalp
 CHOP_UP_TP_PCT = 0.60         # TP UP en mode scalp (retour au "TP serre" pre-2026-08-11)
 CHOP_DOWN_TP_PCT = 1.10       # TP DOWN en mode scalp (vs 1.60 trend). RE-SWEEPE campagne

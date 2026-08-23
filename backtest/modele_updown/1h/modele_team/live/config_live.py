@@ -1,15 +1,11 @@
 """config_live.py -- constantes SPECIFIQUES au daemon live OKX.
 
-Ne redefinit RIEN de ce qui vit deja dans config_main.py (seuils DMI/UP-filters/
-SL/TP/trailing/timestop/levier/exposure) -- ces valeurs sont IMPORTEES depuis
-config_main.py partout ou elles sont necessaires. Ce fichier ne contient que ce
-qui n'a pas d'equivalent backtest : identifiant d'instrument OKX, cadence de la
-boucle, chemins de logs, noms des variables d'env attendues.
-
-COPIE INDEPENDANTE (2026-08-03, campagne autonomie complete live/) : `config_main.py`
-est desormais une copie EMBARQUEE dans live/ (live/config_main.py), plus le
-fichier partage de modele_team/ -- voir l'entete de live/config_main.py pour le
-tradeoff (recopie manuelle apres un changement backtest).
+Ne redefinit RIEN de ce qui vit deja dans modele_team/config_main.py (seuils
+DMI/UP-filters/SL/TP/trailing/timestop/levier/exposure) -- ces valeurs sont
+IMPORTEES depuis config_main.py partout ou elles sont necessaires (symetrie
+backtest/live par construction, cf CLAUDE.md racine et filters.py). Ce fichier
+ne contient que ce qui n'a pas d'equivalent backtest : identifiant d'instrument
+OKX, cadence de la boucle, chemins de logs, noms des variables d'env attendues.
 """
 from __future__ import annotations
 
@@ -17,14 +13,12 @@ import os
 import sys
 from pathlib import Path
 
-# live/config_live.py -> parent = live/. On pousse live/ sur sys.path pour
-# importer config_main comme module top-level (config_main.py est une copie
-# EMBARQUEE dans live/ depuis 2026-08-03, plus modele_team/ -- meme trick que
-# main.py pousse 1h/ pour modele_up/modele_down, ou live.py pousse live/ pour
-# ses propres copies modele_up/modele_down/regime).
-_LIVE_DIR = str(Path(__file__).resolve().parent)
-if _LIVE_DIR not in sys.path:
-    sys.path.insert(0, _LIVE_DIR)
+# live/config_live.py -> parent = live/, parent.parent = modele_team/. On pousse
+# modele_team/ sur sys.path pour importer config_main / filters / okx_fees comme
+# modules top-level (meme trick que main.py pousse 1h/ pour modele_up/modele_down).
+_TEAM_DIR = str(Path(__file__).resolve().parent.parent)
+if _TEAM_DIR not in sys.path:
+    sys.path.insert(0, _TEAM_DIR)
 
 import logging
 
@@ -83,6 +77,72 @@ OKX_LEVERAGE = _env_int("OKX_LEVERAGE", _BACKTEST_LEVERAGE)
 OKX_POSITION_FRACTION = _env_float("OKX_POSITION_FRACTION", _BACKTEST_POSITION_FRACTION)
 
 # ============================================================
+#  Filet de securite "catastrophe" natif OKX (audit 2026-08-03, point #1)
+# ============================================================
+# Un stop-loss STATIQUE pose cote OKX (order-algo conditionnel) a l'ouverture de
+# CHAQUE position reelle -- il s'execute sur le matching engine d'OKX MEME SI le
+# daemon est mort/fige/deconnecte. Ce n'est PAS une replique du SL dynamique du
+# daemon (SL temporel/trailing/timestop/regime restent 100% dans position.py) :
+# c'est un unique plancher fixe par sens, pose DELIBEREMENT PLUS LARGE que la
+# valeur la plus large que le SL dynamique atteint jamais (sa valeur a l'entree,
+# j=0 : UP_SL_START=-1.5%, DOWN_SL_START=-1%), donc il ne se declenche JAMAIS
+# avant le SL du daemon en fonctionnement normal -- il ne sert que si le daemon
+# est aveugle, pour eviter la liquidation (~ -9% a 10x isole). Invariant : le
+# widen ne touche jamais le SL, le regime ne touche que max_hold/trail_gap ->
+# ces bornes -1.5%/-1% sont fixes, un seul chiffre par sens suffit.
+NATIVE_BACKSTOP_ENABLED = _env_int("NATIVE_BACKSTOP_ENABLED", 1) == 1
+CATASTROPHE_SL_UP_PCT = _env_float("CATASTROPHE_SL_UP_PCT", 0.030)     # long : -3.0% prix (2x le SL le plus large -1.5%)
+CATASTROPHE_SL_DOWN_PCT = _env_float("CATASTROPHE_SL_DOWN_PCT", 0.025)  # short : -2.5% prix (2.5x le SL le plus large -1%)
+# ⚠️ PIEGE D'UNITES (audit 2026-08-14) : malgre le suffixe _PCT, ces deux
+# valeurs sont des FRACTIONS decimales (0.030 = 3.0%), PAS des pourcents comme
+# la convention _PCT de config_main.py (2026-08-11). Ne JAMAIS "harmoniser" a
+# 3.0/2.5 ni mettre CATASTROPHE_SL_UP_PCT=3 dans .env : le filet se poserait a
+# -300% (= jamais) ou pire. position.py les consomme en decimal tel quel.
+# Declenchement sur le MARK price (coherent avec le pp reel de evaluate_exit et
+# avec la logique de liquidation OKX). Valeurs OKX : "last" / "index" / "mark".
+BACKSTOP_TRIGGER_PX_TYPE = "mark"
+
+# ============================================================
+#  Anti-rebond desync (audit 2026-08-03, point #4)
+# ============================================================
+# Nb de lectures get_positions() CONSECUTIVES montrant la position absente avant
+# de declarer une desync et d'effacer l'etat local. Une seule lecture vide
+# transitoire (maintenance/propagation OKX) ne doit JAMAIS orpheliner une
+# position reelle encore ouverte (= perte de tout suivi SL/TP).
+DESYNC_CONFIRM_TICKS = _env_int("DESYNC_CONFIRM_TICKS", 3)
+
+# ============================================================
+#  Sizing : marge disponible + garde-fous (audit 2026-08-03, points #6/#9)
+# ============================================================
+# Fraction de la marge DISPONIBLE (availEq) reellement engageable -- laisse un
+# coussin pour les frais taker + funding, pour qu'un 2e trade (sens oppose) ne
+# soit jamais rejete par OKX faute de marge (code 51008). Dimensionne sur
+# availEq (pas eq) : une position deja ouverte gele sa marge, la suivante ne
+# doit pas re-supposer le capital plein.
+SIZING_SAFETY_BUFFER = _env_float("SIZING_SAFETY_BUFFER", 0.98)
+# Tolerance de sur-taille au plancher minSz : si le notionnel voulu est plus de
+# (1+tol)x en-dessous du notionnel minimum d'OKX, on SAUTE le trade plutot que
+# de poster un ordre plus gros que voulu (petit solde).
+MIN_SIZE_OVERSHOOT_TOL = _env_float("MIN_SIZE_OVERSHOOT_TOL", 0.10)
+
+# ============================================================
+#  Horloge : tolerance de derive vs serveur OKX (audit 2026-08-03, point #11)
+# ============================================================
+# OKX rejette une requete signee a plus de ~30s de son heure serveur. On
+# synchronise un offset au demarrage (public/time) et on alerte au-dela de ce
+# seuil -- un daemon a l'horloge derivee echouerait SILENCIEUSEMENT toute
+# ecriture (order/cancel) une fois en reel.
+MAX_CLOCK_SKEW_S = _env_float("MAX_CLOCK_SKEW_S", 20.0)
+
+# Re-synchronisation PERIODIQUE de l'offset horloge dans la boucle (audit
+# 2026-08-13) : le sync unique au boot derive sur un daemon tournant des jours
+# (NTP par pas, VM suspend) et finit par declencher des rejets 50102 "Timestamp
+# request expired". On re-cale l'offset toutes les N minutes -- best-effort,
+# n'echoue jamais la boucle. `_request` conserve en plus un self-heal (resync +
+# retry) sur 50102 pour rattraper un decalage soudain entre deux resyncs.
+CLOCK_RESYNC_MIN = _env_int("CLOCK_RESYNC_MIN", 30)
+
+# ============================================================
 #  Cadence de la boucle
 # ============================================================
 TICK_INTERVAL_S = 60          # 1 tick / minute (monitoring positions)
@@ -95,7 +155,9 @@ INTERVAL_1H_MS = 60 * 60 * 1000
 # ici seulement la cadence de re-pricing PENDANT cette fenetre (pas d'equivalent
 # backtest -- le backtest simule un fill binaire, le live doit activement gerer
 # l'ordre post-only pendant la fenetre).
-ENTRY_REPRICE_EVERY_S = 60    # reprice l'ordre post-only toutes les 60s si non rempli
+# ENTRY_REPRICE_EVERY_S : SUPPRIME (alignement backtest 2026-08-14) -- la
+# limite maker reste STATIQUE au prix de depart pendant toute la fenetre
+# (semantique backtest "fill seulement si le marche revient toucher P0").
 
 # ============================================================
 #  Chemins de logs

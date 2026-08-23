@@ -597,9 +597,9 @@ def simulate_trades(team_bets: pd.DataFrame, body_map: dict[int, float],
             if widened_at is not None:
                 n_widened_up += 1
         elif (not up) and DOWN_MGMT_ENABLED and prices_intrabar is not None:
-            # RETOUR DOWN AU COMMIT ecb04f8 (2026-08-14) : DOWN_WIDEN_ENABLED=False
-            # -> aucun candidat d'elargissement cote DOWN (le commit n'avait pas
-            # de widen) ; CHOP_DOWN_ENABLED=False -> jamais de sorties scalp DOWN.
+            # Gates per-side (2026-08-14) : DOWN_WIDEN_ENABLED et CHOP_DOWN_ENABLED
+            # (config_main.py fait foi) controlent respectivement le widen DOWN et
+            # les sorties scalp DOWN -- False = coupes, True = actifs.
             widen_cands = (_later_same_dir_candidates(traded_ts, False)
                            if DOWN_WIDEN_ENABLED else None)
             if _chop and CHOP_DOWN_ENABLED:
@@ -1112,8 +1112,10 @@ def _render_report(summary: dict, stats: dict, coverage: float) -> None:
         (f"  = exposition {summary['exposure']:.1f}x", "bold yellow"),
         (" le mouvement de prix", "dim"),
     )
+    # expand=False : les panneaux epousent leur contenu au lieu de s'etirer
+    # sur toute la largeur du terminal (demande user 2026-08-14).
     console.print(Panel(Text("\n").join([header, window, fees, sizing]),
-                        border_style="cyan", padding=(0, 2)))
+                        border_style="cyan", padding=(0, 2), expand=False))
 
     if stats.get("n_trades", 0) == 0:
         console.print(Panel(Text("Aucun trade sur la fenetre.", style="red"),
@@ -1187,9 +1189,11 @@ def _render_report(summary: dict, stats: dict, coverage: float) -> None:
     console.print(p)
 
     # --- Bloc mensuel (USDC) ---
-    # --- Par tranche de 365 jours (si fenetre > 1 an) ---
+    # --- Par tranche de 365 jours (TOUJOURS affichee, demande user 2026-08-14 :
+    #     meme sur une fenetre <= 365j on veut la tranche unique + les lignes
+    #     UP/DOWN + TOTAL ; avant elle n'apparaissait que si fenetre > 1 an) ---
     years = stats.get("years") or []
-    if len(years) >= 2:
+    if years:
         # colonnes = les metriques du bloc "Profit / Perte" ventilees par tranche
         # (ajout 2026-08-11 a la demande du user), en plus des colonnes WR/EV.
         ty = Table(title="Par tranche de 365 jours", show_lines=True)
@@ -1295,7 +1299,8 @@ def _render_report(summary: dict, stats: dict, coverage: float) -> None:
         ("   EV ", "dim"),
         (f"{stats['ev_per_trade_pct']:+.4f}%/trade", f"bold {_pnl_color(stats['ev_per_trade_pct'])}"),
     )
-    console.print(Panel(headline, border_style=_pnl_color(net), padding=(0, 2)))
+    console.print(Panel(headline, border_style=_pnl_color(net), padding=(0, 2),
+                        expand=False))
 
     console.print(Text.assemble(("  written  ", "dim"), ("logs/trades.csv", "white"),
                                 (f"   ({stats['n_trades']} trades)", "dim")))

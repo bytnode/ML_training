@@ -201,25 +201,22 @@ def apply_dmi_filter(team_bets: pd.DataFrame,
 _TREND_CTX_CACHE: dict[int, tuple[float, float, bool]] | None = None
 
 
-def load_trend_context() -> dict[int, tuple[float, float, bool]]:
-    """Map open-time 1h (ms) -> (er, age_bear_h, is_mbull), tout l'historique.
+def trend_context_from_series(ts, cl) -> dict[int, tuple[float, float, bool]]:
+    """Math PURE du contexte de tendance : map open-time 1h (ms) -> (er,
+    age_bear_h, is_mbull) depuis deux arrays paralleles (timestamps ms, closes
+    1h). Extraite de load_trend_context (2026-08-14, alignement live) pour que
+    le daemon live la calcule depuis son buffer Bitstamp 1h sans SQLite —
+    MEME code des deux cotes, aucune divergence possible.
     er : Efficiency Ratio de Kaufman sur CHOP_ER_DAYS jours en PAS QUOTIDIENS
     (24 barres 1h), rafraichi a chaque barre. age_bear_h : heures consecutives
     passees sous la SMA CHOP_SMA_DAYS jours. is_mbull : close > cette SMA.
-    Mis en cache module (une seule lecture SQLite par process)."""
-    global _TREND_CTX_CACHE
-    if _TREND_CTX_CACHE is not None:
-        return _TREND_CTX_CACHE
-    con = sqlite3.connect(str(_candles_db_path()))
-    try:
-        c = pd.read_sql_query(
-            "SELECT timestamp_ms, close FROM candles WHERE timeframe='1h' ORDER BY timestamp_ms",
-            con)
-    finally:
-        con.close()
-    c = c.dropna(subset=["close"]).reset_index(drop=True)
-    ts = c["timestamp_ms"].astype("int64").to_numpy()
-    cl = c["close"].to_numpy(dtype=float)
+    Warmup : les barres sans SMA/ER complets sont ABSENTES de la map (= jamais
+    en mode scalp). L'age du bear est compte depuis le DEBUT de la serie
+    fournie : sur un buffer tronque il est sous-estime mais reste correct pour
+    le gate age <= CHOP_BEAR_AGE_MAX_H des que la fenetre a SMA valide depasse
+    largement ce seuil (cf market_data.BTC_1H_BARS cote live)."""
+    ts = np.asarray(ts, dtype=np.int64)
+    cl = np.asarray(cl, dtype=float)
     n, step = CHOP_ER_DAYS, 24
     er = np.full(len(cl), np.nan)
     den = np.zeros(len(cl))
@@ -238,8 +235,28 @@ def load_trend_context() -> dict[int, tuple[float, float, bool]]:
         if np.isnan(er[i]) or np.isnan(sma[i]):
             continue                      # warmup -> absent = jamais en mode scalp
         out[int(ts[i])] = (float(er[i]), float(age[i]), bool(cl[i] > sma[i]))
-    _TREND_CTX_CACHE = out
     return out
+
+
+def load_trend_context() -> dict[int, tuple[float, float, bool]]:
+    """Contexte de tendance sur TOUT l'historique de la table SQLite candles
+    (backtest). Math dans trend_context_from_series (partagee avec le live).
+    Mis en cache module (une seule lecture SQLite par process)."""
+    global _TREND_CTX_CACHE
+    if _TREND_CTX_CACHE is not None:
+        return _TREND_CTX_CACHE
+    con = sqlite3.connect(str(_candles_db_path()))
+    try:
+        c = pd.read_sql_query(
+            "SELECT timestamp_ms, close FROM candles WHERE timeframe='1h' ORDER BY timestamp_ms",
+            con)
+    finally:
+        con.close()
+    c = c.dropna(subset=["close"]).reset_index(drop=True)
+    _TREND_CTX_CACHE = trend_context_from_series(
+        c["timestamp_ms"].astype("int64").to_numpy(),
+        c["close"].to_numpy(dtype=float))
+    return _TREND_CTX_CACHE
 
 
 def chop_mode(trend_ctx: dict | None, decision_ts: int) -> bool:
@@ -256,8 +273,8 @@ def dn_ratchet_extra(trend_ctx: dict | None, decision_ts: int) -> tuple | None:
     CHOP_DOWN_RATCHET_STEP quand la barre de decision est en chop scalpable OU
     en macro-bull — c.-a-d. partout SAUF bear installe (age > 30j), ou les
     trend-rides gardent tout leur espace. None = pas de palier supplementaire.
-    CHOP_DOWN_ENABLED=False (retour DOWN au commit ecb04f8, 2026-08-14) ->
-    toujours None."""
+    Gate par CHOP_DOWN_ENABLED (config_main.py — la valeur en place y fait foi) :
+    False -> toujours None."""
     if trend_ctx is None or not CHOP_DOWN_ENABLED:
         return None
     e = trend_ctx.get(int(decision_ts))
@@ -322,8 +339,7 @@ def effective_down_delta(timestamps, regime_map: dict[int, str] | None,
         regime = regime_map.get(int(ts), "neutral") if regime_map else "neutral"
         override = cfg_regime.REGIME_OVERRIDES.get(regime, {}).get("down_conf_delta")
         out[i] = DOWN_CONF_DELTA if override is None else override
-        # CHOP_DOWN_ENABLED=False (retour DOWN au commit ecb04f8, 2026-08-14) :
-        # plus aucun bump -- delta plat DOWN_CONF_DELTA comme au commit.
+        # Bump chop DOWN, gate par CHOP_DOWN_ENABLED (config_main.py fait foi).
         if CHOP_DOWN_ENABLED and trend_ctx is not None and chop_mode(trend_ctx, int(ts)):
             out[i] += CHOP_DOWN_CONF_DELTA_BUMP
     return out
@@ -347,14 +363,20 @@ def effective_up_conf_min(timestamps, regime_map: dict[int, str] | None,
     return out
 
 
-def effective_up_conf_min_1(ts: int, regime_map: dict[int, str] | None) -> float:
-    """Version scalaire (bar unique) de effective_up_conf_min, pour le live."""
-    return float(effective_up_conf_min(np.array([ts]), regime_map)[0])
+def effective_up_conf_min_1(ts: int, regime_map: dict[int, str] | None,
+                            trend_ctx: dict | None = None) -> float:
+    """Version scalaire (bar unique) de effective_up_conf_min, pour le live.
+    trend_ctx (alignement live 2026-08-14) : passe-le pour que le bump chop
+    CHOP_UP_CONF_MIN_BUMP s'applique aussi en live ; None = ancien comportement."""
+    return float(effective_up_conf_min(np.array([ts]), regime_map, trend_ctx)[0])
 
 
-def effective_down_delta_1(ts: int, regime_map: dict[int, str] | None) -> float:
-    """Version scalaire (bar unique) de effective_down_delta, pour le live."""
-    return float(effective_down_delta(np.array([ts]), regime_map)[0])
+def effective_down_delta_1(ts: int, regime_map: dict[int, str] | None,
+                           trend_ctx: dict | None = None) -> float:
+    """Version scalaire (bar unique) de effective_down_delta, pour le live.
+    trend_ctx (alignement live 2026-08-14) : passe-le pour que le bump chop
+    CHOP_DOWN_CONF_DELTA_BUMP s'applique aussi en live ; None = ancien comportement."""
+    return float(effective_down_delta(np.array([ts]), regime_map, trend_ctx)[0])
 
 
 def apply_conf_filter(team_bets: pd.DataFrame,

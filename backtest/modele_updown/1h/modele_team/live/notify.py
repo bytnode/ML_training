@@ -87,21 +87,19 @@ def send_bet_resolved(pos_side: str, reason: str, pp: float, entry_px: float, ex
           f"capital : {balance_txt}")
 
 
-def send_position_adopted(pos_side: str, avg_px: float, sz: str) -> None:
-    token, chat_id = _error_creds()
+def send_entry_missed(pos_side: str) -> None:
+    token, chat_id = _op_creds()
     _send(token, chat_id,
-          f"❗ <b>Position adoptee</b> {pos_side.upper()} avg_px={avg_px:.2f} sz={sz}\n"
-          f"(ouverte chez OKX mais absente de l'etat local au dernier tick -- "
-          f"redemarrage sur etat corrompu/tronque, ou crash pendant l'ouverture. "
-          f"Surveillance SL/TP/trailing/timestop reprend a partir de maintenant, "
-          f"horizon repart de zero.)")
+          f"🟡 <b>Entree ratee</b> {pos_side.upper()} "
+          f"(limite maker non remplie dans la fenetre -- opportunite abandonnee, "
+          f"semantique backtest, aucun ordre taker)")
 
 
-def send_entry_abandoned(pos_side: str, error: str) -> None:
-    token, chat_id = _error_creds()
+def send_position_adopted(pos_side: str, avg_px: float) -> None:
+    token, chat_id = _op_creds()
     _send(token, chat_id,
-          f"\U0001F6A8 <b>Entree abandonnee</b> {pos_side.upper()} : fallback taker "
-          f"rejete apres expiration de la fenetre maker, aucune position ouverte : {error}")
+          f"♻️ <b>Position adoptee</b> {pos_side.upper()} @ {avg_px:.2f} "
+          f"(trouvee ouverte sur OKX au demarrage -- suivi SL/TP repris, filet natif verifie).")
 
 
 def send_desync(pos_side: str) -> None:

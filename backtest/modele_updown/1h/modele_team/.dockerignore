@@ -37,3 +37,9 @@ analyse/
 # Secrets : charges via env_file de compose, jamais copies dans l'image.
 .env
 .env.*
+
+# Sauvegardes locales (*.bak, *.orig, *.pre_*) : jamais dans l'image -- une copie
+# perimee de position.py/api_okx.py embarquee prete a confusion au debug.
+*.bak
+*.orig
+*.pre_*

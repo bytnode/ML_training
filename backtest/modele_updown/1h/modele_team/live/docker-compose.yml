@@ -1,17 +1,19 @@
-# Build context = live/ lui-meme -- AUTONOMIE COMPLETE (2026-08-03) : plus
-# aucune dependance a modele_team/ ni a 1h/, deploiement VPS = ce dossier seul.
+# Build context = modele_team/ (.. depuis live/) -- AUTONOMIE (2026-07-10) :
+# live/ embarque ses propres copies de modele_up/, modele_down/, regime/
+# (live/modele_up/, live/modele_down/, live/regime/), donc le contexte n'a
+# plus besoin de remonter jusqu'a 1h/ pour les COPY du Dockerfile.
 services:
   live-okx:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: live/Dockerfile
     container_name: live-okx-1h
     restart: unless-stopped
     tty: true
     env_file:
       - ./.env
     volumes:
-      - ./logs:/app/logs
+      - ./logs:/app/modele_team/live/logs
       # PLUS de montage SQLite (campagne autonomie 2026-07-10) : live/ ne touche
       # plus jamais la DB de modele_down, ni pour le DMI par-trade (buffer 4h
       # Bitstamp local, cf market_data.py) ni pour le regime (graine

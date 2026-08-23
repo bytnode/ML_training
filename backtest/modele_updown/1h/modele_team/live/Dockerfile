@@ -1,7 +1,8 @@
-# Build context = live/ lui-meme -- AUTONOMIE COMPLETE (2026-08-03) : live/ n'a
-# plus AUCUNE dependance a modele_team/ ni a 1h/ -- config_main.py et filters.py
-# sont maintenant des copies embarquees (comme modele_up/, modele_down/, regime/
-# deja depuis 2026-07-10). Deploiement VPS = copier ce dossier (live/) seul.
+# Build context = modele_team/ (voir docker-compose.yml) -- AUTONOMIE (2026-07-10) :
+# live/ embarque ses propres copies de modele_up/, modele_down/, regime/
+# (live/modele_up/, live/modele_down/, live/regime/, cf leurs docstrings),
+# donc ce Dockerfile n'a plus besoin de remonter jusqu'a 1h/ pour les COPY --
+# un seul dossier (modele_team/) suffit a un deploiement complet.
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -14,11 +15,14 @@ WORKDIR /app
 RUN pip install --no-cache-dir \
     pandas numpy "xgboost==3.2.*" scikit-learn scipy requests
 
-# Tout est deja dans live/ (contexte = ce dossier) : live.py, position.py,
-# config_main.py, filters.py, modele_up/, modele_down/, regime/, etc.
-COPY . /app/
+# config_main.py/filters.py/okx_fees.py sont sibling de live/ (dans modele_team/,
+# racine du contexte) ; live/ lui-meme embarque tout le reste (modele_up/,
+# modele_down/, regime/ inclus).
+COPY config_main.py filters.py okx_fees.py /app/modele_team/
+COPY live/ /app/modele_team/live/
 
-# .env n'est PAS copie (secrets -- charges via env_file de compose).
-RUN rm -f /app/.env
+# live/.env n'est PAS copie (secrets -- charges via env_file de compose).
+RUN rm -f /app/modele_team/live/.env
 
+WORKDIR /app/modele_team/live
 CMD ["python", "live.py"]
