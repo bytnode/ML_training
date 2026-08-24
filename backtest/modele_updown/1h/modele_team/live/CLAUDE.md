@@ -431,5 +431,13 @@ Docker:
 cd backtest/modele_updown/1h/modele_team/live
 docker compose build
 docker compose up -d
-docker compose logs -f live-okx
+docker compose logs -f live-okx-test
 ```
+
+⚠️ **Branche `algov2_test` : tous les noms Docker portent le suffixe `-test`**
+(projet `live-okx-test` via le `name:` de haut niveau, service `live-okx-test`,
+conteneur `live-okx-1h-test`). C'est ce qui permet de cohabiter avec le
+déploiement de production sur le même VPS : sans le `name:`, Compose déduit le
+nom de projet du dossier (`live`), **identique des deux côtés** — un
+`docker compose down` lancé depuis le test aurait arrêté la prod. Aucun `-p`
+n'est nécessaire. **À retirer si cette branche est fusionnée vers la prod.**

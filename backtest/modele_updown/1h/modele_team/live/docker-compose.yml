@@ -2,12 +2,25 @@
 # live/ embarque ses propres copies de modele_up/, modele_down/, regime/
 # (live/modele_up/, live/modele_down/, live/regime/), donc le contexte n'a
 # plus besoin de remonter jusqu'a 1h/ pour les COPY du Dockerfile.
+# ⚠️ DEPLOIEMENT DE TEST (branche algov2_test) -- CE N'EST PAS LA PROD.
+# Tous les noms portent le suffixe -test pour que rien ne puisse entrer en
+# collision avec le deploiement de production sur le meme VPS :
+#   - `name:` fixe le PROJET Compose. Sans lui, Compose prend le nom du dossier
+#     du fichier (= "live"), IDENTIQUE cote prod -- un `docker compose down`
+#     lance ici aurait arrete la prod. Plus besoin de passer -p a la main.
+#   - `container_name` distinct : deux conteneurs ne peuvent pas partager un nom.
+#   - le service s'appelle live-okx-test : c'est le nom a utiliser dans
+#     `docker compose logs -f live-okx-test`.
+# ⚠️ Si cette branche est un jour fusionnee vers la prod, RETIRER ces suffixes
+# (ou la prod tournerait sous des noms de test).
+name: live-okx-test
+
 services:
-  live-okx:
+  live-okx-test:
     build:
       context: ..
       dockerfile: live/Dockerfile
-    container_name: live-okx-1h
+    container_name: live-okx-1h-test
     restart: unless-stopped
     tty: true
     env_file:
