@@ -1,7 +1,0 @@
-FEATURE_WHITELIST = (
-    "body_pos",
-    "ef_ret4",
-    "dist_to_low_50",
-    "rv_20",
-    "hour_sin",
-)
