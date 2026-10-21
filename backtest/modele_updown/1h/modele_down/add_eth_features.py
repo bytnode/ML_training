@@ -4,9 +4,9 @@ add_eth_features.py — patch ETH/USD pour le master 1h (parite features 15min).
 Porte le builder ETH du modele 15min (live/modele_15m/live_helpers/features_down.py
 :: _compute_eth_features) vers la base 1h. Contrairement au patch d'origine (30m,
 qui resample un flux ETH 15m), cette base est deja 1h : le raw ETH/USD 1h vit
-dans DB/eth_1h.csv (fetch Bitstamp existant, memes colonnes que les debug CSV de
-data.py : timestamp_ms/open/high/low/close/volume, deja aligne sur les memes
-frontieres d'heure que le master BTC) — pas de resample necessaire.
+dans DB/eth_1h.parquet (fetch Bitstamp existant, memes colonnes que les debug
+exports de data.py : timestamp_ms/open/high/low/close/volume, deja aligne sur
+les memes frontieres d'heure que le master BTC) — pas de resample necessaire.
 
 Les ef_* sont alignes NO-LOOKAHEAD sur chaque BTC 1h par join de TIMESTAMP EXACT
 (la bougie ETH 1h concurrente, fermee a T = open_1h + 1h = decision time). Les
@@ -32,7 +32,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parent
 MASTER_PARQUET = ROOT / "DB" / "btc_multi_tf_1h.parquet"
-ETH_CSV = ROOT / "DB" / "eth_1h.csv"
+ETH_PARQUET = ROOT / "DB" / "eth_1h.parquet"
 
 INTERVAL_1H_MS = 60 * 60 * 1000
 
@@ -108,8 +108,8 @@ def main() -> int:
         print(f"ERREUR : master parquet introuvable : {MASTER_PARQUET}")
         print("Lance d'abord : python data.py")
         return 1
-    if not ETH_CSV.exists():
-        print(f"ERREUR : ETH CSV introuvable : {ETH_CSV}")
+    if not ETH_PARQUET.exists():
+        print(f"ERREUR : ETH parquet introuvable : {ETH_PARQUET}")
         return 1
 
     print(f"=== add_eth_features.py (1h) ===")
@@ -129,7 +129,7 @@ def main() -> int:
             shutil.copy2(MASTER_PARQUET, bak)
             print(f"  backup : {bak.name}")
 
-    eth_1h = pd.read_csv(ETH_CSV)
+    eth_1h = pd.read_parquet(ETH_PARQUET)
     print(f"ETH 1h : {len(eth_1h):,} rows (natif, pas de resample necessaire)")
 
     eth_feat = compute_eth_features(eth_1h)

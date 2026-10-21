@@ -57,7 +57,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent
 DB_SQLITE = ROOT / "DB" / "btc_multi_tf.db"
 MASTER_PARQUET = ROOT / "DB" / "btc_multi_tf_1h.parquet"
-ETH_CSV = ROOT / "DB" / "eth_1h.csv"
+ETH_PARQUET = ROOT / "DB" / "eth_1h.parquet"
 
 H_MS = 60 * 60 * 1000
 DAY_MS = 24 * H_MS
@@ -172,7 +172,7 @@ def compute_alpha(df: pd.DataFrame, conn) -> dict:
     out["donchian_mid_50"] = ((c - (hh50 + ll50) / 2.0) / c).to_numpy()
 
     # --- Couplage cross-asset BTC/ETH (corr roulante des returns, concurrent) ---
-    eth = _resample_eth_1h(pd.read_csv(ETH_CSV))
+    eth = _resample_eth_1h(pd.read_parquet(ETH_PARQUET))
     eth["eth_cr"] = eth["close"].astype(float).pct_change()
     eth_map = dict(zip(eth["timestamp_ms"].to_numpy(dtype=np.int64), eth["eth_cr"].to_numpy()))
     eth_cr = pd.Series([eth_map.get(int(t), np.nan) for t in ts], index=df.index)
@@ -183,7 +183,7 @@ def compute_alpha(df: pd.DataFrame, conn) -> dict:
 
 def main() -> int:
     for p, label in [(MASTER_PARQUET, "master parquet"), (DB_SQLITE, "SQLite"),
-                     (ETH_CSV, "ETH CSV")]:
+                     (ETH_PARQUET, "ETH parquet")]:
         if not p.exists():
             print(f"ERREUR : {label} introuvable : {p}")
             return 1

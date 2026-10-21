@@ -492,13 +492,13 @@ def drop_raw_table(db_path: Path) -> None:
 
 
 # ============================================================================
-# Phase 3 — Per-TF CSV (debug uniquement, pas utilisé par train.py)
+# Phase 3 — Per-TF Parquet (debug uniquement, pas utilisé par train.py)
 # ============================================================================
 
-def export_timeframe_csv(db_path: Path, timeframe: str, csv_path: Path) -> int:
-    """Export per-TF CSV (debug uniquement) — features normalisées seulement.
+def export_timeframe_parquet(db_path: Path, timeframe: str, parquet_path: Path) -> int:
+    """Export per-TF Parquet (debug uniquement) — features normalisées seulement.
     Les valeurs brutes close/volume restent en SQLite (utilisées par phase 4
-    pour calculer MACD/BB/MFI), elles ne sont jamais écrites dans les CSVs.
+    pour calculer MACD/BB/MFI), elles ne sont jamais écrites dans ces exports.
     """
     conn = sqlite3.connect(db_path)
     try:
@@ -515,7 +515,7 @@ def export_timeframe_csv(db_path: Path, timeframe: str, csv_path: Path) -> int:
     finally:
         conn.close()
 
-    df.to_csv(csv_path, index=False)
+    df.to_parquet(parquet_path, index=False)
     return len(df)
 
 
@@ -910,17 +910,20 @@ def run(pair: str, days_back: int, db_path: Path) -> None:
     elapsed_feat = time.time() - t1
     print(f"Normalisation terminée en {elapsed_feat:.1f}s")
 
-    # ---- Phase 3 — DROP candles_raw + per-TF CSVs (debug) ----
-    print(f"\n--- Phase 3/5 : nettoyage + export per-TF CSVs ---")
+    # ---- Phase 3 — DROP candles_raw + per-TF Parquet (debug) ----
+    print(f"\n--- Phase 3/5 : nettoyage + export per-TF Parquet ---")
     t2 = time.time()
     drop_raw_table(db_path)
     print(f"  candles_raw supprimée + VACUUM")
     csv_dir = db_path.parent
     db_stem = db_path.stem
     for tf in TIMEFRAMES:
-        csv_path = csv_dir / f"{db_stem}_{tf}.csv"
-        n = export_timeframe_csv(db_path, tf, csv_path)
-        print(f"  [{tf}] {n:,} lignes -> {csv_path.name}")
+        # "_debug" suffix : evite la collision avec le master "{db_stem}_1h.parquet"
+        # (le TF "1h" est a la fois un export debug ET le nom du master -- meme
+        # extension .parquet pour les deux depuis la conversion CSV->parquet).
+        parquet_path = csv_dir / f"{db_stem}_{tf}_debug.parquet"
+        n = export_timeframe_parquet(db_path, tf, parquet_path)
+        print(f"  [{tf}] {n:,} lignes -> {parquet_path.name}")
     elapsed_csv = time.time() - t2
     print(f"Export per-TF terminé en {elapsed_csv:.1f}s")
 

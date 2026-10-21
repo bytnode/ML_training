@@ -40,7 +40,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent
 DB_SQLITE = ROOT / "DB" / "btc_multi_tf.db"
 MASTER_PARQUET = ROOT / "DB" / "btc_multi_tf_1h.parquet"
-ETH_CSV = ROOT / "DB" / "eth_1h.csv"
+ETH_PARQUET = ROOT / "DB" / "eth_1h.parquet"
 
 INTERVAL_1H_MS = 60 * 60 * 1000
 TF_STEP_MS = {"1h": 60 * 60 * 1000, "4h": 4 * 60 * 60 * 1000, "1d": 24 * 60 * 60 * 1000}
@@ -303,10 +303,10 @@ def compute_htf(df30_times: np.ndarray, conn) -> dict:
 # Cross-asset ETH / BTC-ETH
 # ===========================================================================
 def compute_eth_cross(df30: pd.DataFrame) -> dict:
-    """ETH 1h (natif, DB/eth_1h.csv) -> oscillateurs ETH + divergence BTC-ETH,
+    """ETH 1h (natif, DB/eth_1h.parquet) -> oscillateurs ETH + divergence BTC-ETH,
     joins ts exact (concurrent). Pas de resample : deja a la meme granularite
     que le master BTC."""
-    eth = pd.read_csv(ETH_CSV)
+    eth = pd.read_parquet(ETH_PARQUET)
     h, l, c, v = eth["high"].astype(float), eth["low"].astype(float), eth["close"].astype(float), eth["volume"].astype(float)
     cr = (c - c.shift(1)) / c.shift(1)
 
@@ -353,8 +353,8 @@ def main() -> int:
     if not DB_SQLITE.exists():
         print(f"ERREUR : SQLite introuvable : {DB_SQLITE}")
         return 1
-    if not ETH_CSV.exists():
-        print(f"ERREUR : ETH CSV introuvable : {ETH_CSV}")
+    if not ETH_PARQUET.exists():
+        print(f"ERREUR : ETH parquet introuvable : {ETH_PARQUET}")
         return 1
 
     print("=== add_engineered_features.py (1h) ===")

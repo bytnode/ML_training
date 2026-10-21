@@ -6,6 +6,13 @@
 *.sqlite
 *.sqlite3
 *.log
+# Ajoutes 2026-08-14 : caches de predictions (jusqu'a ~200MB) et logs/sweeps
+# regeneres a chaque run — la doc du repo les croyait deja ignores, ils ne
+# l'ont jamais ete (des .csv/.pkl s'etaient retrouves trackes).
+*.pkl
+*.csv
+g_evolution.html
+backtest/modele_updown/1h/modele_team/live/regime/regime_seed.json
 
 # Backup files of any of the above (foo.parquet.bak, foo.parquet.bak2,
 # foo.parquet.bak_clean, etc). The *.parquet rule above only matches paths
